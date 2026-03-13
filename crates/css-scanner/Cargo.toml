@@ -1,0 +1,23 @@
+[package]
+name = "frontend-css-scanner"
+version = "0.1.0"
+edition = "2021"
+description = "CSS/SCSS analysis for frontend-analyzer-provider"
+
+[dependencies]
+frontend-core = { path = "../core" }
+
+# CSS parsing
+lightningcss = "1.0.0-alpha.71"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+
+# Utilities
+regex = "1"
+walkdir = "2"
+tracing = "0.1"

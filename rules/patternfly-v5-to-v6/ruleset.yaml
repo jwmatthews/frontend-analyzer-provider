@@ -1,0 +1,5 @@
+name: patternfly-v5-to-v6
+description: "PatternFly React v5 to v6 migration rules"
+labels:
+  - konveyor.io/source=patternflyv5
+  - konveyor.io/target=patternflyv6

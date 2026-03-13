@@ -1,0 +1,319 @@
+use anyhow::Result;
+use clap::Args;
+use frontend_core::fix::FixSource;
+use std::path::PathBuf;
+
+use crate::fix_engine;
+use crate::goose_client;
+use crate::llm_client;
+
+#[derive(Args)]
+pub struct FixOpts {
+    /// Path to the project to fix.
+    pub project: PathBuf,
+
+    /// Path to Konveyor analysis output (YAML or JSON).
+    #[arg(short, long)]
+    pub input: PathBuf,
+
+    /// Preview changes without writing (default behavior).
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Apply changes to disk.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// LLM provider for AI-assisted fixes: "goose" (local goose CLI) or "openai" (remote endpoint).
+    #[arg(long)]
+    pub llm_provider: Option<String>,
+
+    /// LLM endpoint URL (required when --llm-provider=openai).
+    #[arg(long)]
+    pub llm_endpoint: Option<String>,
+
+    /// Only process fixes for specific rule IDs (comma-separated).
+    #[arg(long)]
+    pub rules: Option<String>,
+
+    /// Directory to save goose prompts and responses for debugging.
+    #[arg(long)]
+    pub log_dir: Option<PathBuf>,
+
+    /// Show detailed output.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+pub async fn run(opts: FixOpts) -> Result<()> {
+    let project = opts.project.canonicalize()?;
+    let input_content = std::fs::read_to_string(&opts.input)?;
+
+    // Parse the Konveyor output (try JSON first, then YAML)
+    let output: Vec<frontend_core::report::RuleSet> = {
+        let trimmed = input_content.trim_start();
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            serde_json::from_str(&input_content)?
+        } else {
+            // Try YAML — serde_yml can panic on large multiline strings,
+            // so catch panics gracefully
+            match std::panic::catch_unwind(|| serde_yml::from_str::<Vec<frontend_core::report::RuleSet>>(&input_content)) {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => anyhow::bail!("Failed to parse YAML input: {}. Try using --output-format json with the analyze command.", e),
+                Err(_) => anyhow::bail!("YAML parser crashed on input file. Use --output-format json with the analyze command instead."),
+            }
+        }
+    };
+
+    let total_violations: usize = output.iter().map(|rs| rs.violations.len()).sum();
+    let total_incidents: usize = output
+        .iter()
+        .flat_map(|rs| rs.violations.values())
+        .map(|v| v.incidents.len())
+        .sum();
+
+    eprintln!(
+        "Loaded {} violations with {} incidents",
+        total_violations, total_incidents
+    );
+
+    // Phase 1: Plan fixes
+    eprintln!("Planning fixes...");
+    let mut plan = fix_engine::plan_fixes(&output, &project)?;
+
+    let pattern_fix_count: usize = plan
+        .files
+        .values()
+        .flat_map(|fixes| fixes.iter())
+        .filter(|f| f.source == FixSource::Pattern)
+        .count();
+    let pattern_edit_count: usize = plan
+        .files
+        .values()
+        .flat_map(|fixes| fixes.iter())
+        .filter(|f| f.source == FixSource::Pattern)
+        .flat_map(|f| f.edits.iter())
+        .count();
+
+    eprintln!(
+        "  Pattern-based: {} fixes ({} edits) across {} files",
+        pattern_fix_count,
+        pattern_edit_count,
+        plan.files.len()
+    );
+    eprintln!("  Manual review: {} incidents", plan.manual.len());
+    eprintln!("  LLM-assisted:  {} incidents", plan.pending_llm.len());
+
+    // Phase 1b: Apply pattern-based fixes first (so LLM sees already-renamed code)
+    if opts.apply && !plan.files.is_empty() {
+        eprintln!("\nApplying pattern-based fixes...");
+        let result = fix_engine::apply_fixes(&plan)?;
+        eprintln!("  Files modified: {}", result.files_modified);
+        eprintln!("  Edits applied:  {}", result.edits_applied);
+        eprintln!("  Edits skipped:  {}", result.edits_skipped);
+        if !result.errors.is_empty() {
+            eprintln!("  Errors:");
+            for err in &result.errors {
+                eprintln!("    {}", err);
+            }
+        }
+    } else if !opts.apply {
+        // Preview mode — show diff for pattern-based fixes
+        let diff = fix_engine::preview_fixes(&plan)?;
+        if diff.is_empty() {
+            eprintln!("\nNo pattern-based auto-fixable changes found.");
+        } else {
+            eprintln!("\nPlanned pattern-based changes (use --apply to write):\n");
+            println!("{}", diff);
+        }
+    }
+
+    // Phase 2: LLM-assisted fixes
+    let llm_provider = opts.llm_provider.as_deref().or_else(|| {
+        // Legacy: if --llm-endpoint is set without --llm-provider, assume openai
+        if opts.llm_endpoint.is_some() {
+            Some("openai")
+        } else {
+            None
+        }
+    });
+
+    if !plan.pending_llm.is_empty() {
+        match llm_provider {
+            Some("goose") => {
+                eprintln!(
+                    "\nUsing goose for {} LLM-assisted fixes...",
+                    plan.pending_llm.len()
+                );
+
+                if !opts.apply {
+                    eprintln!(
+                        "  (dry run — use --apply to let goose edit files directly)"
+                    );
+                    // In dry-run mode, just show what would be sent to goose
+                    for req in &plan.pending_llm {
+                        let file_name = req
+                            .file_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "  Would fix: {} line {} [{}]",
+                            file_name, req.line, req.rule_id
+                        );
+                    }
+                } else {
+                    let pending = std::mem::take(&mut plan.pending_llm);
+                    let results = goose_client::run_all_goose_fixes(
+                        &pending,
+                        opts.verbose,
+                        opts.log_dir.as_deref(),
+                    );
+
+                    let succeeded = results.iter().filter(|r| r.success).count();
+                    let failed = results.iter().filter(|r| !r.success).count();
+                    eprintln!("\n  Goose fixes: {} succeeded, {} failed", succeeded, failed);
+
+                    // Move failures to manual review
+                    for (result, requests) in results.iter().zip(
+                        // Re-group by file to match results
+                        {
+                            let mut by_file: std::collections::BTreeMap<
+                                PathBuf,
+                                Vec<&frontend_core::fix::LlmFixRequest>,
+                            > = std::collections::BTreeMap::new();
+                            for req in &pending {
+                                by_file.entry(req.file_path.clone()).or_default().push(req);
+                            }
+                            by_file.into_values().collect::<Vec<_>>()
+                        },
+                    ) {
+                        if !result.success {
+                            for req in requests {
+                                plan.manual.push(frontend_core::fix::ManualFixItem {
+                                    rule_id: req.rule_id.clone(),
+                                    file_uri: req.file_uri.clone(),
+                                    line: req.line,
+                                    message: req.message.clone(),
+                                    code_snip: req.code_snip.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Some("openai") => {
+                let endpoint = opts.llm_endpoint.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--llm-endpoint is required when using --llm-provider=openai"
+                    )
+                })?;
+
+                if !plan.pending_llm.is_empty() {
+                    eprintln!(
+                        "\nSending {} incidents to LLM endpoint: {}",
+                        plan.pending_llm.len(),
+                        endpoint
+                    );
+
+                    let pending = std::mem::take(&mut plan.pending_llm);
+                    let mut llm_fixes = 0;
+                    let mut llm_errors = 0;
+
+                    for request in &pending {
+                        match llm_client::request_llm_fix(endpoint, request).await {
+                            Ok(fixes) => {
+                                for fix in fixes {
+                                    if !fix.edits.is_empty() {
+                                        llm_fixes += 1;
+                                        plan.files
+                                            .entry(request.file_path.clone())
+                                            .or_default()
+                                            .push(fix);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                llm_errors += 1;
+                                if opts.verbose {
+                                    eprintln!(
+                                        "  LLM error for {}:{} — {}",
+                                        request.file_path.display(),
+                                        request.line,
+                                        e
+                                    );
+                                }
+                                plan.manual.push(frontend_core::fix::ManualFixItem {
+                                    rule_id: request.rule_id.clone(),
+                                    file_uri: request.file_uri.clone(),
+                                    line: request.line,
+                                    message: request.message.clone(),
+                                    code_snip: request.code_snip.clone(),
+                                });
+                            }
+                        }
+                    }
+
+                    eprintln!(
+                        "  LLM generated {} fixes, {} errors",
+                        llm_fixes, llm_errors
+                    );
+
+                    // Apply LLM-generated edits
+                    if opts.apply && !plan.files.is_empty() {
+                        let result = fix_engine::apply_fixes(&plan)?;
+                        eprintln!("  Applied {} LLM edits", result.edits_applied);
+                    }
+                }
+            }
+            Some(other) => {
+                anyhow::bail!(
+                    "Unknown LLM provider '{}'. Use 'goose' or 'openai'.",
+                    other
+                );
+            }
+            None => {
+                eprintln!(
+                    "\n  {} incidents need LLM-assisted fixes.",
+                    plan.pending_llm.len()
+                );
+                eprintln!("  Use --llm-provider goose to fix with local goose.");
+                eprintln!("  Use --llm-provider openai --llm-endpoint <url> for remote LLM.");
+
+                // Move to manual
+                for request in std::mem::take(&mut plan.pending_llm) {
+                    plan.manual.push(frontend_core::fix::ManualFixItem {
+                        rule_id: request.rule_id,
+                        file_uri: request.file_uri,
+                        line: request.line,
+                        message: request.message,
+                        code_snip: request.code_snip,
+                    });
+                }
+            }
+        }
+    }
+
+    // Show manual review items
+    if !plan.manual.is_empty() {
+        eprintln!("\n── Manual review required ({}) ──", plan.manual.len());
+        for item in &plan.manual {
+            eprintln!(
+                "  {} line {} [{}]",
+                item.file_uri
+                    .strip_prefix("file://")
+                    .unwrap_or(&item.file_uri)
+                    .split('/')
+                    .last()
+                    .unwrap_or("?"),
+                item.line,
+                item.rule_id,
+            );
+            if opts.verbose {
+                eprintln!("    {}", item.message);
+            }
+        }
+    }
+
+    Ok(())
+}

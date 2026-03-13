@@ -1,0 +1,153 @@
+# Component removals and deprecations
+
+- ruleID: pfv6-deprecated-application-launcher
+  description: "ApplicationLauncher removed in v6"
+  labels: [change-type=component-removal, has-codemod=false]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^ApplicationLauncher", location: IMPORT, from: "@patternfly/react-core" }
+  message: "ApplicationLauncher has been removed in PF v6. Migrate to Dropdown or MenuToggle-based equivalent."
+
+- ruleID: pfv6-deprecated-context-selector
+  description: "ContextSelector removed in v6"
+  labels: [change-type=component-removal, has-codemod=false]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^ContextSelector", location: IMPORT, from: "@patternfly/react-core" }
+  message: "ContextSelector has been removed in PF v6. Migrate to Dropdown or Select."
+
+- ruleID: pfv6-deprecated-options-menu
+  description: "OptionsMenu removed in v6"
+  labels: [change-type=component-removal, has-codemod=false]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^OptionsMenu", location: IMPORT, from: "@patternfly/react-core" }
+  message: "OptionsMenu has been removed in PF v6. Migrate to Dropdown or MenuToggle."
+
+- ruleID: pfv6-deprecated-page-header
+  description: "PageHeader removed in v6"
+  labels: [change-type=component-removal, has-codemod=false]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(PageHeader|PageHeaderTools|PageHeaderToolsGroup|PageHeaderToolsItem)$", location: IMPORT, from: "@patternfly/react-core" }
+  message: "PageHeader and related components have been removed from @patternfly/react-core in PF v6. Migrate to Masthead. Note: PageHeader from @patternfly/react-component-groups is a different component and is NOT affected."
+
+- ruleID: pfv6-deprecated-page-navigation
+  description: "PageNavigation removed in v6"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^PageNavigation$", location: IMPORT }
+  message: "PageNavigation has been removed in PF v6. Codemod: pageNavigation-remove-component"
+
+- ruleID: pfv6-deprecated-drag-drop
+  description: "DragDrop/Droppable/Draggable deprecated"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(DragDrop|Droppable|Draggable)$", location: IMPORT, from: "@patternfly/react-core" }
+  message: "DragDrop, Droppable, and Draggable have been moved to deprecated in PF v6. Use DragDropSort instead. Codemod: dragDrop-deprecated"
+
+- ruleID: pfv6-deprecated-dual-list-selector
+  description: "Old DualListSelector deprecated"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^DualListSelector$", location: IMPORT }
+  message: "Old DualListSelector moved to deprecated. Import from /next or main path. Codemod: dualListSelector-deprecated / dualListSelectorNext-promoted"
+
+- ruleID: pfv6-deprecated-modal
+  description: "Old Modal API must be migrated to new composable Modal"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^(Modal|ModalVariant)$"
+      location: IMPORT
+      from: "^@patternfly/react-core$"
+  message: "Old Modal API is removed in PF v6. Migrate to the new composable Modal from '@patternfly/react-core': replace 'title' prop with a <ModalHeader> child containing a <ModalTitle>, move body content into <ModalBody>, move actions into <ModalFooter>, replace 'onClose' with 'onClose' on ModalHeader, replace 'variant' with the same prop on the new Modal, and replace 'isOpen' with conditional rendering or the 'isOpen' prop. The new Modal uses ModalHeader/ModalBody/ModalFooter children instead of title/actions/children props. Codemod: modal-deprecated / modalNext-promoted"
+
+- ruleID: pfv6-deprecated-tile
+  description: "Tile deprecated — use Card"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^Tile$", location: IMPORT, from: "@patternfly/react-core" }
+  message: "Tile has been deprecated in PF v6. Use Card with isSelectable/isClickable instead. Codemod: tile-deprecated"
+
+- ruleID: pfv6-deprecated-kebab-toggle
+  description: "KebabToggle replaced with MenuToggle"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^KebabToggle$", location: IMPORT }
+  message: "KebabToggle has been removed. Use MenuToggle with EllipsisVIcon. Codemod: kebabToggle-replace-with-menuToggle"
+
+- ruleID: pfv6-chip-deprecated-import
+  description: "Chip must be imported from deprecated path"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(Chip|ChipGroup)$", location: IMPORT }
+  message: "Chip/ChipGroup must be imported from @patternfly/react-core/deprecated in PF v6. Codemod: chip-deprecated"
+
+# Additional major component deprecations/removals
+
+- ruleID: pfv6-remove-empty-state-header
+  description: "EmptyStateHeader and EmptyStateIcon merged into EmptyState"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 3
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^EmptyStateHeader$", location: IMPORT }
+      - frontend.referenced: { pattern: "^EmptyStateIcon$", location: IMPORT }
+  message: "EmptyStateHeader and EmptyStateIcon have been removed as standalone components in PF v6. Their props (titleText, headingLevel, icon) are now directly on EmptyState. Codemod: emptyStateHeader-move-into-emptyState"
+
+- ruleID: pfv6-deprecated-wizard-old
+  description: "Old Wizard subcomponents moved to deprecated"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 5
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^WizardNavItem$", location: IMPORT }
+      - frontend.referenced: { pattern: "^WizardContextProvider$", location: IMPORT }
+      - frontend.referenced: { pattern: "^WizardBody$", location: IMPORT }
+      - frontend.referenced: { pattern: "^WizardToggle$", location: IMPORT }
+  message: "Old Wizard subcomponents (WizardNavItem, WizardBody, WizardToggle, WizardContextProvider) moved to deprecated in PF v6. Use the promoted Wizard API. Codemod: wizard-deprecated / wizardNext-promoted"
+
+- ruleID: pfv6-deprecated-select-old
+  description: "Old Select components must be migrated to new composable Select"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^(Select|SelectOption|SelectOptionObject|SelectOptionProps|SelectVariant|SelectDirection|SelectToggle|SelectGroup|SelectProps)$"
+      location: IMPORT
+      from: "@patternfly/react-core/deprecated"
+  message: "Old Select components are fully removed in PF v6. Migrate to the new composable Select from '@patternfly/react-core': use MenuToggle as the toggle prop render function, wrap options in SelectList, replace 'selections' with 'selected', 'onToggle' with 'onOpenChange', and 'onSelect' signature changes to (event, value). SelectOptionObject is replaced by string | number values. Codemod: select-deprecated / selectNext-promoted"
+
+- ruleID: pfv6-deprecated-dropdown-old
+  description: "Old Dropdown components must be migrated to new Dropdown"
+  labels: [change-type=component-removal, has-codemod=true]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^(Dropdown|DropdownItem|DropdownToggle|DropdownSeparator|DropdownToggleAction|DropdownToggleCheckbox|BadgeToggle|DropdownPosition|DropdownDirection)$"
+      location: IMPORT
+      from: "@patternfly/react-core/deprecated"
+  message: "Old Dropdown components are fully removed in PF v6. Migrate to the new Dropdown from '@patternfly/react-core': use MenuToggle as the toggle prop render function, wrap items in DropdownList, and replace 'onToggle' with 'onOpenChange'. Codemod: dropdown-deprecated"

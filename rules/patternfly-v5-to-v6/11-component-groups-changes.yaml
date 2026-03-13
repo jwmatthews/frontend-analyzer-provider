@@ -1,0 +1,70 @@
+# react-component-groups prop changes
+# Components from @patternfly/react-component-groups
+
+- ruleID: pfv6-cg-errorstate-props
+  description: "ErrorState: props renamed"
+  labels: [change-type=prop-rename, has-codemod=true, package=react-component-groups]
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^errorTitle$", location: JSX_PROP, component: "^ErrorState$" }
+      - frontend.referenced: { pattern: "^errorDescription$", location: JSX_PROP, component: "^ErrorState$" }
+      - frontend.referenced: { pattern: "^defaultErrorDescription$", location: JSX_PROP, component: "^ErrorState$" }
+  message: "ErrorState props renamed in PF v6: errorTitle->titleText, errorDescription->bodyText, defaultErrorDescription->defaultBodyText. Codemod: component-groups-errorState-rename-props"
+
+- ruleID: pfv6-cg-invalidobject-props
+  description: "InvalidObject/MissingPage: props renamed"
+  labels: [change-type=prop-rename, has-codemod=true, package=react-component-groups]
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^invalidObjectTitleText$", location: JSX_PROP, component: "^InvalidObject$" }
+      - frontend.referenced: { pattern: "^invalidObjectBodyText$", location: JSX_PROP, component: "^InvalidObject$" }
+  message: "InvalidObject props renamed in PF v6: invalidObjectTitleText->titleText, invalidObjectBodyText->bodyText. Codemod: component-groups-invalidObject-rename-props"
+
+- ruleID: pfv6-cg-logsnippet-props
+  description: "LogSnippet: leftBorderVariant replaced with variant"
+  labels: [change-type=prop-rename, has-codemod=true, package=react-component-groups]
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^leftBorderVariant$", location: JSX_PROP, component: "^LogSnippet$" }
+      - frontend.referenced: { pattern: "^LogSnippetBorderVariant$", location: IMPORT, from: "@patternfly/react-component-groups" }
+  message: "LogSnippet 'leftBorderVariant' replaced with 'variant' and LogSnippetBorderVariant enum replaced by AlertVariant in PF v6. Codemod: component-groups-logSnippet-rename-leftBorderVariant"
+
+- ruleID: pfv6-cg-multicontentcard-props
+  description: "MultiContentCard: leftBorderVariant and withHeaderBorder removed"
+  labels: [change-type=prop-removal, has-codemod=true, package=react-component-groups]
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^leftBorderVariant$", location: JSX_PROP, component: "^MultiContentCard$" }
+      - frontend.referenced: { pattern: "^withHeaderBorder$", location: JSX_PROP, component: "^MultiContentCard$" }
+  message: "MultiContentCard props 'leftBorderVariant' and 'withHeaderBorder' removed in PF v6 with no replacement. Codemod: component-groups-multiContentCard-remove-props"
+
+- ruleID: pfv6-cg-notauthorized-props
+  description: "NotAuthorized/UnauthorizedAccess: props renamed"
+  labels: [change-type=prop-rename, has-codemod=true, package=react-component-groups]
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^description$", location: JSX_PROP, component: "^(NotAuthorized|UnauthorizedAccess)$" }
+      - frontend.referenced: { pattern: "^title$", location: JSX_PROP, component: "^(NotAuthorized|UnauthorizedAccess)$" }
+  message: "NotAuthorized/UnauthorizedAccess props renamed: description->bodyText, title->titleText in PF v6. Codemod: component-groups-notAuthorized-rename-props"
+
+- ruleID: pfv6-cg-unavailablecontent-props
+  description: "UnavailableContent: props renamed and removed"
+  labels: [change-type=prop-rename, has-codemod=true, package=react-component-groups]
+  effort: 2
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^unavailableTitleText$", location: JSX_PROP, component: "^UnavailableContent$" }
+      - frontend.referenced: { pattern: "^unavailableBodyPreStatusLinkText$", location: JSX_PROP, component: "^UnavailableContent$" }
+      - frontend.referenced: { pattern: "^unavailableBodyPostStatusLinkText$", location: JSX_PROP, component: "^UnavailableContent$" }
+  message: "UnavailableContent props changed in PF v6: unavailableTitleText->titleText. Props unavailableBodyPreStatusLinkText and unavailableBodyPostStatusLinkText removed, replaced by single 'bodyText' prop. Codemod: component-groups-unavailableContent-rename-props"

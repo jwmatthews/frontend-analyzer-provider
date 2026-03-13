@@ -1,0 +1,136 @@
+# Prop removals — codemod-covered
+
+- ruleID: pfv6-prop-remove-accordion-ishidden
+  description: "AccordionContent: isHidden prop removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isHidden$", location: JSX_PROP, component: "^AccordionContent$" }
+  message: "AccordionContent 'isHidden' prop removed. Visibility is now set by 'isExpanded' on AccordionItem. Codemod: accordionContent-remove-isHidden-prop"
+
+- ruleID: pfv6-prop-remove-card-various
+  description: "Card: multiple props removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(isSelectableRaised|isDisabledRaised|hasSelectableInput|selectableInputAriaLabel|onSelectableInputChange|isFlat|isRounded)$", location: JSX_PROP, component: "^Card$" }
+  message: "Card props isSelectableRaised, isDisabledRaised, hasSelectableInput, selectableInputAriaLabel, onSelectableInputChange, isFlat, isRounded removed in PF v6. Codemod: card-remove-various-props"
+
+- ruleID: pfv6-prop-remove-datalist-plain-button
+  description: "DataListAction: isPlainButtonAction removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isPlainButtonAction$", location: JSX_PROP, component: "^DataListAction$" }
+  message: "DataListAction 'isPlainButtonAction' prop removed in PF v6. Codemod: dataListAction-remove-isPlainButtonAction-prop"
+
+- ruleID: pfv6-prop-remove-drawer-nopadding
+  description: "DrawerHead: hasNoPadding removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^hasNoPadding$", location: JSX_PROP, component: "^DrawerHead$" }
+  message: "DrawerHead 'hasNoPadding' prop removed in PF v6. Codemod: drawer-remove-props"
+
+- ruleID: pfv6-prop-remove-expandable-isactive
+  description: "ExpandableSection: isActive prop removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isActive$", location: JSX_PROP, component: "^ExpandableSection$" }
+  message: "ExpandableSection 'isActive' prop removed in PF v6. Codemod: expandableSection-remove-isActive-prop"
+
+- ruleID: pfv6-prop-remove-helpertext-props
+  description: "HelperTextItem: hasIcon and isDynamic removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(hasIcon|isDynamic)$", location: JSX_PROP, component: "^HelperTextItem$" }
+  message: "HelperTextItem 'hasIcon' and 'isDynamic' props removed in PF v6. Codemod: helperTextItem-remove-props"
+
+- ruleID: pfv6-prop-remove-masthead-bgcolor
+  description: "Masthead: backgroundColor removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^backgroundColor$", location: JSX_PROP, component: "^Masthead$" }
+  message: "Masthead 'backgroundColor' prop removed in PF v6. Codemod: masthead-remove-background-color"
+
+- ruleID: pfv6-prop-remove-nav-theme
+  description: "Nav: theme prop removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^theme$", location: JSX_PROP, component: "^(Nav|PageSidebar)$" }
+  message: "Nav/PageSidebar 'theme' prop removed in PF v6. Codemod: nav-remove-theme-prop / pageSidebar-remove-theme-prop"
+
+- ruleID: pfv6-prop-remove-navitem-wrapper
+  description: "NavItem: hasNavLinkWrapper removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^hasNavLinkWrapper$", location: JSX_PROP, component: "^NavItem$" }
+  message: "NavItem 'hasNavLinkWrapper' prop removed in PF v6. Codemod: navItem-remove-hasNavLinkWrapper-prop"
+
+- ruleID: pfv6-prop-remove-switch-labeloff
+  description: "Switch: labelOff removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^labelOff$", location: JSX_PROP, component: "^Switch$" }
+  message: "Switch 'labelOff' prop removed in PF v6. Codemod: switch-remove-labelOff"
+
+- ruleID: pfv6-prop-remove-toolbar-various
+  description: "Toolbar: usePageInsets, alignSelf, widths removed"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(usePageInsets|alignSelf|widths|alignment)$", location: JSX_PROP, component: "^(Toolbar|ToolbarContent|ToolbarGroup|ToolbarItem|ToolbarToggleGroup)$" }
+  message: "Toolbar props usePageInsets, alignSelf, widths, alignment removed in PF v6. Codemod: toolbar-remove-props"
+
+- ruleID: pfv6-prop-remove-navlist-aria-scroll
+  description: "NavList: ariaLeftScroll and ariaRightScroll removed"
+  labels: [change-type=prop-removal, has-codemod=false]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(ariaLeftScroll|ariaRightScroll)$", location: JSX_PROP, component: "^NavList$" }
+  message: "NavList props ariaLeftScroll and ariaRightScroll removed in PF v6."
+
+- ruleID: pfv6-prop-remove-duallist-onoptionselect
+  description: "DualListSelectorListWrapper: onOptionSelect removed"
+  labels: [change-type=prop-removal, has-codemod=false]
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^onOptionSelect$", location: JSX_PROP, component: "^DualListSelectorListWrapper$" }
+  message: "DualListSelectorListWrapper 'onOptionSelect' prop has been removed in PF v6."
+
+- ruleID: pfv6-prop-remove-accordion-toggle-isexpanded
+  description: "AccordionToggle: isExpanded moved to AccordionItem"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isExpanded$", location: JSX_PROP, component: "^AccordionToggle$" }
+  message: "AccordionToggle 'isExpanded' prop moved to AccordionItem in PF v6. Set isExpanded on AccordionItem instead. Codemod: accordionToggle-move-isExpanded"
+
+- ruleID: pfv6-prop-remove-cardheader-selectableactions
+  description: "CardHeader: selectableActions simplified for clickable-only"
+  labels: [change-type=prop-removal, has-codemod=true]
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^selectableActions$", location: JSX_PROP, component: "^CardHeader$" }
+  message: "CardHeader 'selectableActions' changed in PF v6: for clickable-only cards, selectableActionId and name are no longer needed. Codemod: cardHeader-update-selectableActions"

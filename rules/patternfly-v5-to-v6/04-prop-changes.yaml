@@ -1,0 +1,43 @@
+- ruleID: pfv6-prop-isactive-to-isclicked
+  description: "AlertActionCloseButton/Link: isActive renamed to isClicked"
+  labels:
+    - change-type=inherited-rename
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "isActive"
+      location: JSX_PROP
+      component: "^(AlertActionCloseButton|AlertActionLink)$"
+  message: "The 'isActive' prop has been renamed to 'isClicked' on AlertActionCloseButton and AlertActionLink in PF v6. Update prop usage."
+
+- ruleID: pfv6-prop-clipboard-children-type
+  description: "ClipboardCopy.children: type narrowed from ReactNode to string"
+  labels:
+    - change-type=prop-type-narrow
+    - has-codemod=false
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "ClipboardCopy"
+      location: JSX_COMPONENT
+  message: "ClipboardCopy children type narrowed from ReactNode to string | string[] in PF v6. Non-string children will cause a TypeScript error."
+
+- ruleID: pfv6-prop-navlist-aria-scroll
+  description: "NavList: ariaLeftScroll and ariaRightScroll props removed"
+  labels:
+    - change-type=prop-removal
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced:
+          pattern: "ariaLeftScroll"
+          location: JSX_PROP
+      - frontend.referenced:
+          pattern: "ariaRightScroll"
+          location: JSX_PROP
+  message: "NavList props 'ariaLeftScroll' and 'ariaRightScroll' have been removed in PF v6. Scroll buttons are now wrapped in a new div with conditional rendering."

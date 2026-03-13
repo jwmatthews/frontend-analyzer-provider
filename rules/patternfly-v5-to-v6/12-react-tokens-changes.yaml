@@ -1,0 +1,50 @@
+# react-tokens changes
+# Token import names and CSS variable prefixes changed in PF v6
+
+- ruleID: pfv6-tokens-global-vars
+  description: "react-tokens: global_* token imports need updating"
+  labels: [change-type=token-rename, has-codemod=true, package=react-tokens]
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^global_"
+      location: IMPORT
+      from: "@patternfly/react-tokens"
+  message: "Global token imports (global_*) from @patternfly/react-tokens have changed in PF v6. CSS variable prefixes changed from --pf-v5-global to --pf-t--global. For global color tokens (e.g., global_danger_color_100, global_success_color_100), the recommended replacement is to use the PF Icon component with a semantic status prop (e.g., <Icon status=\"danger\"><ExclamationCircleIcon /></Icon>) instead of applying color values directly. Non-color global tokens are auto-fixable. Codemod: tokens-update"
+
+- ruleID: pfv6-tokens-component-vars
+  description: "react-tokens: c_* component tokens reorganized"
+  labels: [change-type=token-rename, has-codemod=false, package=react-tokens]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^c_[a-z]"
+      location: IMPORT
+      from: "@patternfly/react-tokens"
+  message: "Component-level tokens (c_*) from @patternfly/react-tokens have been reorganized in PF v6. There is no automated mapping -- manual replacement is required."
+
+- ruleID: pfv6-tokens-chart-vars
+  description: "react-tokens: chart_* tokens reorganized"
+  labels: [change-type=token-rename, has-codemod=false, package=react-tokens]
+  effort: 5
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^chart_"
+      location: IMPORT
+      from: "@patternfly/react-tokens"
+  message: "Chart tokens (chart_*) from @patternfly/react-tokens have been reorganized in PF v6. Manual replacement is required."
+
+- ruleID: pfv6-tokens-theme-prefix
+  description: "react-tokens: theme tokens need t_ prefix"
+  labels: [change-type=token-rename, has-codemod=true, package=react-tokens]
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^(color_|motion_|opacity_|font_size_|box_shadow_|border_radius_)"
+      location: IMPORT
+      from: "@patternfly/react-tokens"
+  message: "Theme tokens in @patternfly/react-tokens are now prefixed with 't_' in PF v6 (e.g., color_green_10 -> t_color_green_10). Codemod: tokens-update"

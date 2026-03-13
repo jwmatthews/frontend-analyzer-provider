@@ -1,0 +1,132 @@
+- ruleID: pfv6-a11y-clipboard-copy-aria
+  description: "ClipboardCopyButton: aria-labelledby removed"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 3
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "ClipboardCopyButton"
+      location: JSX_COMPONENT
+  message: "ClipboardCopyButton no longer renders aria-labelledby on the Button element in PF v6. If you relied on this for accessibility, add an explicit aria-label prop."
+
+- ruleID: pfv6-a11y-nav-separator-role
+  description: "NavItemSeparator: default role changed to presentation"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "NavItemSeparator"
+      location: JSX_COMPONENT
+  message: "NavItemSeparator default role changed from 'separator' to 'presentation' in PF v6. If screen readers rely on the separator role, pass role='separator' explicitly."
+
+- ruleID: pfv6-a11y-expandable-section-button
+  description: "ExpandableSectionToggle: native button replaced with PF Button"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 3
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "ExpandableSection"
+      location: JSX_COMPONENT
+  message: "ExpandableSectionToggle now renders a PF <Button> instead of a native <button> in PF v6. The aria-hidden attribute on the toggle icon has been removed. Test with screen readers if you have custom a11y handling."
+
+# Pipeline extras — accessibility changes not covered by codemods
+
+- ruleID: pfv6-a11y-file-upload-aria
+  description: "FileUploadField: aria-describedby removed"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^(FileUpload|FileUploadField)$"
+      location: JSX_COMPONENT
+  message: "FileUploadField no longer renders aria-describedby on the filename TextInput in PF v6. If you relied on this for screen reader descriptions, add an explicit aria-describedby prop."
+
+- ruleID: pfv6-a11y-jumplinks-aria
+  description: "JumpLinks: ARIA label and labelledby changes"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^JumpLinks$"
+      location: JSX_COMPONENT
+  message: "JumpLinks nav element aria-label/aria-labelledby logic changed in PF v6. The internal <ul> also gets new aria-label and aria-labelledby attributes. Review ARIA labeling if you test for specific aria attributes."
+
+- ruleID: pfv6-a11y-number-input-icons
+  description: "NumberInput: icons via prop instead of children"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^NumberInput$"
+      location: JSX_COMPONENT
+  message: "NumberInput now passes icons via the icon prop instead of children in PF v6. Screen reader traversal order may be affected. Test accessibility with screen readers."
+
+- ruleID: pfv6-a11y-progress-role
+  description: "ProgressContainer: role=progressbar and aria-hidden changes"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 3
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Progress$"
+      location: JSX_COMPONENT
+  message: "Progress component moved role='progressbar' from ProgressBar child element in PF v6. The aria-hidden on title/description div is now conditionally applied based on truncation. Test with screen readers if you use Progress with custom descriptions."
+
+- ruleID: pfv6-a11y-truncate-tabindex
+  description: "Truncate: tabIndex={0} added when truncated"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Truncate$"
+      location: JSX_COMPONENT
+  message: "Truncate now adds tabIndex={0} when content is truncated in PF v6, improving keyboard accessibility. This changes tab order — truncated content is now focusable."
+
+- ruleID: pfv6-a11y-datepicker-toggle
+  description: "DatePicker: toggle button element type changed"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^DatePicker$"
+      location: JSX_COMPONENT
+  message: "DatePicker toggle button element type has changed in PF v6. Test accessibility with screen readers and keyboard navigation if you use DatePicker."
+
+- ruleID: pfv6-a11y-textarea-autoresize
+  description: "TextArea: autoResize height calculation changed"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^autoResize$"
+      location: JSX_PROP
+      component: "^TextArea$"
+  message: "TextArea autoResize height calculation now uses computed styles instead of field padding in PF v6. TextAreas with autoResize may render at different heights."

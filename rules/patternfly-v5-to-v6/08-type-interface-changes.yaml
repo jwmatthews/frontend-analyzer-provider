@@ -1,0 +1,98 @@
+# TypeScript interface, type, and enum changes — pipeline extras (no codemod)
+# The TypeScript compiler will catch most of these at build time.
+
+- ruleID: pfv6-type-text-interfaces-removed
+  description: "TextContentProps, TextListProps, TextListItemProps removed"
+  labels:
+    - change-type=interface-removal
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^TextContentProps$", location: TYPE_REFERENCE }
+      - frontend.referenced: { pattern: "^TextListProps$", location: TYPE_REFERENCE }
+      - frontend.referenced: { pattern: "^TextListItemProps$", location: TYPE_REFERENCE }
+  message: "TextContentProps, TextListProps, and TextListItemProps interfaces have been removed in PF v6. Use ContentProps from the new Content component instead."
+
+- ruleID: pfv6-type-text-variants-removed
+  description: "TextListVariants, TextListItemVariants enums removed"
+  labels:
+    - change-type=interface-removal
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^TextListVariants$", location: IMPORT }
+      - frontend.referenced: { pattern: "^TextListItemVariants$", location: IMPORT }
+  message: "TextListVariants and TextListItemVariants enums have been removed in PF v6. They are merged into ContentVariants."
+
+- ruleID: pfv6-type-modal-box-interfaces
+  description: "ModalBox* interfaces removed or renamed"
+  labels:
+    - change-type=interface-removal
+    - has-codemod=false
+  effort: 2
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^ModalBoxProps$", location: TYPE_REFERENCE }
+      - frontend.referenced: { pattern: "^ModalBoxFooterProps$", location: TYPE_REFERENCE }
+      - frontend.referenced: { pattern: "^ModalBoxBodyProps$", location: TYPE_REFERENCE }
+      - frontend.referenced: { pattern: "^ModalBoxHeaderProps$", location: TYPE_REFERENCE }
+      - frontend.referenced: { pattern: "^ModalBoxCloseButtonProps$", location: TYPE_REFERENCE }
+  message: "ModalBox* interfaces are removed or renamed in PF v6: ModalBoxProps and ModalBoxCloseButtonProps are no longer exported, ModalBoxBodyProps renamed to ModalBodyProps, ModalBoxFooterProps and ModalBoxHeaderProps moved to deprecated."
+
+- ruleID: pfv6-type-menu-toggle-checkbox-narrowed
+  description: "MenuToggleCheckbox: defaultChecked type narrowed"
+  labels:
+    - change-type=prop-type-change
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^defaultChecked$"
+      location: JSX_PROP
+      component: "^MenuToggleCheckbox$"
+  message: "MenuToggleCheckbox 'defaultChecked' prop type narrowed from boolean | null to boolean in PF v6. Remove null values."
+
+- ruleID: pfv6-type-calendar-inline-component
+  description: "CalendarMonthInlineProps: component type changed"
+  labels:
+    - change-type=prop-type-change
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^CalendarMonthInlineProps$"
+      location: TYPE_REFERENCE
+  message: "CalendarMonthInlineProps 'component' property type changed from JSX.IntrinsicElements to React.JSX.IntrinsicElements in PF v6."
+
+- ruleID: pfv6-type-datalist-check-props
+  description: "DataListCheckProps: extends CheckboxProps instead of HTMLProps"
+  labels:
+    - change-type=prop-type-change
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^DataListCheckProps$"
+      location: TYPE_REFERENCE
+  message: "DataListCheckProps now extends CheckboxProps instead of React.HTMLProps<HTMLInputElement> in PF v6. HTML input props that don't exist on Checkbox will cause TypeScript errors."
+
+- ruleID: pfv6-type-expandable-toggle-props
+  description: "ExpandableSectionToggleProps: omits onToggle"
+  labels:
+    - change-type=prop-type-change
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^ExpandableSectionToggleProps$"
+      location: TYPE_REFERENCE
+  message: "ExpandableSectionToggleProps now omits 'onToggle' from React.HTMLProps in PF v6. Passing onToggle via HTML props spread will no longer type-check."

@@ -1,0 +1,3 @@
+Using existing protoc installation
+cargo:rerun-if-changed=../../proto/provider.proto
+cargo:rerun-if-changed=../../proto/

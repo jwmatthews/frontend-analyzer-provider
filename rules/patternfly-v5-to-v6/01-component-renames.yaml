@@ -1,0 +1,109 @@
+# Component renames — codemod-covered
+# These have automated fixes via pf-codemods
+
+- ruleID: pfv6-rename-chip-to-label
+  description: "Chip/ChipGroup renamed to Label/LabelGroup"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^Chip$", location: JSX_COMPONENT }
+      - frontend.referenced: { pattern: "^ChipGroup$", location: JSX_COMPONENT }
+  message: "Chip/ChipGroup have been renamed to Label/LabelGroup in PF v6. Codemod: chip-replace-with-label"
+  links:
+    - url: "https://www.patternfly.org/get-started/upgrade"
+      title: "PF v6 Upgrade Guide"
+
+- ruleID: pfv6-rename-toolbar-chip-group-content
+  description: "ToolbarChipGroupContent renamed to ToolbarLabelGroupContent"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "ToolbarChipGroupContent", location: IMPORT }
+  message: "ToolbarChipGroupContent renamed to ToolbarLabelGroupContent. Codemod: toolbarChipGroupContent-rename-component"
+
+- ruleID: pfv6-rename-masthead-brand
+  description: "MastheadBrand renamed to MastheadLogo"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^MastheadBrand$", location: JSX_COMPONENT }
+  message: "MastheadBrand renamed to MastheadLogo in PF v6. Codemod: masthead-name-changes"
+
+- ruleID: pfv6-rename-content-header
+  description: "ContentHeader renamed to PageHeader (component-groups)"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^ContentHeader$", location: JSX_COMPONENT }
+  message: "ContentHeader renamed to PageHeader in @patternfly/react-component-groups v6. Codemod: component-groups-contentHeader-rename-to-pageHeader"
+
+- ruleID: pfv6-rename-invalid-object
+  description: "InvalidObject renamed to MissingPage"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^InvalidObject$", location: JSX_COMPONENT }
+  message: "InvalidObject renamed to MissingPage in PF v6. Codemod: component-groups-invalidObject-rename-to-missingPage"
+
+- ruleID: pfv6-rename-not-authorized
+  description: "NotAuthorized renamed to UnauthorizedAccess"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^NotAuthorized$", location: JSX_COMPONENT }
+  message: "NotAuthorized renamed to UnauthorizedAccess in PF v6. Codemod: component-groups-notAuthorized-rename-to-unauthorizedAccess"
+
+- ruleID: pfv6-rename-text-to-content
+  description: "Text/TextContent/TextList/TextListItem replaced with Content"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 3
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^(Text|TextContent|TextList|TextListItem)$", location: IMPORT }
+  message: "Text, TextContent, TextList, and TextListItem are replaced by the single Content component in PF v6. Codemod: text-replace-with-content"
+
+- ruleID: pfv6-rename-form-field-group-typo
+  description: "FormFiledGroupHeaderTitleTextObject: typo fix rename"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^FormFiledGroupHeaderTitleTextObject$", location: IMPORT }
+  message: "FormFiledGroupHeaderTitleTextObject (misspelled) renamed to FormFieldGroupHeaderTitleTextObject (typo fix) in PF v6. Codemod: formFieldGroupHeaderTitleTextObject-rename"
+
+- ruleID: pfv6-rename-text-variants
+  description: "TextVariants/TextProps renamed to Content equivalents"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^TextVariants$", location: IMPORT }
+      - frontend.referenced: { pattern: "^TextProps$", location: IMPORT }
+  message: "TextVariants renamed to ContentVariants and TextProps renamed to ContentProps in PF v6. Codemod: text-replace-with-content"
+
+- ruleID: pfv6-rename-text-isvisited
+  description: "Text isVisited renamed to isVisitedLink on Content"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isVisited$", location: JSX_PROP, component: "^(Text|Content)$" }
+  message: "Text/Content 'isVisited' prop renamed to 'isVisitedLink' in PF v6. Codemod: text-replace-with-content"
+
+- ruleID: pfv6-rename-textlist-isplain
+  description: "TextList isPlain renamed to isPlainList on Content"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isPlain$", location: JSX_PROP, component: "^(TextList|Content)$" }
+  message: "TextList/Content 'isPlain' prop renamed to 'isPlainList' in PF v6. Codemod: text-replace-with-content"

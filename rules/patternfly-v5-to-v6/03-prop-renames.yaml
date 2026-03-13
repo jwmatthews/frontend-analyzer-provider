@@ -1,0 +1,133 @@
+# Prop renames — codemod-covered
+
+- ruleID: pfv6-prop-rename-button-isactive
+  description: "Button: isActive renamed to isClicked"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isActive$", location: JSX_PROP, component: "^(Button|AlertActionCloseButton|AlertActionLink)$" }
+  message: "Button 'isActive' prop renamed to 'isClicked' in PF v6. Codemod: button-rename-isActive"
+
+- ruleID: pfv6-prop-rename-page-header
+  description: "Page: header renamed to masthead"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^header$", location: JSX_PROP, component: "^Page$" }
+  message: "Page 'header' prop renamed to 'masthead' in PF v6. Codemod: page-rename-header"
+
+- ruleID: pfv6-prop-rename-page-tertiary-nav
+  description: "Page: tertiaryNav renamed to horizontalSubnav"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^tertiaryNav$", location: JSX_PROP, component: "^Page$" }
+  message: "Page 'tertiaryNav' prop renamed to 'horizontalSubnav' in PF v6. Codemod: page-rename-tertiaryNav"
+
+- ruleID: pfv6-prop-rename-page-is-tertiary-grouped
+  description: "Page: isTertiaryNavGrouped renamed to isHorizontalSubnavGrouped"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isTertiaryNavGrouped$", location: JSX_PROP, component: "^Page$" }
+  message: "Page 'isTertiaryNavGrouped' renamed to 'isHorizontalSubnavGrouped'. Codemod: page-rename-isTertiaryNavGrouped"
+
+- ruleID: pfv6-prop-rename-page-is-tertiary-width-limited
+  description: "Page: isTertiaryNavWidthLimited renamed"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isTertiaryNavWidthLimited$", location: JSX_PROP, component: "^Page$" }
+  message: "Page 'isTertiaryNavWidthLimited' renamed to 'isHorizontalSubnavWidthLimited'. Codemod: page-rename-isTertiaryNavWidthLimited"
+
+- ruleID: pfv6-prop-rename-avatar-border
+  description: "Avatar: border renamed to isBordered"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^border$", location: JSX_PROP, component: "^Avatar$" }
+  message: "Avatar 'border' prop replaced with 'isBordered' in PF v6. Codemod: avatar-replace-border-for-isBordered"
+
+- ruleID: pfv6-prop-rename-formgroup-labelicon
+  description: "FormGroup: labelIcon renamed to labelHelp"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^labelIcon$", location: JSX_PROP, component: "^FormGroup$" }
+  message: "FormGroup 'labelIcon' prop renamed to 'labelHelp' in PF v6. Codemod: formGroup-rename-labelIcon"
+
+- ruleID: pfv6-prop-rename-tabs-issecondary
+  description: "Tabs: isSecondary renamed to isSubtab"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isSecondary$", location: JSX_PROP, component: "^Tabs$" }
+  message: "Tabs 'isSecondary' prop renamed to 'isSubtab' in PF v6. Codemod: tabs-renamed-isSecondary-prop"
+
+- ruleID: pfv6-prop-rename-checkbox-label-position
+  description: "Checkbox/Radio: isLabelBeforeButton replaced with labelPosition"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isLabelBeforeButton$", location: JSX_PROP, component: "^(Checkbox|Radio)$" }
+  message: "Checkbox/Radio 'isLabelBeforeButton' replaced with labelPosition='start' in PF v6. Codemod: checkbox-radio-replace-isLabelBeforeButton"
+
+- ruleID: pfv6-prop-rename-toolbar-chip-to-label
+  description: "Toolbar: chip-based props renamed to label-based"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 3
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^(customChipGroupContent|chipGroupContentRef|chipGroupExpandedText|chipGroupCollapsedText|chips|deleteChip|deleteChipGroup|categoryName)$", location: JSX_PROP }
+  message: "Toolbar chip-based props renamed to label equivalents in PF v6 (e.g., chips→labels, deleteChip→deleteLabel). Codemod: toolbar-replace-chip-instances"
+
+- ruleID: pfv6-prop-rename-menutoggle-splitbutton
+  description: "MenuToggle: splitButtonOptions renamed to splitButtonItems"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^splitButtonOptions$", location: JSX_PROP, component: "^MenuToggle$" }
+  message: "MenuToggle 'splitButtonOptions' renamed to 'splitButtonItems' in PF v6. The SplitButtonOptions interface is removed; pass items directly. Codemod: menuToggle-replace-splitButtonOptions"
+
+- ruleID: pfv6-prop-rename-toolbar-align
+  description: "Toolbar: align values alignLeft/alignRight renamed"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^align$", location: JSX_PROP, component: "^(ToolbarGroup|ToolbarItem|ToolbarToggleGroup)$" }
+  message: "Toolbar align values renamed: 'alignLeft'->'alignStart', 'alignRight'->'alignEnd' in PF v6. Codemod: toolbar-replace-align-values"
+
+- ruleID: pfv6-prop-rename-toolbar-chip-interfaces
+  description: "ToolbarChip/ToolbarChipGroup interfaces renamed"
+  labels: [change-type=component-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    or:
+      - frontend.referenced: { pattern: "^ToolbarChipGroup$", location: TYPE_REFERENCE }
+      - frontend.referenced: { pattern: "^ToolbarChip$", location: TYPE_REFERENCE }
+  message: "ToolbarChipGroup renamed to ToolbarLabelGroup and ToolbarChip renamed to ToolbarLabel in PF v6. Codemod: toolbar-replace-chip-instances"
+
+- ruleID: pfv6-prop-rename-innerref-to-ref
+  description: "innerRef replaced with standard React ref"
+  labels: [change-type=prop-rename, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^innerRef$"
+      location: JSX_PROP
+      component: "^(MenuToggle|Table|Td|Th|Tr|TextInputGroupMain)$"
+  message: "PF v6 adopted standard React ref forwarding. The 'innerRef' prop has been removed on MenuToggle, Table, Td, Th, Tr, and TextInputGroupMain. Use the standard 'ref' prop instead."

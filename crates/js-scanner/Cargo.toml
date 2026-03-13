@@ -1,0 +1,26 @@
+[package]
+name = "frontend-js-scanner"
+version = "0.1.0"
+edition = "2021"
+description = "OXC-based JS/TS/JSX/TSX analysis for frontend-analyzer-provider"
+
+[dependencies]
+frontend-core = { path = "../core" }
+
+# OXC - JavaScript/TypeScript toolchain
+oxc_parser = "0.116"
+oxc_ast = "0.116"
+oxc_allocator = "0.116"
+oxc_span = "0.116"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+
+# Utilities
+regex = "1"
+walkdir = "2"
+tracing = "0.1"

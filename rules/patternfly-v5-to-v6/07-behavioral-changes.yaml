@@ -1,0 +1,149 @@
+# Behavioral and icon prop migration changes — pipeline extras (no codemod)
+# Runtime behavior changes and icon rendering changes that affect
+# user interaction patterns, focus management, and DOM icon positions.
+
+- ruleID: pfv6-behavioral-menu-hover
+  description: "Menu: hover behavior during keyboard navigation changed"
+  labels:
+    - change-type=behavioral
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Menu$"
+      location: JSX_COMPONENT
+  message: "Menu no longer sets disableHover during keyboard events in PF v6. Hover highlighting persists during keyboard navigation. Test menus with both mouse and keyboard interaction."
+
+- ruleID: pfv6-behavioral-menu-container-focus
+  description: "MenuContainer: no auto-focus on toggle"
+  labels:
+    - change-type=behavioral
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^MenuContainer$"
+      location: JSX_COMPONENT
+  message: "MenuContainer no longer auto-focuses the first menu item when toggling closed/open in PF v6. Test focus management if you rely on automatic first-item focus."
+
+- ruleID: pfv6-behavioral-clipboard-copy-join
+  description: "ClipboardCopy: string array joined with space"
+  labels:
+    - change-type=behavioral
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^ClipboardCopy$"
+      location: JSX_COMPONENT
+  message: "ClipboardCopy now joins string array children with a space instead of empty string in PF v6. If you pass multiple string children, verify the copied text includes expected spaces."
+
+- ruleID: pfv6-icon-clipboard-copy-button
+  description: "ClipboardCopyButton: CopyIcon passed via icon prop"
+  labels:
+    - change-type=icon-prop-migration
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^ClipboardCopyButton$"
+      location: JSX_COMPONENT
+  message: "ClipboardCopyButton now passes CopyIcon via the Button icon prop instead of children in PF v6. Custom CSS targeting the icon DOM position within the button will break."
+
+- ruleID: pfv6-icon-tab-action
+  description: "TabAction: button children via icon prop"
+  labels:
+    - change-type=icon-prop-migration
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^TabAction$"
+      location: JSX_COMPONENT
+  message: "TabAction now passes button children via the icon prop instead of direct children in PF v6. Custom CSS targeting the icon DOM position will break."
+
+- ruleID: pfv6-icon-multiple-file-upload-close
+  description: "MultipleFileUploadStatusItem: close button uses icon prop"
+  labels:
+    - change-type=icon-prop-migration
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^MultipleFileUploadStatusItem$"
+      location: JSX_COMPONENT
+  message: "MultipleFileUploadStatusItem close button now uses the icon prop instead of children, and the icon changed from TimesCircleIcon to TimesIcon in PF v6."
+
+- ruleID: pfv6-behavioral-button-icon-children
+  description: "Button: icon children should use icon prop instead"
+  labels:
+    - change-type=behavioral
+    - has-codemod=true
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "Icon$"
+      location: JSX_COMPONENT
+      parent: "^Button$"
+  message: "Icons passed as children of Button must now use the 'icon' prop instead in PF v6. Replace <Button><SomeIcon /></Button> with <Button icon={<SomeIcon />} />. Codemod: button-move-icons-to-icon-prop"
+
+# Additional behavioral changes from pf-codemods-v5-v6.json
+
+- ruleID: pfv6-behavioral-button-isfavorite
+  description: "Button: StarIcon usage should use isFavorite prop"
+  labels:
+    - change-type=behavioral
+    - has-codemod=true
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^StarIcon$"
+      location: JSX_COMPONENT
+  message: "StarIcon usage with Button should be replaced with the new 'isFavorite' and 'isFavorited' props on Button in PF v6. Codemod: button-replace-starIcon-with-isFavorite"
+
+- ruleID: pfv6-behavioral-drawer-panel-body
+  description: "DrawerHead: DrawerPanelBody no longer rendered internally"
+  labels:
+    - change-type=behavioral
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^DrawerHead$"
+      location: JSX_COMPONENT
+  message: "DrawerHead no longer renders DrawerPanelBody internally in PF v6. If you relied on the implicit wrapping, add DrawerPanelBody explicitly."
+
+- ruleID: pfv6-behavioral-login-header-element
+  description: "LoginMainHeader: wrapper changed from header to div"
+  labels:
+    - change-type=behavioral
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^LoginMainHeader$"
+      location: JSX_COMPONENT
+  message: "LoginMainHeader wrapper element changed from <header> to <div> in PF v6. CSS selectors or accessibility tools relying on the <header> element will break."
+
+- ruleID: pfv6-behavioral-jumplinks-item-button
+  description: "JumpLinksItem: uses Button component internally"
+  labels:
+    - change-type=behavioral
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^JumpLinksItem$"
+      location: JSX_COMPONENT
+  message: "JumpLinksItem now uses Button component internally in PF v6. The onClick handler type changed to React.MouseEvent. This may break existing event handler signatures."

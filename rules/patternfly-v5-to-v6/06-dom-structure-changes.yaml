@@ -1,0 +1,253 @@
+# DOM structure changes — pipeline extras (no codemod)
+# Changes to rendered HTML element tree that break snapshot tests,
+# CSS selectors targeting specific DOM structure, and E2E tests.
+
+- ruleID: pfv6-dom-expandable-section-toggle
+  description: "ExpandableSectionToggle: wrapper div added, span removed"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^ExpandableSection$"
+      location: JSX_COMPONENT
+  message: "ExpandableSectionToggle in PF v6 adds a new wrapper <div> around the button and no longer wraps toggle text in a <span>. Update snapshot tests and CSS selectors targeting the toggle DOM structure."
+
+- ruleID: pfv6-dom-navlist-scroll-buttons
+  description: "NavList: scroll buttons wrapped and conditionally rendered"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^NavList$"
+      location: JSX_COMPONENT
+  message: "NavList scroll buttons are now wrapped in a new <div> and only rendered when scrolling is needed in PF v6. Update tests or CSS targeting scroll button elements."
+
+- ruleID: pfv6-dom-progress-tooltip
+  description: "ProgressContainer: tooltip and truncation DOM changes"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Progress$"
+      location: JSX_COMPONENT
+  message: "Progress component tooltip is now rendered as a sibling with triggerRef instead of wrapping the child in PF v6. Truncated titles also get tabIndex, onFocus, and ref. Update CSS and tests targeting Progress tooltip structure."
+
+- ruleID: pfv6-dom-truncate-tooltip
+  description: "Truncate: tooltip rendered as sibling"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Truncate$"
+      location: JSX_COMPONENT
+  message: "Truncate tooltip is now rendered as a sibling instead of wrapping the content in PF v6. Update CSS and tests targeting Truncate tooltip structure."
+
+- ruleID: pfv6-dom-dropdown-item-tooltip
+  description: "DropdownItem: tooltip rendered as sibling"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^DropdownItem$"
+      location: JSX_COMPONENT
+  message: "DropdownItem tooltip is now rendered as a sibling instead of wrapping the element in PF v6. Update CSS and tests targeting DropdownItem tooltip structure."
+
+- ruleID: pfv6-dom-menu-item-tooltip
+  description: "MenuItem: tooltip rendered as sibling"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^MenuItem$"
+      location: JSX_COMPONENT
+  message: "MenuItem tooltip is now rendered as a sibling instead of wrapping the element in PF v6. Update CSS and tests targeting MenuItem tooltip structure."
+
+- ruleID: pfv6-dom-nav-expandable-inert
+  description: "NavExpandable: collapsed section gets inert attribute"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^NavExpandable$"
+      location: JSX_COMPONENT
+  message: "NavExpandable section gets the 'inert' HTML attribute when collapsed in PF v6. This prevents focus on hidden elements. Test keyboard navigation if you have custom handlers."
+
+- ruleID: pfv6-dom-menu-group-label
+  description: "MenuGroup: label div conditionally rendered"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^MenuGroup$"
+      location: JSX_COMPONENT
+  message: "MenuGroup label div is now only rendered when the label prop is truthy in PF v6. CSS selectors or tests targeting the label div when no label is set will break."
+
+- ruleID: pfv6-dom-hint-actions
+  description: "Hint: actions div conditionally rendered"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Hint$"
+      location: JSX_COMPONENT
+  message: "Hint actions div is now only rendered when the actions prop is provided in PF v6. CSS selectors or tests targeting the actions div without the actions prop will break."
+
+- ruleID: pfv6-dom-list-item-wrapper
+  description: "ListItem: children wrapped in span"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^ListItem$"
+      location: JSX_COMPONENT
+  message: "ListItem children are now wrapped in a <span> instead of rendered directly in <li> in PF v6. Update CSS selectors and snapshot tests."
+
+# Additional DOM structure changes from pf-codemods-v5-v6.json
+
+- ruleID: pfv6-dom-accordion-item-wrapper
+  description: "AccordionItem: wrapping div added"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^AccordionItem$"
+      location: JSX_COMPONENT
+  message: "AccordionItem now renders a wrapping <div> element in PF v6. This may break CSS selectors or snapshot tests that rely on the previous DOM structure."
+
+- ruleID: pfv6-dom-masthead-layout
+  description: "Masthead: layout restructured — MastheadToggle moves inside MastheadMain"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=true
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^(MastheadToggle|MastheadMain)$"
+      location: JSX_COMPONENT
+  message: "Masthead layout restructured in PF v6. Move MastheadToggle INSIDE MastheadMain (it was a sibling before). Wrap the Brand component with MastheadLogo inside MastheadBrand. Replace <Button variant='plain'><BarsIcon /></Button> inside MastheadToggle with <PageToggleButton isHamburgerButton onSidebarToggle={handler} />. The new structure is: <Masthead> <MastheadMain> <MastheadToggle>...</MastheadToggle> <MastheadBrand><MastheadLogo>...</MastheadLogo></MastheadBrand> </MastheadMain> <MastheadContent>...</MastheadContent> </Masthead>. Codemod: masthead-name-changes"
+
+- ruleID: pfv6-dom-menu-item-action
+  description: "MenuItemAction: DOM structure changed"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^MenuItemAction$"
+      location: JSX_COMPONENT
+  message: "MenuItemAction now uses Button component internally with a wrapping element and no icon wrapper in PF v6. CSS selectors targeting the old DOM structure will break."
+
+- ruleID: pfv6-dom-notification-badge
+  description: "NotificationBadge: stateful button DOM"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^NotificationBadge$"
+      location: JSX_COMPONENT
+  message: "NotificationBadge now uses a stateful button internally in PF v6. DOM structure changes may affect CSS selectors or event handling."
+
+- ruleID: pfv6-dom-notification-drawer-header
+  description: "NotificationDrawerHeader: renders h1 instead of Text"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^NotificationDrawerHeader$"
+      location: JSX_COMPONENT
+  message: "NotificationDrawerHeader now renders a native <h1> element instead of the Text component in PF v6. CSS selectors or snapshot tests may break."
+
+- ruleID: pfv6-dom-page-body-wrapper
+  description: "Page: PageBody wrapper added automatically"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^horizontalSubnav$"
+      location: JSX_PROP
+      component: "^Page$"
+  message: "Page now automatically adds a PageBody wrapper when 'horizontalSubnav' or 'breadcrumb' is passed in PF v6. This changes DOM structure and may affect layout or CSS."
+
+- ruleID: pfv6-dom-pagination-toggle
+  description: "Pagination: wrapper added around options menu toggle"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Pagination$"
+      location: JSX_COMPONENT
+  message: "Pagination now has a wrapper element around the PaginationOptionsMenu toggle in PF v6. CSS selectors or snapshot tests may break."
+
+- ruleID: pfv6-dom-tabs-scroll-buttons
+  description: "Tabs: scroll buttons use Button component"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Tabs$"
+      location: JSX_COMPONENT
+  message: "Tabs scroll buttons now use Button components with a wrapper <div> in PF v6. CSS selectors or snapshot tests targeting scroll buttons may break."
+
+- ruleID: pfv6-dom-wizard-footer
+  description: "WizardFooter: ActionList wrapper added"
+  labels:
+    - change-type=dom-structure
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^WizardFooter$"
+      location: JSX_COMPONENT
+  message: "WizardFooter default footer now uses an ActionList wrapper around Button elements in PF v6. CSS selectors or snapshot tests may break."

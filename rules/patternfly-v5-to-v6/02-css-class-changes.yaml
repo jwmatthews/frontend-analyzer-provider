@@ -1,0 +1,206 @@
+- ruleID: pfv6-css-nav-expandable
+  description: "NavExpandable: pf-m-expandable modifier removed from li"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 3
+  category: potential
+  when:
+    frontend.cssclass:
+      pattern: "pf-m-expandable"
+  message: "The CSS class 'pf-m-expandable' is no longer applied to NavExpandable <li> elements in PF v6. Custom styles targeting this selector will silently break. Review and update CSS overrides."
+
+- ruleID: pfv6-css-number-input-validated
+  description: "NumberInput: validated state CSS modifier removed"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 3
+  category: potential
+  when:
+    frontend.cssclass:
+      pattern: "pf-m-(success|warning|error)"
+      filePattern: "\\.(css|scss)$"
+  message: "NumberInput no longer applies validated state CSS modifiers (pf-m-success/warning/error) in PF v6. Custom CSS targeting these modifiers on NumberInput will silently break."
+
+- ruleID: pfv6-css-title-size
+  description: "Title: default size mapping changed"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Title$"
+      location: JSX_COMPONENT
+  message: "Title component default size changed from headingLevelSizeMap to undefined in PF v6. Titles without explicit 'size' prop may render differently."
+
+- ruleID: pfv6-css-v5-prefix
+  description: "PF v5 CSS class prefix pf-v5-c- still in use"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 2
+  category: mandatory
+  when:
+    frontend.cssclass:
+      pattern: "pf-v5-c-"
+  message: "CSS class prefix 'pf-v5-c-' must be updated for PF v6. These classes will not match PF v6 components."
+
+- ruleID: pfv6-css-variable-v5-prefix
+  description: "PF v5 CSS variable prefix --pf-v5- still in use"
+  labels:
+    - change-type=css-variable
+    - has-codemod=false
+  effort: 2
+  category: mandatory
+  when:
+    frontend.cssvar:
+      pattern: "--pf-v5-"
+  message: "CSS variable prefix '--pf-v5-' has changed in PF v6. Update to the new PF v6 token format."
+
+- ruleID: pfv6-css-variable-logical-properties
+  description: "PF v6 CSS variables use logical properties (BlockStart/InlineEnd)"
+  labels:
+    - change-type=css-variable
+    - has-codemod=false
+  effort: 2
+  category: mandatory
+  when:
+    frontend.cssvar:
+      pattern: "--pf-(v5|v6)-.*--(Padding|Margin|Inset|BorderWidth|MaxHeight|Height|Width|Offset|TranslateX|TranslateY)(Top|Bottom|Left|Right)\\b"
+  message: "PF v6 CSS custom properties use CSS logical property suffixes instead of physical ones. Rename: Top->BlockStart, Bottom->BlockEnd, Left->InlineStart, Right->InlineEnd. For example, --pf-v6-c-table__expandable-row-content--PaddingTop becomes --pf-v6-c-table__expandable-row-content--PaddingBlockStart."
+
+- ruleID: pfv6-stale-snapshots
+  description: "Snapshot files contain stale PF v5 class names"
+  labels:
+    - change-type=snapshot
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    builtin.filecontent:
+      pattern: "pf-v5-c-"
+      filePattern: "\\.snap$"
+  message: "Snapshot file contains PF v5 class names (pf-v5-c-*) that will not match after upgrading to PF v6. Delete the snapshot file and re-run tests to regenerate snapshots with PF v6 class names."
+
+# Pipeline extras — CSS class changes not covered by codemods
+
+- ruleID: pfv6-css-calendar-month-classes
+  description: "CalendarMonth: hardcoded CSS class names for navigation"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^CalendarMonth$"
+      location: JSX_COMPONENT
+  message: "CalendarMonth now uses hardcoded 'pf-m-prev-month'/'pf-m-next-month' class names instead of styles.modifiers in PF v6. Navigation button class names have also changed. Update CSS overrides targeting CalendarMonth navigation buttons."
+
+- ruleID: pfv6-css-expandable-section-detached
+  description: "ExpandableSectionToggle: detached class conditionally applied"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^isDetached$"
+      location: JSX_PROP
+      component: "^ExpandableSection$"
+  message: "ExpandableSection now conditionally applies styles.modifiers.detached instead of always applying it in PF v6. CSS overrides relying on .pf-m-detached being always present will break."
+
+- ruleID: pfv6-css-datalist-check
+  description: "DataListCheck: renders Checkbox component instead of native input"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^DataListCheck$"
+      location: JSX_COMPONENT
+  message: "DataListCheck now renders a PF <Checkbox> instead of a native <input> in PF v6. This changes the CSS class hierarchy. Update CSS selectors targeting the checkbox input inside DataList items."
+
+- ruleID: pfv6-css-simple-list-link
+  description: "SimpleListItem: new pf-m-link class for anchors"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^SimpleList$"
+      location: JSX_COMPONENT
+  message: "SimpleListItem now adds '.pf-m-link' CSS class for anchor-type components in PF v6. This may affect CSS specificity of custom overrides."
+
+- ruleID: pfv6-css-textarea-class
+  description: "TextArea: new textarea modifier class on wrapper"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^TextArea$"
+      location: JSX_COMPONENT
+  message: "TextArea now adds styles.modifiers.textarea class to the wrapper span in PF v6. This may affect CSS specificity of custom overrides on TextArea."
+
+- ruleID: pfv6-css-tab-title-icon
+  description: "TabTitleIcon: class generation changed"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^TabTitleIcon$"
+      location: JSX_COMPONENT
+  message: "TabTitleIcon class generation changed from styles.tabsItemIcon to a template literal in PF v6. CSS selectors using the exact old class name may break."
+
+- ruleID: pfv6-css-multiple-file-upload-status
+  description: "MultipleFileUploadStatus: internal class names changed"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^MultipleFileUploadStatus$"
+      location: JSX_COMPONENT
+  message: "MultipleFileUploadStatus internal CSS class name strings have changed in PF v6. Update CSS overrides targeting these internal classes."
+
+- ruleID: pfv6-css-menu-keyboard-nav
+  description: "Menu: keyboard navigation class handling changed"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^Menu$"
+      location: JSX_COMPONENT
+  message: "Menu keyboard navigation now excludes dropdown toggle elements from focus checks in PF v6. Test keyboard navigation if you have custom menu implementations."
+
+- ruleID: pfv6-css-jumplinks-label
+  description: "JumpLinks: label div and toggle icon class changes"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^JumpLinks$"
+      location: JSX_COMPONENT
+  message: "JumpLinks standalone label div class handling changed with alwaysShowLabel+expandable in PF v6. The expandable toggle icon is now passed via the icon prop instead of children. Update CSS selectors targeting JumpLinks label and toggle elements."

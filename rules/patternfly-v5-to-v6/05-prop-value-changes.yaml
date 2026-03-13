@@ -1,0 +1,111 @@
+# Prop value changes — codemod-covered
+
+- ruleID: pfv6-prop-value-banner-color
+  description: "Banner/Label: color values cyan/gold renamed"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^color$", location: JSX_PROP, component: "^(Banner|Label)$", value: "^(cyan|gold)$" }
+  message: "Color prop values renamed: 'cyan'->'teal', 'gold'->'yellow' on Banner and Label in PF v6. Codemod: colorProps-replaced-colors"
+
+- ruleID: pfv6-prop-value-nav-tertiary
+  description: "Nav: variant='tertiary' replaced with 'horizontal-subnav'"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^variant$", location: JSX_PROP, component: "^Nav$", value: "^tertiary$" }
+  message: "Nav variant='tertiary' replaced with variant='horizontal-subnav' in PF v6. Codemod: nav-remove-tertiary-variant"
+
+- ruleID: pfv6-prop-value-drawer-colorvariant
+  description: "Drawer: colorVariant values changed"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(DrawerColorVariant|colorVariant)$", location: JSX_PROP }
+  message: "DrawerContent/DrawerPanelContent colorVariant values changed: 'no-background' removed, 'light-200'→'secondary'. Codemod: drawer-replace-colorVariant-light200"
+
+- ruleID: pfv6-prop-value-toolbar-group-variant
+  description: "ToolbarGroup: icon-button-group variant renamed"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^variant$", location: JSX_PROP, component: "^(ToolbarGroup|ToolbarToggleGroup)$", value: "^(button-group|icon-button-group)$" }
+  message: "ToolbarGroup/ToolbarToggleGroup variant values renamed: 'button-group'→'action-group', 'icon-button-group'→'action-group-plain'. Codemod: toolbarGroup-updated-iconButtonGroup-variant"
+
+- ruleID: pfv6-prop-value-toolbar-item-variant
+  description: "ToolbarItem: some variant values removed"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^variant$", location: JSX_PROP, component: "^ToolbarItem$", value: "^(bulk-select|overflow-menu|search-filter|chip-group)$" }
+  message: "ToolbarItem variant values removed: 'bulk-select', 'overflow-menu', 'search-filter'; renamed: 'chip-group'→'label-group'. Codemod: toolbarItem-variant-prop-updates"
+
+- ruleID: pfv6-prop-value-tabs-variant
+  description: "Tabs: variant='light300' replaced with 'secondary'"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^variant$", location: JSX_PROP, component: "^Tabs$", value: "^light300$" }
+  message: "Tabs variant='light300' replaced with 'secondary' in PF v6. Codemod: tabs-replace-variant-light300"
+
+- ruleID: pfv6-prop-value-label-overflow
+  description: "Label: isOverflowLabel replaced with variant='overflow'"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^isOverflowLabel$", location: JSX_PROP, component: "^Label$" }
+  message: "Label 'isOverflowLabel' replaced with variant='overflow' in PF v6. Codemod: label-remove-isOverflowLabel"
+
+- ruleID: pfv6-prop-value-toolbar-spacer
+  description: "Toolbar: spacer/spaceItems replaced with gap props"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^(spacer|spaceItems)$", location: JSX_PROP, component: "^(Toolbar|ToolbarContent|ToolbarGroup|ToolbarItem|ToolbarToggleGroup)$" }
+  message: "Toolbar spacer->gap/columnGap/rowGap, spaceItems removed in PF v6. Codemod: toolbar-replaced-spacer-spaceItems"
+
+# Additional prop value changes
+
+- ruleID: pfv6-prop-value-banner-variant
+  description: "Banner: variant prop replaced with color"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^variant$", location: JSX_PROP, component: "^Banner$" }
+  message: "Banner 'variant' prop replaced with 'color' in PF v6. Codemod: banner-replace-variantProp"
+
+- ruleID: pfv6-prop-value-menutoggle-variant
+  description: "MenuToggle: variant='plain' split into plainText and typeahead"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^variant$", location: JSX_PROP, component: "^MenuToggle$", value: "^plain$" }
+  message: "MenuToggle variant='plain' has been split into 'plainText' and 'typeahead' variants in PF v6. Codemod: menuToggle-replace-variant-plain"
+
+- ruleID: pfv6-prop-value-pagesection-variant
+  description: "PageSection: variant values narrowed"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^variant$", location: JSX_PROP, component: "^PageSection$", value: "^(dark|darker|light)$" }
+  message: "PageSection variant now only accepts 'default' or 'secondary' in PF v6. Values 'dark', 'darker', and 'light' have been removed. If you used variant='light' to control page body styling, replace with hasBodyWrapper={false}. Additionally, variant classes are now only applied when type='default', and isWidthLimited no longer controls PageBody wrapping — use the new hasBodyWrapper prop explicitly. Codemod: pageSection-update-variant"
+
+- ruleID: pfv6-prop-value-pagesection-type
+  description: "PageSection: type='nav' removed"
+  labels: [change-type=prop-value-change, has-codemod=true]
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced: { pattern: "^type$", location: JSX_PROP, component: "^PageSection$", value: "^nav$" }
+  message: "PageSection type value 'nav' has been removed in PF v6. Codemod: pageSection-remove-nav-type"

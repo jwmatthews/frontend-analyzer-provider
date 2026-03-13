@@ -1,0 +1,20 @@
+[
+    {
+        "name": "frontend",
+        "address": "localhost:9001",
+        "initConfig": [
+            {
+                "analysisMode": "source-only",
+                "location": "/tmp/quipucords-ui"
+            }
+        ]
+    },
+    {
+        "name": "builtin",
+        "initConfig": [
+            {
+                "location": "/tmp/quipucords-ui"
+            }
+        ]
+    }
+]

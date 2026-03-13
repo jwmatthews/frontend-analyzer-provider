@@ -1,0 +1,217 @@
+# Miscellaneous changes — pipeline extras (no codemod)
+
+- ruleID: pfv6-misc-tab-button-ouia
+  description: "TabButton: OUIA component type changed"
+  labels:
+    - change-type=other
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^TabButton$"
+      location: JSX_COMPONENT
+  message: "TabButton data-ouia-component-type changed from 'PF5/TabButton' to 'PF6/TabButton' in PF v6. Update E2E tests that query by OUIA component type."
+
+- ruleID: pfv6-misc-form-field-group-ontoggle
+  description: "FormFieldGroup: onToggle prop omitted"
+  labels:
+    - change-type=other
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^onToggle$"
+      location: JSX_PROP
+      component: "^(FormFieldGroup|FormFieldGroupExpandable)$"
+  message: "FormFieldGroupProps and FormFieldGroupExpandableProps now omit 'onToggle' from inherited HTMLProps in PF v6. Passing onToggle directly will cause a TypeScript error."
+
+- ruleID: pfv6-misc-simple-list-onselect-ref
+  description: "SimpleList: onSelect ref parameter type changed"
+  labels:
+    - change-type=other
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^onSelect$"
+      location: JSX_PROP
+      component: "^SimpleList$"
+  message: "SimpleList 'onSelect' callback ref parameter type changed to include '| null' in PF v6. Update handler signatures if TypeScript strict mode is enabled."
+
+- ruleID: pfv6-misc-toolbar-internal-context
+  description: "Toolbar internal context: chip props renamed to label"
+  labels:
+    - change-type=inherited-rename
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    or:
+      - frontend.referenced: { pattern: "^ToolbarContextProps$", location: TYPE_REFERENCE }
+      - frontend.referenced: { pattern: "^ToolbarContentContext$", location: TYPE_REFERENCE }
+  message: "Toolbar internal context types renamed chip-based properties to label-based in PF v6: chipGroupContentRef->labelGroupContentRef, customChipGroupContent->customLabelGroupContent, chipContainerRef->labelContainerRef."
+
+# Additional miscellaneous changes from pf-codemods-v5-v6.json
+
+- ruleID: pfv6-misc-treeview-selectable
+  description: "TreeView: pf-m-selectable class removed"
+  labels:
+    - change-type=css-class
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.cssclass:
+      pattern: "pf-m-selectable"
+  message: "The 'pf-m-selectable' CSS class modifier has been removed from TreeView list items in PF v6. CSS selectors or test assertions targeting this class will break."
+
+- ruleID: pfv6-misc-simple-file-upload
+  description: "SimpleFileUpload: a11y and structure changes"
+  labels:
+    - change-type=accessibility
+    - has-codemod=false
+  effort: 2
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^SimpleFileUpload$"
+      location: JSX_COMPONENT
+  message: "SimpleFileUpload has a11y changes in PF v6: aria-describedby removed from TextInput, 'id' removed from browse button. Use 'browseButtonAriaDescribedby' prop and FileUploadHelperText component."
+
+- ruleID: pfv6-misc-slider-step-css-var
+  description: "SliderStep: CSS variable renamed"
+  labels:
+    - change-type=css-variable
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.cssvar:
+      pattern: "--pf-v5-c-slider__step--Left"
+  message: "SliderStep CSS variable '--pf-v5-c-slider__step--Left' renamed to '--pf-v6-c-slider__step--InsetInlineStart' in PF v6."
+
+- ruleID: pfv6-misc-wizard-step-body
+  description: "WizardStep: body prop no longer accepts null"
+  labels:
+    - change-type=prop-type-change
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^body$"
+      location: JSX_PROP
+      component: "^WizardStep$"
+  message: "WizardStep 'body' prop no longer accepts null in PF v6. Remove body={null} usage."
+
+- ruleID: pfv6-misc-logviewer-stylesheet
+  description: "LogViewer: stylesheet moved to LogViewer package"
+  labels:
+    - change-type=other
+    - has-codemod=false
+    - package=react-log-viewer
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^LogViewer$"
+      location: IMPORT
+      from: "@patternfly/react-log-viewer"
+  message: "LogViewer stylesheet moved from PatternFly package to the LogViewer package itself in PF v6. Update style import paths."
+
+- ruleID: pfv6-misc-feedback-modal-css
+  description: "FeedbackModal: CSS import required"
+  labels:
+    - change-type=other
+    - has-codemod=false
+    - package=react-user-feedback
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^FeedbackModal$"
+      from: "@patternfly/react-user-feedback"
+      location: IMPORT
+  message: "FeedbackModal SCSS refactored to CSS in PF v6. Must now manually import 'Feedback.css' from react-user-feedback package."
+
+- ruleID: pfv6-misc-table-sticky-css-vars
+  description: "Table Th/Td: sticky column CSS vars renamed"
+  labels:
+    - change-type=css-variable
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.cssvar:
+      pattern: "--pf-v5-c-table__sticky-column"
+  message: "Table sticky column CSS variables renamed: --pf-v5-c-table__sticky-column--Left/Right -> --pf-v6-c-table__sticky-column--InsetInlineStart/InsetInlineEnd in PF v6."
+
+- ruleID: pfv6-misc-login-footer-links
+  description: "LoginMainFooterLinksItem: restructured"
+  labels:
+    - change-type=component-removal
+    - has-codemod=true
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^LoginMainFooterLinksItem$"
+      location: JSX_COMPONENT
+  message: "LoginMainFooterLinksItem restructured in PF v6. Children should be wrapped in a Button with variant='link' and component='a'. Props like href and linkComponentProps move into the Button child. Codemod: loginMainFooterLinksItem-structure-update"
+
+- ruleID: pfv6-misc-page-toggle-button
+  description: "PageToggleButton: BarsIcon should use isHamburgerButton"
+  labels:
+    - change-type=prop-rename
+    - has-codemod=true
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^PageToggleButton$"
+      location: JSX_COMPONENT
+  message: "PageToggleButton BarsIcon child should be replaced with the 'isHamburgerButton' prop in PF v6. This also enables button animation. Codemod: pageToggleButton-replace-barsicon"
+
+- ruleID: pfv6-misc-page-breadcrumb-bodywrapper
+  description: "PageBreadcrumb: hasBodyWrapper prop needed"
+  labels:
+    - change-type=behavioral
+    - has-codemod=false
+  effort: 1
+  category: potential
+  when:
+    frontend.referenced:
+      pattern: "^PageBreadcrumb$"
+      location: JSX_COMPONENT
+  message: "PageBreadcrumb 'isWidthLimited' no longer controls PageBody wrapping in PF v6. Add 'hasBodyWrapper' prop explicitly if wrapping is needed."
+
+- ruleID: pfv6-misc-jumplinks-href-required
+  description: "JumpLinksItem: href now required"
+  labels:
+    - change-type=prop-type-change
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^JumpLinksItem$"
+      location: JSX_COMPONENT
+  message: "JumpLinksItem 'href' prop is now required in PF v6 (was optional). Ensure all JumpLinksItem elements have an href value."
+
+- ruleID: pfv6-misc-charts-import-path
+  description: "react-charts: import path changed to /victory subpath"
+  labels:
+    - change-type=module-export
+    - has-codemod=true
+    - package=react-charts
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "."
+      location: IMPORT
+      from: "^@patternfly/react-charts$"
+  message: "All chart component imports must now use '@patternfly/react-charts/victory' subpath in PF v6. Victory is now an optional peer dependency. Codemod: charts-import-victory-subpath"

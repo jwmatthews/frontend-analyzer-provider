@@ -1,0 +1,41 @@
+[workspace]
+members = ["crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc"]
+resolver = "2"
+
+[package]
+name = "frontend-analyzer-provider"
+version = "0.1.0"
+edition = "2021"
+description = "Konveyor external provider for JS/TS/JSX/TSX and CSS/SCSS analysis"
+license = "Apache-2.0"
+
+[dependencies]
+frontend-core = { path = "crates/core" }
+frontend-js-scanner = { path = "crates/js-scanner" }
+frontend-css-scanner = { path = "crates/css-scanner" }
+frontend-grpc = { path = "crates/grpc" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "=0.0.12"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client (for LLM endpoint)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Utilities
+regex = "1"
+walkdir = "2"

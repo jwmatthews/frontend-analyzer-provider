@@ -1,0 +1,67 @@
+# Module export changes — pipeline extras (no codemod)
+# Exports removed, moved to deprecated, or values changed.
+
+- ruleID: pfv6-export-droppable-context
+  description: "DroppableContext: moved to deprecated exports"
+  labels:
+    - change-type=module-export
+    - has-codemod=false
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^DroppableContext$"
+      location: IMPORT
+  message: "DroppableContext has been moved to deprecated exports in PF v6. Import from @patternfly/react-core/deprecated instead."
+
+- ruleID: pfv6-export-dual-list-selector-context
+  description: "DualListSelectorContext: no longer exported"
+  labels:
+    - change-type=module-export
+    - has-codemod=false
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^DualListSelectorContext$"
+      location: IMPORT
+  message: "DualListSelectorContext is no longer exported from the main DualListSelector module in PF v6."
+
+- ruleID: pfv6-export-dual-list-selector-list-context
+  description: "DualListSelectorListContext: onOptionSelect removed"
+  labels:
+    - change-type=module-export
+    - has-codemod=false
+  effort: 3
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^DualListSelectorListContext$"
+      location: IMPORT
+  message: "DualListSelectorListContext 'onOptionSelect' property has been removed from the context in PF v6."
+
+- ruleID: pfv6-export-tabs-light300
+  description: "TabsContextProps: light300 variant removed"
+  labels:
+    - change-type=module-export
+    - has-codemod=false
+  effort: 1
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^TabsContextProps$"
+      location: TYPE_REFERENCE
+  message: "TabsContextProps 'variant' property no longer accepts 'light300' value in PF v6. Use 'secondary' instead."
+
+- ruleID: pfv6-export-global-breakpoints
+  description: "globalBreakpoints: values changed from rem to px"
+  labels:
+    - change-type=module-export
+    - has-codemod=false
+  effort: 2
+  category: mandatory
+  when:
+    frontend.referenced:
+      pattern: "^globalBreakpoints$"
+      location: IMPORT
+  message: "globalBreakpoints values changed from rem to px (multiplied by 16) in PF v6. If you use these values for calculations, update your math accordingly."
