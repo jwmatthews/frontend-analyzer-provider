@@ -8,6 +8,35 @@ use frontend_core::incident::Incident;
 use oxc_ast::ast::*;
 use oxc_span::GetSpan;
 use regex::Regex;
+use std::collections::HashMap;
+
+/// Build a map of local identifier → module source from all import declarations.
+///
+/// This allows JSX scanning to resolve any component or parent back to its
+/// import source (e.g., `Button` → `@patternfly/react-core`).
+pub fn build_import_map(program: &Program<'_>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for stmt in &program.body {
+        if let Statement::ImportDeclaration(import) = stmt {
+            let module_source = import.source.value.as_str();
+            if let Some(specifiers) = &import.specifiers {
+                for spec in specifiers {
+                    let local_name = match spec {
+                        ImportDeclarationSpecifier::ImportSpecifier(s) => s.local.name.as_str(),
+                        ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                            s.local.name.as_str()
+                        }
+                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                            s.local.name.as_str()
+                        }
+                    };
+                    map.insert(local_name.to_string(), module_source.to_string());
+                }
+            }
+        }
+    }
+    map
+}
 
 /// Scan a statement for import declarations matching the pattern.
 pub fn scan_imports(

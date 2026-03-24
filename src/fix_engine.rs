@@ -35,9 +35,15 @@ pub fn plan_fixes(
             for incident in &violation.incidents {
                 let file_path = uri_to_path(&incident.uri, project_root);
 
-                // Skip vendored files — these are updated via package.json
+                // Skip node_modules — these are updated via package.json
                 // version bumps, not by patching source directly.
-                if file_path.components().any(|c| c.as_os_str() == "vendor") {
+                // Note: src/vendor/ is NOT skipped — vendored source code
+                // (e.g., forked libraries) is compiled as part of the project
+                // and needs migration alongside the rest of the codebase.
+                if file_path
+                    .components()
+                    .any(|c| c.as_os_str() == "node_modules")
+                {
                     continue;
                 }
 

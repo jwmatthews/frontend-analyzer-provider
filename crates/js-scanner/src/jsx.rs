@@ -9,6 +9,12 @@ use frontend_core::incident::Incident;
 use oxc_ast::ast::*;
 use oxc_span::GetSpan;
 use regex::Regex;
+use std::collections::HashMap;
+
+/// Import map: local identifier name → module source path.
+/// Built from import declarations, passed through JSX scanning so components
+/// can be resolved to their import source (e.g., Button → @patternfly/react-core).
+type ImportMap = HashMap<String, String>;
 
 /// Scan a statement for JSX component and prop usage.
 pub fn scan_jsx(
@@ -17,6 +23,7 @@ pub fn scan_jsx(
     pattern: &Regex,
     file_uri: &str,
     location: Option<&ReferenceLocation>,
+    import_map: &ImportMap,
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     walk_statement_for_jsx(
@@ -27,6 +34,7 @@ pub fn scan_jsx(
         location,
         &mut incidents,
         None,
+        import_map,
     );
     incidents
 }
@@ -39,6 +47,7 @@ fn walk_statement_for_jsx(
     location: Option<&ReferenceLocation>,
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
+    import_map: &ImportMap,
 ) {
     match stmt {
         Statement::ExportDefaultDeclaration(decl) => {
@@ -52,6 +61,7 @@ fn walk_statement_for_jsx(
                         location,
                         incidents,
                         parent_name,
+                        import_map,
                     );
                 }
             }
@@ -67,6 +77,7 @@ fn walk_statement_for_jsx(
                         location,
                         incidents,
                         parent_name,
+                        import_map,
                     );
                 }
             }
@@ -79,6 +90,7 @@ fn walk_statement_for_jsx(
                     location,
                     incidents,
                     parent_name,
+                    import_map,
                 );
             }
         }
@@ -92,6 +104,7 @@ fn walk_statement_for_jsx(
                     location,
                     incidents,
                     parent_name,
+                    import_map,
                 );
             }
         }
@@ -104,6 +117,7 @@ fn walk_statement_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         Statement::ReturnStatement(ret) => {
@@ -116,6 +130,7 @@ fn walk_statement_for_jsx(
                     location,
                     incidents,
                     parent_name,
+                    import_map,
                 );
             }
         }
@@ -128,6 +143,7 @@ fn walk_statement_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         Statement::BlockStatement(block) => {
@@ -140,6 +156,7 @@ fn walk_statement_for_jsx(
                     location,
                     incidents,
                     parent_name,
+                    import_map,
                 );
             }
         }
@@ -152,6 +169,7 @@ fn walk_statement_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
             if let Some(alt) = &if_stmt.alternate {
                 walk_statement_for_jsx(
@@ -162,6 +180,7 @@ fn walk_statement_for_jsx(
                     location,
                     incidents,
                     parent_name,
+                    import_map,
                 );
             }
         }
@@ -177,6 +196,7 @@ fn walk_variable_declaration(
     location: Option<&ReferenceLocation>,
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
+    import_map: &ImportMap,
 ) {
     for declarator in &var_decl.declarations {
         if let Some(init) = &declarator.init {
@@ -188,6 +208,7 @@ fn walk_variable_declaration(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
     }
@@ -201,6 +222,7 @@ fn walk_function_body(
     location: Option<&ReferenceLocation>,
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
+    import_map: &ImportMap,
 ) {
     for stmt in &body.statements {
         walk_statement_for_jsx(
@@ -211,6 +233,7 @@ fn walk_function_body(
             location,
             incidents,
             parent_name,
+            import_map,
         );
     }
 }
@@ -223,6 +246,7 @@ fn walk_expression_for_jsx(
     location: Option<&ReferenceLocation>,
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
+    import_map: &ImportMap,
 ) {
     match expr {
         Expression::JSXElement(el) => {
@@ -234,6 +258,7 @@ fn walk_expression_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         Expression::JSXFragment(frag) => {
@@ -246,6 +271,7 @@ fn walk_expression_for_jsx(
                     location,
                     incidents,
                     parent_name,
+                    import_map,
                 );
             }
         }
@@ -258,6 +284,7 @@ fn walk_expression_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         Expression::ConditionalExpression(cond) => {
@@ -269,6 +296,7 @@ fn walk_expression_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
             walk_expression_for_jsx(
                 &cond.alternate,
@@ -278,6 +306,7 @@ fn walk_expression_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         Expression::LogicalExpression(logic) => {
@@ -289,6 +318,7 @@ fn walk_expression_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         Expression::ArrowFunctionExpression(arrow) => {
@@ -300,6 +330,7 @@ fn walk_expression_for_jsx(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         Expression::CallExpression(call) => {
@@ -313,6 +344,7 @@ fn walk_expression_for_jsx(
                         location,
                         incidents,
                         parent_name,
+                        import_map,
                     );
                 } else if let Some(expr) = arg.as_expression() {
                     walk_expression_for_jsx(
@@ -323,6 +355,7 @@ fn walk_expression_for_jsx(
                         location,
                         incidents,
                         parent_name,
+                        import_map,
                     );
                 }
             }
@@ -339,6 +372,7 @@ fn walk_jsx_child(
     location: Option<&ReferenceLocation>,
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
+    import_map: &ImportMap,
 ) {
     match child {
         JSXChild::Element(el) => {
@@ -350,6 +384,7 @@ fn walk_jsx_child(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         JSXChild::Fragment(frag) => {
@@ -362,6 +397,7 @@ fn walk_jsx_child(
                     location,
                     incidents,
                     parent_name,
+                    import_map,
                 );
             }
         }
@@ -376,6 +412,7 @@ fn walk_jsx_child(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         _ => {}
@@ -393,6 +430,7 @@ fn walk_jsx_expression(
     location: Option<&ReferenceLocation>,
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
+    import_map: &ImportMap,
 ) {
     match jsx_expr {
         JSXExpression::EmptyExpression(_) => {}
@@ -406,6 +444,7 @@ fn walk_jsx_expression(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         JSXExpression::JSXFragment(frag) => {
@@ -418,6 +457,7 @@ fn walk_jsx_expression(
                     location,
                     incidents,
                     parent_name,
+                    import_map,
                 );
             }
         }
@@ -431,6 +471,7 @@ fn walk_jsx_expression(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         // Arrow functions: {ref => (<Component />)} or {() => <Component />}
@@ -443,6 +484,7 @@ fn walk_jsx_expression(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         // Conditionals: {condition && <Component />} or {cond ? <A/> : <B/>}
@@ -455,6 +497,7 @@ fn walk_jsx_expression(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
             walk_expression_for_jsx(
                 &cond.alternate,
@@ -464,6 +507,7 @@ fn walk_jsx_expression(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         JSXExpression::LogicalExpression(logic) => {
@@ -475,6 +519,7 @@ fn walk_jsx_expression(
                 location,
                 incidents,
                 parent_name,
+                import_map,
             );
         }
         // Function calls: {renderFn(<Component />)} or {fn(arg)}
@@ -489,6 +534,7 @@ fn walk_jsx_expression(
                         location,
                         incidents,
                         parent_name,
+                        import_map,
                     );
                 } else if let Some(expr) = arg.as_expression() {
                     walk_expression_for_jsx(
@@ -499,6 +545,7 @@ fn walk_jsx_expression(
                         location,
                         incidents,
                         parent_name,
+                        import_map,
                     );
                 }
             }
@@ -515,6 +562,7 @@ fn check_jsx_element(
     location: Option<&ReferenceLocation>,
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
+    import_map: &ImportMap,
 ) {
     let opening = &el.opening_element;
     let component_name = jsx_element_name_to_string(&opening.name);
@@ -528,11 +576,24 @@ fn check_jsx_element(
             "componentName".into(),
             serde_json::Value::String(component_name.clone()),
         );
+        // Resolve the matched component's import source
+        if let Some(module) = import_map.get(&component_name) {
+            incident
+                .variables
+                .insert("module".into(), serde_json::Value::String(module.clone()));
+        }
         if let Some(parent) = parent_name {
             incident.variables.insert(
                 "parentName".into(),
                 serde_json::Value::String(parent.to_string()),
             );
+            // Resolve the parent component's import source
+            if let Some(parent_module) = import_map.get(parent) {
+                incident.variables.insert(
+                    "parentFrom".into(),
+                    serde_json::Value::String(parent_module.clone()),
+                );
+            }
         }
         incidents.push(incident);
     }
@@ -601,6 +662,7 @@ fn check_jsx_element(
                     location,
                     incidents,
                     Some(&component_name),
+                    import_map,
                 );
             }
         }
@@ -616,6 +678,7 @@ fn check_jsx_element(
             location,
             incidents,
             Some(&component_name),
+            import_map,
         );
     }
 }

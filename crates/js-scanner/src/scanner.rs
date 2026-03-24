@@ -93,6 +93,10 @@ pub fn scan_file_referenced(
 
     let location = condition.location.as_ref();
 
+    // Build import map so JSX scanning can resolve components to their
+    // import source (e.g., Button → @patternfly/react-core).
+    let import_map = crate::imports::build_import_map(&ret.program);
+
     for stmt in &ret.program.body {
         match location {
             Some(ReferenceLocation::Import) | None => {
@@ -113,6 +117,7 @@ pub fn scan_file_referenced(
                     &pattern_re,
                     &file_uri,
                     location,
+                    &import_map,
                 ));
             }
             _ => {}
@@ -180,15 +185,33 @@ pub fn scan_file_referenced(
         });
     }
 
-    // Filter by import source path if specified
+    // Filter by import source path if specified.
+    // Works for both import incidents (module from import statement) and
+    // JSX incidents (module resolved from the file's import map).
     if let Some(from_pattern) = &condition.from {
         let from_re = Regex::new(from_pattern)?;
         incidents.retain(|inc| {
             if let Some(serde_json::Value::String(module)) = inc.variables.get("module") {
                 from_re.is_match(module)
             } else {
-                // No module = not an import incident, keep it (e.g., JSX usage)
+                // No module = component not found in imports (e.g., locally
+                // defined or HTML element). Keep it to avoid false negatives.
                 true
+            }
+        });
+    }
+
+    // Filter by parent import source path if specified.
+    // Matches the parent JSX component's import source, resolved from the
+    // file's import map (e.g., parentFrom: "@patternfly/react-core").
+    if let Some(parent_from_pattern) = &condition.parent_from {
+        let parent_from_re = Regex::new(parent_from_pattern)?;
+        incidents.retain(|inc| {
+            if let Some(serde_json::Value::String(module)) = inc.variables.get("parentFrom") {
+                parent_from_re.is_match(module)
+            } else {
+                // No parentFrom = parent not found in imports, filter out
+                false
             }
         });
     }

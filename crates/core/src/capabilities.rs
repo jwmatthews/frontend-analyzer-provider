@@ -41,6 +41,13 @@ pub struct ReferencedCondition {
     /// When set, only matches components that are direct children of a parent
     /// JSX element whose name matches this pattern.
     pub parent: Option<String>,
+    /// Optional parent import source filter for JSX_COMPONENT location.
+    /// When set, only matches when the parent JSX component was imported from
+    /// a module whose path matches this pattern. Requires `parent` to be set.
+    /// Example: `parent_from: "@patternfly/react-core"` ensures the parent
+    /// `Button` is from PatternFly, not a custom app component.
+    #[serde(rename = "parentFrom", skip_serializing_if = "Option::is_none")]
+    pub parent_from: Option<String>,
     /// Optional prop value filter for JSX_PROP location.
     /// When set, only matches props whose value matches this pattern.
     /// Matches against string literal values (e.g., variant="plain") and
