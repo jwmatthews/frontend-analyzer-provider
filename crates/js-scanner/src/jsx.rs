@@ -642,6 +642,15 @@ fn check_jsx_element(
                             }
                         }
 
+                        // Resolve the owning component's import source so
+                        // that the `from` filter can check it. Without this,
+                        // JSX_PROP incidents bypass the `from` constraint.
+                        if let Some(module) = import_map.get(&component_name) {
+                            incident
+                                .variables
+                                .insert("module".into(), serde_json::Value::String(module.clone()));
+                        }
+
                         incidents.push(incident);
                     }
                 }

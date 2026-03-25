@@ -615,7 +615,10 @@ fn process_single_file(
                     chunk_retried.push(was_retried);
                     all_stderrs.push(stderr);
 
-                    // Record what was applied for context in next chunk
+                    // Record what was applied for context in next chunk.
+                    // Include the first 3 lines of the message to preserve
+                    // critical details like import path changes that
+                    // subsequent chunks need to avoid reverting.
                     for req in chunk.iter() {
                         let lines_display = req
                             .lines
@@ -623,11 +626,11 @@ fn process_single_file(
                             .map(|l| l.to_string())
                             .collect::<Vec<_>>()
                             .join(", ");
+                        let summary: String =
+                            req.message.lines().take(3).collect::<Vec<_>>().join("\n  ");
                         applied_summaries.push(format!(
                             "- {} (line {}): {}",
-                            req.rule_id,
-                            lines_display,
-                            req.message.lines().next().unwrap_or("")
+                            req.rule_id, lines_display, summary
                         ));
                     }
                     all_outputs.push(output.clone());
@@ -676,11 +679,15 @@ fn process_single_file(
                                         .map(|l| l.to_string())
                                         .collect::<Vec<_>>()
                                         .join(", ");
+                                    let summary: String = req
+                                        .message
+                                        .lines()
+                                        .take(3)
+                                        .collect::<Vec<_>>()
+                                        .join("\n  ");
                                     applied_summaries.push(format!(
                                         "- {} (line {}): {}",
-                                        req.rule_id,
-                                        lines_display,
-                                        req.message.lines().next().unwrap_or("")
+                                        req.rule_id, lines_display, summary
                                     ));
                                 }
                                 all_outputs.push(output.clone());
@@ -933,6 +940,9 @@ Code contexts:
             "\n## Previously attempted fixes:\n\
              The following fixes were attempted in a previous pass. Most should already\n\
              be applied to the file on disk. Do NOT revert changes that are already correct.\n\
+             CRITICAL: Do NOT move imports back to '@patternfly/react-core/deprecated' if\n\
+             a previous fix moved them to '@patternfly/react-core'. The migration direction\n\
+             is always FROM deprecated TO the main package, never the reverse.\n\
              However, if any of these fixes were NOT actually applied (the old pattern\n\
              still exists in the file), apply them now along with the new fixes below.\n\
              {}\n\n",
