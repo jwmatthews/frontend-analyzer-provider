@@ -161,3 +161,65 @@ fn walk_expr(
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn scan_source(source: &str, pattern: &str) -> Vec<Incident> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(pattern).unwrap();
+
+        ret.program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_css_var_usage(stmt, source, &re, "file:///test.tsx"))
+            .collect()
+    }
+
+    #[test]
+    fn test_string_literal_css_var() {
+        let source = r#"const color = "--pf-v5-global--Color--100";"#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("matchingText"),
+            Some(&serde_json::Value::String(
+                "--pf-v5-global--Color--100".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_template_literal_css_var() {
+        let source = r#"const style = `var(--pf-v5-global--spacer--md)`;"#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_no_match() {
+        let source = r#"const color = "--pf-v6-global--Color--100";"#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn test_css_var_in_function_call() {
+        let source = r#"getComputedStyle(el).getPropertyValue("--pf-v5-global--Color--100");"#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_css_var_in_variable_declaration() {
+        let source = r#"const varName = "--pf-v5-global--spacer--lg";"#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(incidents.len(), 1);
+    }
+}

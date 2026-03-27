@@ -283,3 +283,307 @@ pub fn load_strategies_from_json(
         .collect();
     Ok(strategies)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_strategy_entry(strategy: &str) -> StrategyEntry {
+        StrategyEntry {
+            strategy: strategy.to_string(),
+            from: None,
+            to: None,
+            component: None,
+            prop: None,
+            package: None,
+            new_version: None,
+            mappings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_rename_with_top_level_from_to() {
+        let mut entry = make_strategy_entry("Rename");
+        entry.from = Some("Chip".to_string());
+        entry.to = Some("Label".to_string());
+
+        match entry.to_fix_strategy() {
+            FixStrategy::Rename(mappings) => {
+                assert_eq!(mappings.len(), 1);
+                assert_eq!(mappings[0].old, "Chip");
+                assert_eq!(mappings[0].new, "Label");
+            }
+            other => panic!("Expected Rename, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rename_with_mappings_array() {
+        let mut entry = make_strategy_entry("Rename");
+        entry.mappings = vec![
+            MappingEntry {
+                from: Some("Chip".to_string()),
+                to: Some("Label".to_string()),
+                component: None,
+                prop: None,
+            },
+            MappingEntry {
+                from: Some("ChipGroup".to_string()),
+                to: Some("LabelGroup".to_string()),
+                component: None,
+                prop: None,
+            },
+        ];
+
+        match entry.to_fix_strategy() {
+            FixStrategy::Rename(mappings) => {
+                assert_eq!(mappings.len(), 2);
+                assert_eq!(mappings[0].old, "Chip");
+                assert_eq!(mappings[0].new, "Label");
+                assert_eq!(mappings[1].old, "ChipGroup");
+                assert_eq!(mappings[1].new, "LabelGroup");
+            }
+            other => panic!("Expected Rename, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rename_mappings_take_precedence_over_top_level() {
+        let mut entry = make_strategy_entry("Rename");
+        entry.from = Some("TopLevel".to_string());
+        entry.to = Some("ShouldBeIgnored".to_string());
+        entry.mappings = vec![MappingEntry {
+            from: Some("FromMapping".to_string()),
+            to: Some("ToMapping".to_string()),
+            component: None,
+            prop: None,
+        }];
+
+        match entry.to_fix_strategy() {
+            FixStrategy::Rename(mappings) => {
+                assert_eq!(mappings.len(), 1);
+                assert_eq!(mappings[0].old, "FromMapping");
+            }
+            other => panic!("Expected Rename, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rename_empty_falls_back_to_manual() {
+        let entry = make_strategy_entry("Rename");
+        match entry.to_fix_strategy() {
+            FixStrategy::Manual => {}
+            other => panic!("Expected Manual, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_remove_prop() {
+        let entry = make_strategy_entry("RemoveProp");
+        match entry.to_fix_strategy() {
+            FixStrategy::RemoveProp => {}
+            other => panic!("Expected RemoveProp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_css_variable_prefix() {
+        let mut entry = make_strategy_entry("CssVariablePrefix");
+        entry.from = Some("pf-v5-".to_string());
+        entry.to = Some("pf-v6-".to_string());
+
+        match entry.to_fix_strategy() {
+            FixStrategy::CssVariablePrefix {
+                old_prefix,
+                new_prefix,
+            } => {
+                assert_eq!(old_prefix, "pf-v5-");
+                assert_eq!(new_prefix, "pf-v6-");
+            }
+            other => panic!("Expected CssVariablePrefix, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_css_variable_prefix_missing_fields_falls_to_manual() {
+        let entry = make_strategy_entry("CssVariablePrefix");
+        match entry.to_fix_strategy() {
+            FixStrategy::Manual => {}
+            other => panic!("Expected Manual, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_import_path_change() {
+        let mut entry = make_strategy_entry("ImportPathChange");
+        entry.from = Some("@patternfly/react-core/deprecated".to_string());
+        entry.to = Some("@patternfly/react-core".to_string());
+
+        match entry.to_fix_strategy() {
+            FixStrategy::ImportPathChange { old_path, new_path } => {
+                assert_eq!(old_path, "@patternfly/react-core/deprecated");
+                assert_eq!(new_path, "@patternfly/react-core");
+            }
+            other => panic!("Expected ImportPathChange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_import_path_change_missing_fields_falls_to_manual() {
+        let mut entry = make_strategy_entry("ImportPathChange");
+        entry.from = Some("something".to_string());
+        // missing `to`
+        match entry.to_fix_strategy() {
+            FixStrategy::Manual => {}
+            other => panic!("Expected Manual, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_dependency() {
+        let mut entry = make_strategy_entry("UpdateDependency");
+        entry.package = Some("@patternfly/react-core".to_string());
+        entry.new_version = Some("^6.0.0".to_string());
+
+        match entry.to_fix_strategy() {
+            FixStrategy::UpdateDependency {
+                package,
+                new_version,
+            } => {
+                assert_eq!(package, "@patternfly/react-core");
+                assert_eq!(new_version, "^6.0.0");
+            }
+            other => panic!("Expected UpdateDependency, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_dependency_missing_fields_falls_to_manual() {
+        let mut entry = make_strategy_entry("UpdateDependency");
+        entry.package = Some("something".to_string());
+        // missing new_version
+        match entry.to_fix_strategy() {
+            FixStrategy::Manual => {}
+            other => panic!("Expected Manual, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_prop_value_change_maps_to_llm() {
+        let entry = make_strategy_entry("PropValueChange");
+        match entry.to_fix_strategy() {
+            FixStrategy::Llm => {}
+            other => panic!("Expected Llm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_prop_type_change_maps_to_llm() {
+        let entry = make_strategy_entry("PropTypeChange");
+        match entry.to_fix_strategy() {
+            FixStrategy::Llm => {}
+            other => panic!("Expected Llm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_llm_assisted_maps_to_llm() {
+        let entry = make_strategy_entry("LlmAssisted");
+        match entry.to_fix_strategy() {
+            FixStrategy::Llm => {}
+            other => panic!("Expected Llm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unknown_strategy_maps_to_manual() {
+        let entry = make_strategy_entry("SomethingUnknown");
+        match entry.to_fix_strategy() {
+            FixStrategy::Manual => {}
+            other => panic!("Expected Manual, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_strategy_entry_json_deserialization() {
+        let json = r#"{
+            "strategy": "Rename",
+            "mappings": [
+                {"from": "Chip", "to": "Label"},
+                {"from": "ChipGroup", "to": "LabelGroup"}
+            ]
+        }"#;
+        let entry: StrategyEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.strategy, "Rename");
+        assert_eq!(entry.mappings.len(), 2);
+        assert_eq!(entry.mappings[0].from.as_deref(), Some("Chip"));
+        assert_eq!(entry.mappings[0].to.as_deref(), Some("Label"));
+    }
+
+    #[test]
+    fn test_strategy_entry_json_with_top_level_fields() {
+        let json = r#"{
+            "strategy": "ImportPathChange",
+            "from": "@patternfly/react-core/deprecated",
+            "to": "@patternfly/react-core"
+        }"#;
+        let entry: StrategyEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.strategy, "ImportPathChange");
+        assert_eq!(
+            entry.from.as_deref(),
+            Some("@patternfly/react-core/deprecated")
+        );
+        assert_eq!(entry.to.as_deref(), Some("@patternfly/react-core"));
+        assert!(entry.mappings.is_empty());
+    }
+
+    #[test]
+    fn test_fix_plan_default_is_empty() {
+        let plan = FixPlan::default();
+        assert!(plan.files.is_empty());
+        assert!(plan.manual.is_empty());
+        assert!(plan.pending_llm.is_empty());
+    }
+
+    #[test]
+    fn test_fix_result_default_is_zero() {
+        let result = FixResult::default();
+        assert_eq!(result.files_modified, 0);
+        assert_eq!(result.edits_applied, 0);
+        assert_eq!(result.edits_skipped, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_fix_confidence_serde() {
+        assert_eq!(
+            serde_json::to_string(&FixConfidence::Exact).unwrap(),
+            "\"exact\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FixConfidence::High).unwrap(),
+            "\"high\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FixConfidence::Medium).unwrap(),
+            "\"medium\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FixConfidence::Low).unwrap(),
+            "\"low\""
+        );
+    }
+
+    #[test]
+    fn test_fix_source_serde() {
+        assert_eq!(
+            serde_json::to_string(&FixSource::Pattern).unwrap(),
+            "\"pattern\""
+        );
+        assert_eq!(serde_json::to_string(&FixSource::Llm).unwrap(), "\"llm\"");
+        assert_eq!(
+            serde_json::to_string(&FixSource::Manual).unwrap(),
+            "\"manual\""
+        );
+    }
+}

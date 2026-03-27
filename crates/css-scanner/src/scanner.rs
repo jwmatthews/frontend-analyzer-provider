@@ -98,3 +98,37 @@ pub fn path_to_uri(path: &Path, root: &Path) -> String {
     };
     format!("file://{}", absolute.display())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_path_to_uri_absolute() {
+        let uri = path_to_uri(Path::new("/home/user/styles.css"), Path::new("/root"));
+        assert_eq!(uri, "file:///home/user/styles.css");
+    }
+
+    #[test]
+    fn test_path_to_uri_relative() {
+        let uri = path_to_uri(Path::new("src/styles.css"), Path::new("/home/user/project"));
+        assert_eq!(uri, "file:///home/user/project/src/styles.css");
+    }
+
+    #[test]
+    fn test_css_extensions_list() {
+        assert!(CSS_EXTENSIONS.contains(&"css"));
+        assert!(CSS_EXTENSIONS.contains(&"scss"));
+        assert!(CSS_EXTENSIONS.contains(&"less"));
+        assert!(CSS_EXTENSIONS.contains(&"sass"));
+        assert!(!CSS_EXTENSIONS.contains(&"js"));
+    }
+
+    #[test]
+    fn test_skip_dirs_list() {
+        assert!(SKIP_DIRS.contains(&"node_modules"));
+        assert!(SKIP_DIRS.contains(&".git"));
+        assert!(SKIP_DIRS.contains(&"dist"));
+        assert!(SKIP_DIRS.contains(&"build"));
+    }
+}

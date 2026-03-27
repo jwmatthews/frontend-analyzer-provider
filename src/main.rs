@@ -2,9 +2,6 @@ use anyhow::Result;
 use clap::Parser;
 
 mod cli;
-mod fix_engine;
-mod goose_client;
-mod llm_client;
 
 #[tokio::main]
 async fn main() -> Result<()> {

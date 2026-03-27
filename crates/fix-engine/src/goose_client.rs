@@ -5,6 +5,8 @@
 
 use anyhow::{Context, Result};
 use frontend_core::fix::LlmFixRequest;
+
+use crate::context::FixContext;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -135,41 +137,6 @@ fn run_goose_with_timeout(prompt: &str, max_turns: &str) -> Result<(bool, String
 /// Run goose fixes for all pending LLM requests.
 /// Groups requests by file path for batch processing.
 /// If `log_dir` is provided, saves prompts and responses to JSON files.
-/// Maximum number of files to process concurrently.
-/// Each file spawns a goose process, so this limits system load.
-/// Determine the processing priority of a fix request within a batch.
-///
-/// Lower priority number = processed first. This ensures structural
-/// migration rules (which require JSX restructuring) come before
-/// informational/review-only rules.
-fn fix_priority_by_id(id: &str) -> u8 {
-    if id.contains("hierarchy-") {
-        0 // hierarchy composition: highest priority, restructures component children
-    } else if id.contains("component-import-deprecated") {
-        1 // structural migration: removed/restructured components
-    } else if id.contains("composition") || id.contains("new-sibling") {
-        2 // composition: children→prop, new wrapper components
-    } else if id.contains("removed")
-        || id.contains("renamed")
-        || id.contains("type-changed")
-        || id.contains("signature-changed")
-        || id.contains("prop-value")
-    {
-        3 // prop-level changes
-    } else if id.contains("behavioral")
-        || id.contains("dom-structure")
-        || id.contains("css-")
-        || id.contains("accessibility")
-        || id.contains("logic-change")
-        || id.contains("render-output")
-    {
-        4 // informational: DOM/CSS/a11y changes
-    } else if id.starts_with("conformance-") {
-        5 // review-only: conformance checks
-    } else {
-        3 // default: treat as prop-level
-    }
-}
 
 /// An LLM fix request with multiple incidents from the same rule merged
 /// into a single entry. This preserves the priority-based sort order
@@ -277,6 +244,7 @@ const MAX_CONCURRENT_FILES: usize = 3;
 
 pub fn run_all_goose_fixes(
     requests: &[LlmFixRequest],
+    ctx: &dyn FixContext,
     verbose: bool,
     log_dir: Option<&std::path::Path>,
 ) -> Vec<GooseFixResult> {
@@ -302,7 +270,10 @@ pub fn run_all_goose_fixes(
     let mut merged_by_file: Vec<(PathBuf, Vec<MergedLlmFixRequest>)> = Vec::new();
     for (path, file_reqs) in by_file {
         let mut merged = merge_by_rule_id(&file_reqs);
-        merged.sort_by(|a, b| fix_priority_by_id(&a.rule_id).cmp(&fix_priority_by_id(&b.rule_id)));
+        merged.sort_by(|a, b| {
+            ctx.fix_priority(&a.rule_id)
+                .cmp(&ctx.fix_priority(&b.rule_id))
+        });
         merged_by_file.push((path, merged));
     }
 
@@ -345,8 +316,15 @@ pub fn run_all_goose_fixes(
             let log_dir = log_dir;
 
             let handle = s.spawn(move || {
-                let result =
-                    process_single_file(i, total_files, file_path, file_requests, verbose, log_dir);
+                let result = process_single_file(
+                    i,
+                    total_files,
+                    file_path,
+                    file_requests,
+                    ctx,
+                    verbose,
+                    log_dir,
+                );
 
                 let idx = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 match &result {
@@ -392,6 +370,7 @@ fn process_single_file(
     total_files: usize,
     file_path: &PathBuf,
     file_requests: &[MergedLlmFixRequest],
+    ctx: &dyn FixContext,
     verbose: bool,
     log_dir: Option<&std::path::Path>,
 ) -> GooseFixResult {
@@ -441,7 +420,7 @@ fn process_single_file(
     let mut applied_summaries: Vec<String> = Vec::new();
 
     if file_requests.len() == 1 {
-        let prompt = build_merged_prompt(&file_requests[0]);
+        let prompt = build_merged_prompt(&file_requests[0], ctx);
         all_prompts.push(prompt.clone());
         let max_turns_str = "5".to_string();
         let mut goose_result = run_goose_with_timeout(&prompt, &max_turns_str);
@@ -497,6 +476,7 @@ fn process_single_file(
                 } else {
                     Some(&applied_summaries)
                 },
+                ctx,
             );
             all_prompts.push(prompt.clone());
 
@@ -802,7 +782,7 @@ fn process_single_file(
 
 /// Build a prompt for a single merged fix request (one unique rule, possibly
 /// multiple incident lines).
-fn build_merged_prompt(request: &MergedLlmFixRequest) -> String {
+fn build_merged_prompt(request: &MergedLlmFixRequest, ctx: &dyn FixContext) -> String {
     let lines_display = request
         .lines
         .iter()
@@ -821,8 +801,16 @@ fn build_merged_prompt(request: &MergedLlmFixRequest) -> String {
         }
     }
 
+    let constraints = ctx.llm_constraints();
+    let constraints_section = if constraints.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = constraints.iter().map(|c| format!("- {}", c)).collect();
+        format!("\nIMPORTANT constraints:\n{}", lines.join("\n"))
+    };
+
     format!(
-        r#"You are applying a PatternFly v5 to v6 migration fix.
+        r#"You are applying a {migration_desc} fix.
 
 File: {file_path}
 Line: {lines}
@@ -840,26 +828,16 @@ Instructions:
 2. Apply ONLY the change described by the migration rule at or near line {lines}
 3. Make the minimum edit necessary — do not change unrelated code
 4. Write the fixed file
-
-IMPORTANT constraints:
-- NEVER use deep import paths like '@patternfly/react-core/dist/esm/...' or '@patternfly/react-core/next'. Always use the public barrel import '@patternfly/react-core'.
-- NEVER replace PatternFly components (Button, MenuToggle, etc.) with raw HTML elements (<button>, <a>, <div>). If a component still exists in PF6, keep using it.
-- NEVER remove data-ouia-component-id, ouiaId, or other test identifier props unless the migration rule specifically says to.
-- NEVER invent or use component names that are not mentioned in the migration rules or already imported in the file. Only use components explicitly named in the rule message.
-- When adding new components (ModalHeader, ModalBody, ModalFooter, etc.), import them from the same package as the parent component.
-- If the migration rule says a component was "restructured" or "still exists", keep the component and only restructure its props/children as described. If the rule says a component was "removed" and tells you to remove the import, DO remove it and migrate to the replacement described in the rule.
-- When a prop migration says to pass a prop to a child component (e.g., 'actions → pass as children of <ModalFooter>'), you MUST create that child component element, import it, and render the prop value within it.
-- Props can be passed in multiple ways — look for ALL of them when migrating a removed prop:
-  * Direct: `propName={{value}}`
-  * Conditional spread: `{{...(value && {{ propName: value }})}}` or `{{...(condition && {{ propName }})}}` — convert the condition to wrap the new child component, e.g., `{{value && <ChildComponent>{{value}}</ChildComponent>}}`
-  * Object spread: `{{...props}}` — check if the spread object contains the removed prop
+{constraints_section}
 
 Before writing, reason through the fix step by step to ensure nothing is missed. Then read the file, make the edit, and write it."#,
+        migration_desc = ctx.migration_description(),
         file_path = request.file_path.display(),
         lines = lines_display,
         rule_id = request.rule_id,
         message = request.message,
         code_context = code_context,
+        constraints_section = constraints_section,
     )
 }
 
@@ -867,6 +845,7 @@ fn build_batch_prompt_with_context(
     file_path: &PathBuf,
     requests: &[&MergedLlmFixRequest],
     previously_applied: Option<&[String]>,
+    ctx: &dyn FixContext,
 ) -> String {
     // Requests are already merged by rule_id and sorted by priority upstream
     // (in run_all_goose_fixes). We iterate directly in the provided order
@@ -935,25 +914,38 @@ Code contexts:
         }
     }
 
+    let revert_warning = ctx.revert_warnings().unwrap_or("");
     let context_section = if let Some(applied) = previously_applied {
-        format!(
+        let mut section = format!(
             "\n## Previously attempted fixes:\n\
              The following fixes were attempted in a previous pass. Most should already\n\
-             be applied to the file on disk. Do NOT revert changes that are already correct.\n\
-             CRITICAL: Do NOT move imports back to '@patternfly/react-core/deprecated' if\n\
-             a previous fix moved them to '@patternfly/react-core'. The migration direction\n\
-             is always FROM deprecated TO the main package, never the reverse.\n\
-             However, if any of these fixes were NOT actually applied (the old pattern\n\
-             still exists in the file), apply them now along with the new fixes below.\n\
-             {}\n\n",
-            applied.join("\n")
-        )
+             be applied to the file on disk. Do NOT revert changes that are already correct.\n"
+        );
+        if !revert_warning.is_empty() {
+            section.push_str(revert_warning);
+            section.push('\n');
+        }
+        section.push_str(
+            "However, if any of these fixes were NOT actually applied (the old pattern\n\
+             still exists in the file), apply them now along with the new fixes below.\n",
+        );
+        section.push_str(&applied.join("\n"));
+        section.push_str("\n\n");
+        section
     } else {
         String::new()
     };
 
+    let constraints = ctx.llm_constraints();
+    let constraints_section = if constraints.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = constraints.iter().map(|c| format!("- {}", c)).collect();
+        format!("\nIMPORTANT constraints:\n{}", lines.join("\n"))
+    };
+
     format!(
-        r#"You are applying PatternFly v5 to v6 migration fixes to a single file.
+        r#"You are applying {migration_desc} fixes to a single file.
 
 File: {file_path}
 {context_section}
@@ -969,29 +961,19 @@ Instructions:
 3. Make the minimum edits necessary — do not change unrelated code
 4. Do NOT revert any changes that were already applied in previous passes
 5. Write the fixed file once with ALL changes from every fix applied
-
-IMPORTANT constraints:
-- NEVER use deep import paths like '@patternfly/react-core/dist/esm/...' or '@patternfly/react-core/next'. Always use the public barrel import '@patternfly/react-core'.
-- NEVER replace PatternFly components (Button, MenuToggle, etc.) with raw HTML elements (<button>, <a>, <div>). If a component still exists in PF6, keep using it.
-- NEVER remove data-ouia-component-id, ouiaId, or other test identifier props unless the migration rule specifically says to.
-- NEVER invent or use component names that are not mentioned in the migration rules or already imported in the file. Only use components explicitly named in the rule message.
-- When adding new components (ModalHeader, ModalBody, ModalFooter, etc.), import them from the same package as the parent component.
-- If the migration rule says a component was "restructured" or "still exists", keep the component and only restructure its props/children as described. If the rule says a component was "removed" and tells you to remove the import, DO remove it and migrate to the replacement described in the rule.
-- When a prop migration says to pass a prop to a child component (e.g., 'actions → pass as children of <ModalFooter>'), you MUST create that child component element, import it, and render the prop value within it.
-- Props can be passed in multiple ways — look for ALL of them when migrating a removed prop:
-  * Direct: `propName={{value}}`
-  * Conditional spread: `{{...(value && {{ propName: value }})}}` or `{{...(condition && {{ propName }})}}` — convert the condition to wrap the new child component, e.g., `{{value && <ChildComponent>{{value}}</ChildComponent>}}`
-  * Object spread: `{{...props}}` — check if the spread object contains the removed prop
+{constraints_section}
 
 VERIFICATION: After making edits, check that EVERY removed prop listed in the migration rules
 has been migrated to its specified child component. Do NOT declare a migration "already applied"
 unless ALL listed child components are present AND all removed props are accounted for.
 
 Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it."#,
+        migration_desc = ctx.migration_description(),
         file_path = file_path.display(),
         context_section = context_section,
         count = requests.len(),
         fixes = fixes,
+        constraints_section = constraints_section,
     )
 }
 
@@ -1016,85 +998,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_fix_priority_structural_first() {
-        assert_eq!(
-            fix_priority_by_id("semver-modal-component-import-deprecated"),
-            1
-        );
-        assert_eq!(
-            fix_priority_by_id("semver-composition-button-children-to-icon-prop"),
-            2
-        );
-        assert_eq!(
-            fix_priority_by_id("semver-packages-react-core-modalprops-title-removed"),
-            3
-        );
-        assert_eq!(
-            fix_priority_by_id("semver-packages-react-core-button-tsx-button-behavioral"),
-            4
-        );
-        assert_eq!(
-            fix_priority_by_id("conformance-dropdown-expected-children"),
-            5
-        );
-    }
-
-    #[test]
-    fn test_fix_priority_hierarchy_is_highest() {
-        assert_eq!(
-            fix_priority_by_id("semver-hierarchy-modal-composition-changed"),
-            0
-        );
-    }
-
-    #[test]
-    fn test_fix_priority_sorting_order() {
-        let mut ids = vec![
-            "conformance-dropdown-expected-children",
-            "semver-packages-react-core-button-behavioral",
-            "semver-modal-component-import-deprecated",
-            "semver-composition-button-children-to-icon-prop",
-            "semver-packages-react-core-modalprops-title-removed",
-            "semver-hierarchy-emptystate-composition-changed",
-            "conformance-toolbar-expected-children",
-            "semver-packages-react-core-dom-structure",
-        ];
-
-        ids.sort_by(|a, b| fix_priority_by_id(a).cmp(&fix_priority_by_id(b)));
-
-        // Hierarchy (0) and component-import-deprecated (1) come first
-        assert!(ids[0].contains("component-import-deprecated") || ids[0].contains("hierarchy-"));
-        assert!(ids[1].contains("component-import-deprecated") || ids[1].contains("hierarchy-"));
-
-        // Conformance (5) comes last
-        assert!(ids[ids.len() - 1].starts_with("conformance-"));
-        assert!(ids[ids.len() - 2].starts_with("conformance-"));
-    }
-
-    #[test]
-    fn test_fix_priority_dom_and_css_are_informational() {
-        assert_eq!(fix_priority_by_id("semver-foo-dom-structure"), 4);
-        assert_eq!(fix_priority_by_id("semver-foo-css-class"), 4);
-        assert_eq!(fix_priority_by_id("semver-foo-css-variable"), 4);
-        assert_eq!(fix_priority_by_id("semver-foo-accessibility"), 4);
-        assert_eq!(fix_priority_by_id("semver-foo-logic-change"), 4);
-        assert_eq!(fix_priority_by_id("semver-foo-render-output"), 4);
-    }
-
-    #[test]
-    fn test_fix_priority_prop_level_changes() {
-        assert_eq!(fix_priority_by_id("semver-foo-removed"), 3);
-        assert_eq!(fix_priority_by_id("semver-foo-renamed"), 3);
-        assert_eq!(fix_priority_by_id("semver-foo-type-changed"), 3);
-        assert_eq!(fix_priority_by_id("semver-foo-signature-changed"), 3);
-        assert_eq!(fix_priority_by_id("semver-foo-prop-value-change"), 3);
-    }
-
-    #[test]
-    fn test_fix_priority_unknown_defaults_to_prop_level() {
-        assert_eq!(fix_priority_by_id("semver-something-unknown"), 3);
-    }
+    // NOTE: fix_priority tests have moved to the patternfly-fix-context crate,
+    // since priority ordering is now a FixContext concern, not a goose_client one.
 
     // ── merge_by_rule_id tests ───────────────────────────────────────────
 
@@ -1191,103 +1096,56 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_then_sort_produces_correct_prompt_order() {
-        // This is the key test: simulates the exact scenario from the bug.
-        // The input is unsorted (as it comes from kantra violations).
-        // After merge + sort, hierarchy rules must be FIRST, not buried
-        // at Fix 7/8 like the BTreeMap bug caused.
+    fn test_merge_then_sort_with_context() {
+        // Tests that merge + sort works with a FixContext.
+        // With GenericFixContext (priority 3 for all), insertion order is preserved.
         let reqs = vec![
-            make_req_at_line("semver-composition-button-children-to-icon-prop", 139, None),
-            make_req_at_line("semver-composition-button-nesting-changed", 139, None),
-            make_req_at_line(
-                "semver-composition-emptystateheader-nesting-changed",
-                152,
-                None,
-            ),
-            make_req_at_line(
-                "semver-composition-emptystateicon-nesting-changed",
-                152,
-                None,
-            ),
-            make_req_at_line(
-                "semver-emptystateheader-component-import-deprecated",
-                7,
-                None,
-            ),
-            make_req_at_line("semver-emptystateicon-component-import-deprecated", 8, None),
-            make_req_at_line("semver-hierarchy-emptystate-composition-changed", 6, None),
-            make_req_at_line("semver-hierarchy-modal-composition-changed", 9, None),
+            make_req_at_line("rule-a", 10, None),
+            make_req_at_line("rule-b", 20, None),
+            make_req_at_line("rule-c", 30, None),
         ];
         let refs: Vec<&LlmFixRequest> = reqs.iter().collect();
 
-        // Step 1: merge by rule_id (preserves insertion order)
         let mut merged = merge_by_rule_id(&refs);
+        let ctx = crate::context::GenericFixContext;
+        merged.sort_by(|a, b| {
+            ctx.fix_priority(&a.rule_id)
+                .cmp(&ctx.fix_priority(&b.rule_id))
+        });
 
-        // Step 2: sort by priority (hierarchy=0 first, conformance=5 last)
-        merged.sort_by(|a, b| fix_priority_by_id(&a.rule_id).cmp(&fix_priority_by_id(&b.rule_id)));
-
-        // Hierarchy rules (priority 0) must be first
-        assert_eq!(
-            merged[0].rule_id,
-            "semver-hierarchy-emptystate-composition-changed"
-        );
-        assert_eq!(
-            merged[1].rule_id,
-            "semver-hierarchy-modal-composition-changed"
-        );
-
-        // Component-import-deprecated (priority 1) next
-        assert_eq!(
-            merged[2].rule_id,
-            "semver-emptystateheader-component-import-deprecated"
-        );
-        assert_eq!(
-            merged[3].rule_id,
-            "semver-emptystateicon-component-import-deprecated"
-        );
-
-        // Composition (priority 2) after that
-        assert!(merged[4].rule_id.contains("composition"));
-        assert!(merged[5].rule_id.contains("composition"));
-        assert!(merged[6].rule_id.contains("composition"));
-        assert!(merged[7].rule_id.contains("composition"));
+        // With equal priority, sort is stable — insertion order preserved
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].rule_id, "rule-a");
+        assert_eq!(merged[1].rule_id, "rule-b");
+        assert_eq!(merged[2].rule_id, "rule-c");
     }
 
     #[test]
-    fn test_batch_prompt_preserves_priority_order() {
-        // Verify that the prompt Fix numbering follows priority order,
-        // not alphabetical order. This is the exact bug that was fixed.
+    fn test_batch_prompt_includes_all_fixes() {
+        // Verify that the batch prompt includes all fix entries.
         let reqs = vec![
-            make_req("semver-composition-button-children-to-icon-prop"),
-            make_req("semver-hierarchy-modal-composition-changed"),
-            make_req("conformance-table-expected-children"),
+            make_req("rule-alpha"),
+            make_req("rule-beta"),
+            make_req("rule-gamma"),
         ];
         let refs: Vec<&LlmFixRequest> = reqs.iter().collect();
 
-        // Merge and sort by priority
-        let mut merged = merge_by_rule_id(&refs);
-        merged.sort_by(|a, b| fix_priority_by_id(&a.rule_id).cmp(&fix_priority_by_id(&b.rule_id)));
-
-        // Build the prompt
+        let merged = merge_by_rule_id(&refs);
         let merged_refs: Vec<&MergedLlmFixRequest> = merged.iter().collect();
-        let prompt =
-            build_batch_prompt_with_context(&PathBuf::from("/tmp/test.tsx"), &merged_refs, None);
-
-        // Extract Fix N and corresponding rule IDs from the prompt
-        let fix_rules: Vec<&str> = prompt
-            .lines()
-            .filter(|l| l.starts_with("Rule ["))
-            .map(|l| l.trim_start_matches("Rule [").trim_end_matches("]:"))
-            .collect();
-
-        // Fix 1 must be the hierarchy rule (priority 0), not the
-        // composition rule that sorts earlier alphabetically
-        assert_eq!(fix_rules[0], "semver-hierarchy-modal-composition-changed");
-        assert_eq!(
-            fix_rules[1],
-            "semver-composition-button-children-to-icon-prop"
+        let ctx = crate::context::GenericFixContext;
+        let prompt = build_batch_prompt_with_context(
+            &PathBuf::from("/tmp/test.tsx"),
+            &merged_refs,
+            None,
+            &ctx,
         );
-        assert_eq!(fix_rules[2], "conformance-table-expected-children");
+
+        // All rules appear in the prompt
+        assert!(prompt.contains("rule-alpha"));
+        assert!(prompt.contains("rule-beta"));
+        assert!(prompt.contains("rule-gamma"));
+        // Uses the generic migration description
+        assert!(prompt.contains("code migration"));
     }
 
     #[test]

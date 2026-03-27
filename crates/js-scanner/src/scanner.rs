@@ -218,7 +218,11 @@ pub fn scan_file_referenced(
 
     // Add code snippets
     for incident in &mut incidents {
-        incident.code_snip = Some(extract_code_snip(&source, incident.line_number, 5));
+        incident.code_snip = Some(extract_code_snip(
+            &source,
+            incident.line_number.unwrap_or(0),
+            5,
+        ));
     }
 
     Ok(incidents)
@@ -247,7 +251,11 @@ pub fn scan_file_classnames(file_path: &Path, root: &Path, pattern: &Regex) -> R
     }
 
     for incident in &mut incidents {
-        incident.code_snip = Some(extract_code_snip(&source, incident.line_number, 5));
+        incident.code_snip = Some(extract_code_snip(
+            &source,
+            incident.line_number.unwrap_or(0),
+            5,
+        ));
     }
 
     Ok(incidents)
@@ -276,7 +284,11 @@ pub fn scan_file_css_vars(file_path: &Path, root: &Path, pattern: &Regex) -> Res
     }
 
     for incident in &mut incidents {
-        incident.code_snip = Some(extract_code_snip(&source, incident.line_number, 5));
+        incident.code_snip = Some(extract_code_snip(
+            &source,
+            incident.line_number.unwrap_or(0),
+            5,
+        ));
     }
 
     Ok(incidents)
@@ -333,7 +345,7 @@ pub fn line_number_from_offset(source: &str, offset: u32) -> u32 {
     source[..clamped].chars().filter(|c| *c == '\n').count() as u32 + 1
 }
 
-/// Create an Incident from source location info.
+/// Create an `Incident` from source location info.
 pub fn make_incident(source: &str, file_uri: &str, start_offset: u32, end_offset: u32) -> Incident {
     let start_clamped = (start_offset as usize).min(source.len());
     let end_clamped = (end_offset as usize).min(source.len());
@@ -363,4 +375,147 @@ pub fn make_incident(source: &str, file_uri: &str, start_offset: u32, end_offset
             },
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── line_number_from_offset tests ────────────────────────────────────
+
+    #[test]
+    fn test_line_number_offset_zero() {
+        assert_eq!(line_number_from_offset("hello\nworld", 0), 1);
+    }
+
+    #[test]
+    fn test_line_number_first_line() {
+        assert_eq!(line_number_from_offset("hello\nworld", 3), 1);
+    }
+
+    #[test]
+    fn test_line_number_at_newline() {
+        // offset 5 is the '\n' character
+        assert_eq!(line_number_from_offset("hello\nworld", 5), 1);
+    }
+
+    #[test]
+    fn test_line_number_second_line() {
+        assert_eq!(line_number_from_offset("hello\nworld", 6), 2);
+    }
+
+    #[test]
+    fn test_line_number_third_line() {
+        assert_eq!(line_number_from_offset("a\nb\nc\nd", 4), 3);
+    }
+
+    #[test]
+    fn test_line_number_single_line() {
+        assert_eq!(line_number_from_offset("no newlines", 5), 1);
+    }
+
+    #[test]
+    fn test_line_number_offset_beyond_source() {
+        // Should clamp to source length
+        assert_eq!(line_number_from_offset("a\nb", 999), 2);
+    }
+
+    #[test]
+    fn test_line_number_empty_source() {
+        assert_eq!(line_number_from_offset("", 0), 1);
+    }
+
+    // ── path_to_uri tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_path_to_uri_absolute() {
+        let uri = path_to_uri(Path::new("/home/user/src/App.tsx"), Path::new("/root"));
+        assert_eq!(uri, "file:///home/user/src/App.tsx");
+    }
+
+    #[test]
+    fn test_path_to_uri_relative() {
+        let uri = path_to_uri(Path::new("src/App.tsx"), Path::new("/home/user/project"));
+        assert_eq!(uri, "file:///home/user/project/src/App.tsx");
+    }
+
+    // ── make_incident tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_make_incident_basic() {
+        let source = "import { Button } from '@patternfly/react-core';";
+        let incident = make_incident(source, "file:///test.tsx", 0, 48);
+        assert_eq!(incident.file_uri, "file:///test.tsx");
+        assert_eq!(incident.line_number, Some(1));
+        let loc = incident.code_location.unwrap();
+        assert_eq!(loc.start.line, 0); // 0-indexed
+        assert_eq!(loc.start.character, 0);
+    }
+
+    #[test]
+    fn test_make_incident_second_line() {
+        let source = "line one\nimport { X } from 'y';";
+        // "import" starts at offset 9
+        let incident = make_incident(source, "file:///test.tsx", 9, 30);
+        assert_eq!(incident.line_number, Some(2));
+        let loc = incident.code_location.unwrap();
+        assert_eq!(loc.start.line, 1); // 0-indexed
+        assert_eq!(loc.start.character, 0);
+    }
+
+    #[test]
+    fn test_make_incident_column_calculation() {
+        let source = "  const x = 1;";
+        // "x" is at offset 8
+        let incident = make_incident(source, "file:///test.tsx", 8, 9);
+        assert_eq!(incident.line_number, Some(1));
+        let loc = incident.code_location.unwrap();
+        assert_eq!(loc.start.character, 8);
+        assert_eq!(loc.end.character, 9);
+    }
+
+    // ── source_type_for_file tests ───────────────────────────────────────
+
+    #[test]
+    fn test_source_type_tsx() {
+        let st = source_type_for_file(Path::new("app.tsx"), "");
+        assert!(st.is_typescript());
+        assert!(st.is_jsx());
+    }
+
+    #[test]
+    fn test_source_type_ts() {
+        let st = source_type_for_file(Path::new("app.ts"), "");
+        assert!(st.is_typescript());
+    }
+
+    #[test]
+    fn test_source_type_jsx() {
+        let st = source_type_for_file(Path::new("app.jsx"), "");
+        assert!(st.is_jsx());
+    }
+
+    #[test]
+    fn test_source_type_js_with_import() {
+        let st = source_type_for_file(Path::new("app.js"), "import { foo } from 'bar';");
+        assert!(st.is_jsx()); // JSX always enabled
+    }
+
+    #[test]
+    fn test_source_type_js_with_require() {
+        let st = source_type_for_file(Path::new("app.js"), "const foo = require('bar');");
+        assert!(st.is_jsx()); // JSX always enabled
+    }
+
+    #[test]
+    fn test_source_type_cjs() {
+        let st = source_type_for_file(Path::new("app.cjs"), "");
+        assert!(st.is_jsx());
+    }
+
+    #[test]
+    fn test_source_type_mjs() {
+        let st = source_type_for_file(Path::new("app.mjs"), "");
+        assert!(st.is_jsx());
+    }
 }

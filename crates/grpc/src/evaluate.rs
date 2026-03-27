@@ -124,17 +124,17 @@ fn incident_to_proto(incident: &Incident) -> IncidentContext {
     IncidentContext {
         file_uri: incident.file_uri.clone(),
         effort: incident.effort,
-        code_location: Some(Location {
+        code_location: incident.code_location.as_ref().map(|loc| Location {
             start_position: Some(Position {
-                line: incident.code_location.start.line as f64,
-                character: incident.code_location.start.character as f64,
+                line: loc.start.line as f64,
+                character: loc.start.character as f64,
             }),
             end_position: Some(Position {
-                line: incident.code_location.end.line as f64,
-                character: incident.code_location.end.character as f64,
+                line: loc.end.line as f64,
+                character: loc.end.character as f64,
             }),
         }),
-        line_number: Some(incident.line_number as i64),
+        line_number: incident.line_number.map(|n| n as i64),
         variables,
         links: incident
             .links

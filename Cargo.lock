@@ -743,19 +743,16 @@ dependencies = [
  "anyhow",
  "clap",
  "frontend-core",
- "frontend-css-scanner",
+ "frontend-fix-engine",
  "frontend-grpc",
- "frontend-js-scanner",
- "libc",
- "regex",
- "reqwest 0.12.28",
+ "konveyor-core",
+ "patternfly-fix-context",
  "serde",
  "serde_json",
  "serde_yml",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "walkdir",
 ]
 
 [[package]]
@@ -763,11 +760,10 @@ name = "frontend-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "regex",
+ "konveyor-core",
  "serde",
  "serde_json",
  "serde_yml",
- "walkdir",
 ]
 
 [[package]]
@@ -782,6 +778,21 @@ dependencies = [
  "serde_json",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "frontend-fix-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "frontend-core",
+ "konveyor-core",
+ "libc",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1349,6 +1360,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "konveyor-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1901,6 +1920,13 @@ name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
+name = "patternfly-fix-context"
+version = "0.1.0"
+dependencies = [
+ "frontend-fix-engine",
+]
 
 [[package]]
 name = "percent-encoding"

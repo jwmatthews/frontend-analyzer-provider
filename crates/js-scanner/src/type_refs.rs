@@ -180,3 +180,99 @@ fn check_ts_type(
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn scan_source(source: &str, pattern: &str) -> Vec<Incident> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(pattern).unwrap();
+
+        ret.program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_type_refs(stmt, source, &re, "file:///test.tsx"))
+            .collect()
+    }
+
+    #[test]
+    fn test_type_alias_matches() {
+        let incidents = scan_source("type MyProps = ButtonProps;", r"^MyProps$");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("typeName"),
+            Some(&serde_json::Value::String("MyProps".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_type_alias_rhs_reference() {
+        let incidents = scan_source("type MyProps = ButtonProps;", r"^ButtonProps$");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("typeName"),
+            Some(&serde_json::Value::String("ButtonProps".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_interface_declaration() {
+        let incidents = scan_source("interface MyInterface {}", r"^MyInterface$");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_interface_extends() {
+        let incidents = scan_source("interface MyProps extends ButtonProps {}", r"^ButtonProps$");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("typeName"),
+            Some(&serde_json::Value::String("ButtonProps".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_variable_type_annotation() {
+        let incidents = scan_source("const x: ButtonProps = {};", r"^ButtonProps$");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_union_type_reference() {
+        let incidents = scan_source(
+            "type Combined = ButtonProps | AlertProps;",
+            r"^ButtonProps$",
+        );
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_no_match() {
+        let incidents = scan_source("type Foo = string;", r"^ButtonProps$");
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn test_exported_type_alias() {
+        let incidents = scan_source("export type MyProps = ButtonProps;", r"^MyProps$");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_exported_interface() {
+        let incidents = scan_source("export interface MyInterface {}", r"^MyInterface$");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_array_type_reference() {
+        let incidents = scan_source("const items: ButtonProps[] = [];", r"^ButtonProps$");
+        assert_eq!(incidents.len(), 1);
+    }
+}

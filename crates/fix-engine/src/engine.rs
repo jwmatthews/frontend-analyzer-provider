@@ -6,7 +6,8 @@
 
 use anyhow::Result;
 use frontend_core::fix::*;
-use frontend_core::report::{RuleSet, ViolationIncident};
+use konveyor_core::incident::Incident;
+use konveyor_core::report::RuleSet;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
@@ -33,7 +34,7 @@ pub fn plan_fixes(
                 .unwrap_or(FixStrategy::Llm);
 
             for incident in &violation.incidents {
-                let file_path = uri_to_path(&incident.uri, project_root);
+                let file_path = uri_to_path(&incident.file_uri, project_root);
 
                 // Skip node_modules — these are updated via package.json
                 // version bumps, not by patching source directly.
@@ -95,7 +96,7 @@ pub fn plan_fixes(
                     FixStrategy::Manual => {
                         plan.manual.push(ManualFixItem {
                             rule_id: rule_id.clone(),
-                            file_uri: incident.uri.clone(),
+                            file_uri: incident.file_uri.clone(),
                             line: incident.line_number.unwrap_or(0),
                             message: incident.message.clone(),
                             code_snip: incident.code_snip.clone(),
@@ -104,7 +105,7 @@ pub fn plan_fixes(
                     FixStrategy::Llm => {
                         plan.pending_llm.push(LlmFixRequest {
                             rule_id: rule_id.clone(),
-                            file_uri: incident.uri.clone(),
+                            file_uri: incident.file_uri.clone(),
                             file_path: file_path.clone(),
                             line: incident.line_number.unwrap_or(0),
                             message: incident.message.clone(),
@@ -272,7 +273,7 @@ pub fn preview_fixes(plan: &FixPlan) -> Result<String> {
 
 fn plan_rename(
     rule_id: &str,
-    incident: &ViolationIncident,
+    incident: &Incident,
     mappings: &[RenameMapping],
     file_path: &PathBuf,
 ) -> Option<PlannedFix> {
@@ -414,17 +415,13 @@ fn plan_rename(
         confidence: FixConfidence::Exact,
         source: FixSource::Pattern,
         rule_id: rule_id.to_string(),
-        file_uri: incident.uri.clone(),
+        file_uri: incident.file_uri.clone(),
         line,
         description: format!("Rename {}", desc),
     })
 }
 
-fn plan_remove_prop(
-    rule_id: &str,
-    incident: &ViolationIncident,
-    file_path: &PathBuf,
-) -> Option<PlannedFix> {
+fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &PathBuf) -> Option<PlannedFix> {
     let line = incident.line_number?;
     let prop_name = incident
         .variables
@@ -458,7 +455,7 @@ fn plan_remove_prop(
                 confidence: FixConfidence::High,
                 source: FixSource::Pattern,
                 rule_id: rule_id.to_string(),
-                file_uri: incident.uri.clone(),
+                file_uri: incident.file_uri.clone(),
                 line,
                 description: format!("Remove prop '{}'", prop_name),
             })
@@ -481,7 +478,7 @@ fn plan_remove_prop(
                     confidence: FixConfidence::Low,
                     source: FixSource::Pattern,
                     rule_id: rule_id.to_string(),
-                    file_uri: incident.uri.clone(),
+                    file_uri: incident.file_uri.clone(),
                     line,
                     description: format!(
                         "Remove prop '{}' (unbalanced brackets, manual)",
@@ -513,7 +510,7 @@ fn plan_remove_prop(
                 confidence: FixConfidence::High,
                 source: FixSource::Pattern,
                 rule_id: rule_id.to_string(),
-                file_uri: incident.uri.clone(),
+                file_uri: incident.file_uri.clone(),
                 line,
                 description: format!(
                     "Remove prop '{}' ({} lines)",
@@ -540,7 +537,7 @@ fn plan_remove_prop(
                     confidence: FixConfidence::Low,
                     source: FixSource::Pattern,
                     rule_id: rule_id.to_string(),
-                    file_uri: incident.uri.clone(),
+                    file_uri: incident.file_uri.clone(),
                     line,
                     description: format!("Remove prop '{}' (multi-line inline, manual)", prop_name),
                 });
@@ -557,7 +554,7 @@ fn plan_remove_prop(
                 confidence: FixConfidence::High,
                 source: FixSource::Pattern,
                 rule_id: rule_id.to_string(),
-                file_uri: incident.uri.clone(),
+                file_uri: incident.file_uri.clone(),
                 line,
                 description: format!("Remove prop '{}'", prop_name),
             })
@@ -568,7 +565,7 @@ fn plan_remove_prop(
                 confidence: FixConfidence::Low,
                 source: FixSource::Pattern,
                 rule_id: rule_id.to_string(),
-                file_uri: incident.uri.clone(),
+                file_uri: incident.file_uri.clone(),
                 line,
                 description: format!("Remove prop '{}' (manual)", prop_name),
             })
@@ -578,7 +575,7 @@ fn plan_remove_prop(
 
 fn plan_import_path_change(
     rule_id: &str,
-    incident: &ViolationIncident,
+    incident: &Incident,
     old_path: &str,
     new_path: &str,
     _file_path: &PathBuf,
@@ -596,7 +593,7 @@ fn plan_import_path_change(
         confidence: FixConfidence::Exact,
         source: FixSource::Pattern,
         rule_id: rule_id.to_string(),
-        file_uri: incident.uri.clone(),
+        file_uri: incident.file_uri.clone(),
         line,
         description: format!("Change import path to '{}'", new_path),
     })
@@ -604,7 +601,7 @@ fn plan_import_path_change(
 
 fn plan_update_dependency(
     rule_id: &str,
-    incident: &ViolationIncident,
+    incident: &Incident,
     package: &str,
     new_version: &str,
     file_path: &PathBuf,
@@ -641,7 +638,7 @@ fn plan_update_dependency(
             confidence: FixConfidence::Exact,
             source: FixSource::Pattern,
             rule_id: rule_id.to_string(),
-            file_uri: incident.uri.clone(),
+            file_uri: incident.file_uri.clone(),
             line,
             description: format!("Update {} to {}", package, new_version),
         })
@@ -722,7 +719,7 @@ fn bracket_depth(line: &str) -> i32 {
 
 /// Extract the matched text from incident variables.
 /// Checks propName, componentName, importedName, className, variableName in that order.
-fn get_matched_text(incident: &ViolationIncident) -> String {
+fn get_matched_text(incident: &Incident) -> String {
     for key in &[
         "propName",
         "componentName",
@@ -765,4 +762,280 @@ fn infer_strategy_from_labels(labels: &[String]) -> Option<&'static FixStrategy>
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a test Incident with just the fields the fix-engine cares about.
+    fn make_test_incident(
+        uri: &str,
+        line: u32,
+        variables: BTreeMap<String, serde_json::Value>,
+    ) -> Incident {
+        Incident {
+            file_uri: uri.to_string(),
+            line_number: Some(line),
+            code_location: None,
+            message: String::new(),
+            code_snip: None,
+            variables,
+            effort: None,
+            links: Vec::new(),
+            is_dependency_incident: false,
+        }
+    }
+
+    // ── bracket_depth tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_bracket_depth_balanced() {
+        assert_eq!(bracket_depth("{ foo: bar }"), 0);
+        assert_eq!(bracket_depth("foo()"), 0);
+        assert_eq!(bracket_depth("[1, 2, 3]"), 0);
+        assert_eq!(bracket_depth("{ foo: [1, 2] }"), 0);
+    }
+
+    #[test]
+    fn test_bracket_depth_open() {
+        assert_eq!(bracket_depth("actions={["), 2); // { and [
+        assert_eq!(bracket_depth("  <Button"), 0);
+        assert_eq!(bracket_depth("foo(bar, {"), 2); // ( and {
+    }
+
+    #[test]
+    fn test_bracket_depth_close() {
+        assert_eq!(bracket_depth("]}"), -2);
+        assert_eq!(bracket_depth(")"), -1);
+    }
+
+    #[test]
+    fn test_bracket_depth_nested() {
+        assert_eq!(bracket_depth("{ a: { b: [1] } }"), 0);
+        assert_eq!(bracket_depth("f(g(h(x)))"), 0);
+    }
+
+    #[test]
+    fn test_bracket_depth_ignores_string_literals() {
+        assert_eq!(bracket_depth(r#"  foo="{not a bracket}""#), 0);
+        assert_eq!(bracket_depth("  foo='[still not]'"), 0);
+        assert_eq!(bracket_depth("  foo=`${`nested`}`"), 0);
+    }
+
+    #[test]
+    fn test_bracket_depth_empty() {
+        assert_eq!(bracket_depth(""), 0);
+        assert_eq!(bracket_depth("   just text   "), 0);
+    }
+
+    #[test]
+    fn test_bracket_depth_escaped_quotes() {
+        // Escaped quote should not toggle string mode
+        assert_eq!(bracket_depth(r#"  "escaped \" quote" "#), 0);
+    }
+
+    // ── dedup_import_specifiers tests ────────────────────────────────────
+
+    #[test]
+    fn test_dedup_import_no_duplicates() {
+        let mut lines = vec!["import { Foo, Bar } from '@pkg';".to_string()];
+        dedup_import_specifiers(&mut lines);
+        assert!(lines[0].contains("Foo"));
+        assert!(lines[0].contains("Bar"));
+    }
+
+    #[test]
+    fn test_dedup_import_removes_duplicates() {
+        let mut lines =
+            vec!["import { Content, Content, Content } from '@patternfly/react-core';".to_string()];
+        dedup_import_specifiers(&mut lines);
+        // Should contain exactly one "Content"
+        let count = lines[0].matches("Content").count();
+        assert_eq!(
+            count, 1,
+            "Expected 1 occurrence of Content, got {}: {}",
+            count, lines[0]
+        );
+    }
+
+    #[test]
+    fn test_dedup_import_preserves_different_specifiers() {
+        let mut lines = vec!["import { Foo, Bar, Foo, Baz, Bar } from '@pkg';".to_string()];
+        dedup_import_specifiers(&mut lines);
+        assert_eq!(lines[0].matches("Foo").count(), 1);
+        assert_eq!(lines[0].matches("Bar").count(), 1);
+        assert_eq!(lines[0].matches("Baz").count(), 1);
+    }
+
+    #[test]
+    fn test_dedup_import_preserves_aliases() {
+        let mut lines = vec!["import { Foo as F, Foo as F } from '@pkg';".to_string()];
+        dedup_import_specifiers(&mut lines);
+        assert_eq!(lines[0].matches("Foo as F").count(), 1);
+    }
+
+    #[test]
+    fn test_dedup_import_non_import_lines_unchanged() {
+        let original = "const x = { Foo, Foo };".to_string();
+        let mut lines = vec![original.clone()];
+        dedup_import_specifiers(&mut lines);
+        assert_eq!(lines[0], original);
+    }
+
+    // ── get_matched_text tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_get_matched_text_prop_name_first() {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "propName".to_string(),
+            serde_json::Value::String("isActive".to_string()),
+        );
+        vars.insert(
+            "componentName".to_string(),
+            serde_json::Value::String("Button".to_string()),
+        );
+        let incident = make_test_incident("file:///test.tsx", 1, vars);
+        assert_eq!(get_matched_text(&incident), "isActive");
+    }
+
+    #[test]
+    fn test_get_matched_text_component_name() {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "componentName".to_string(),
+            serde_json::Value::String("Button".to_string()),
+        );
+        let incident = make_test_incident("", 1, vars);
+        assert_eq!(get_matched_text(&incident), "Button");
+    }
+
+    #[test]
+    fn test_get_matched_text_imported_name() {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "importedName".to_string(),
+            serde_json::Value::String("Chip".to_string()),
+        );
+        let incident = make_test_incident("", 1, vars);
+        assert_eq!(get_matched_text(&incident), "Chip");
+    }
+
+    #[test]
+    fn test_get_matched_text_empty_when_no_known_vars() {
+        let incident = make_test_incident("", 1, BTreeMap::new());
+        assert_eq!(get_matched_text(&incident), "");
+    }
+
+    #[test]
+    fn test_get_matched_text_ignores_non_string_values() {
+        let mut vars = BTreeMap::new();
+        vars.insert("propName".to_string(), serde_json::Value::Bool(true));
+        vars.insert(
+            "componentName".to_string(),
+            serde_json::Value::String("Fallback".to_string()),
+        );
+        let incident = make_test_incident("", 1, vars);
+        assert_eq!(get_matched_text(&incident), "Fallback");
+    }
+
+    // ── uri_to_path tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_uri_to_path_absolute() {
+        let path = uri_to_path(
+            "file:///home/user/project/src/App.tsx",
+            std::path::Path::new("/ignored"),
+        );
+        assert_eq!(path, PathBuf::from("/home/user/project/src/App.tsx"));
+    }
+
+    #[test]
+    fn test_uri_to_path_relative() {
+        let path = uri_to_path("src/App.tsx", std::path::Path::new("/home/user/project"));
+        assert_eq!(path, PathBuf::from("/home/user/project/src/App.tsx"));
+    }
+
+    #[test]
+    fn test_uri_to_path_no_file_prefix() {
+        let path = uri_to_path("/absolute/path.tsx", std::path::Path::new("/root"));
+        assert_eq!(path, PathBuf::from("/absolute/path.tsx"));
+    }
+
+    // ── infer_strategy_from_labels tests ─────────────────────────────────
+
+    #[test]
+    fn test_infer_prop_removal() {
+        let labels = vec!["change-type=prop-removal".to_string()];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(matches!(strategy, Some(&FixStrategy::RemoveProp)));
+    }
+
+    #[test]
+    fn test_infer_dom_structure_manual() {
+        let labels = vec!["change-type=dom-structure".to_string()];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(matches!(strategy, Some(&FixStrategy::Manual)));
+    }
+
+    #[test]
+    fn test_infer_behavioral_manual() {
+        let labels = vec!["change-type=behavioral".to_string()];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(matches!(strategy, Some(&FixStrategy::Manual)));
+    }
+
+    #[test]
+    fn test_infer_accessibility_manual() {
+        let labels = vec!["change-type=accessibility".to_string()];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(matches!(strategy, Some(&FixStrategy::Manual)));
+    }
+
+    #[test]
+    fn test_infer_interface_removal_manual() {
+        let labels = vec!["change-type=interface-removal".to_string()];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(matches!(strategy, Some(&FixStrategy::Manual)));
+    }
+
+    #[test]
+    fn test_infer_module_export_manual() {
+        let labels = vec!["change-type=module-export".to_string()];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(matches!(strategy, Some(&FixStrategy::Manual)));
+    }
+
+    #[test]
+    fn test_infer_other_manual() {
+        let labels = vec!["change-type=other".to_string()];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(matches!(strategy, Some(&FixStrategy::Manual)));
+    }
+
+    #[test]
+    fn test_infer_unknown_label_returns_none() {
+        let labels = vec!["change-type=rename".to_string()];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(strategy.is_none());
+    }
+
+    #[test]
+    fn test_infer_empty_labels_returns_none() {
+        let labels: Vec<String> = Vec::new();
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(strategy.is_none());
+    }
+
+    #[test]
+    fn test_infer_first_matching_label_wins() {
+        let labels = vec![
+            "framework=patternfly".to_string(),
+            "change-type=prop-removal".to_string(),
+            "change-type=dom-structure".to_string(), // would also match, but prop-removal comes first
+        ];
+        let strategy = infer_strategy_from_labels(&labels);
+        assert!(matches!(strategy, Some(&FixStrategy::RemoveProp)));
+    }
 }

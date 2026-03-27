@@ -4,8 +4,10 @@
 //! the response into text edits.
 
 use anyhow::Result;
-use frontend_core::fix::*;
+use frontend_core::fix::{FixConfidence, FixSource, LlmFixRequest, PlannedFix, TextEdit};
 use serde::{Deserialize, Serialize};
+
+use crate::context::FixContext;
 
 /// An OpenAI-compatible chat completion request.
 #[derive(Serialize)]
@@ -41,20 +43,12 @@ struct ChatChoiceMessage {
 pub async fn request_llm_fix(
     endpoint: &str,
     request: &LlmFixRequest,
+    ctx: &dyn FixContext,
 ) -> Result<Vec<PlannedFix>> {
     // Read the source file for full context
     let source = std::fs::read_to_string(&request.file_path)?;
 
-    let system_prompt = "You are a PatternFly v5 to v6 migration assistant. \
-        Given a code snippet and a migration message, output ONLY the corrected \
-        code for the affected lines. Output in this exact format:\n\n\
-        ```fix\n\
-        LINE:<line_number>\n\
-        OLD:<exact old text on that line>\n\
-        NEW:<replacement text>\n\
-        ```\n\n\
-        You may output multiple fix blocks. Do not include any explanation outside \
-        the fix blocks. Only output fixes for lines that need to change.";
+    let system_prompt = ctx.llm_system_prompt();
 
     let user_prompt = format!(
         "File: {}\nLine: {}\n\nMigration rule: {}\n\nMessage: {}\n\nFull file source:\n```\n{}\n```",
@@ -70,7 +64,7 @@ pub async fn request_llm_fix(
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: system_prompt.to_string(),
+                content: system_prompt,
             },
             ChatMessage {
                 role: "user".to_string(),
@@ -181,5 +175,115 @@ NEW:import { PageToggleButton } from '@patternfly/react-core';
         assert_eq!(edits[0].old_text, "<BarsIcon />");
         assert_eq!(edits[0].new_text, "<PageToggleButton isHamburgerButton />");
         assert_eq!(edits[1].line, 10);
+    }
+
+    #[test]
+    fn test_parse_llm_response_empty_input() {
+        let edits = parse_llm_fix_response("", "rule-1");
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn test_parse_llm_response_no_fix_blocks() {
+        let response = "Here is some explanation text without any fix blocks.";
+        let edits = parse_llm_fix_response(response, "rule-1");
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn test_parse_llm_response_non_fix_code_blocks_ignored() {
+        let response = r#"
+```typescript
+const x = 1;
+```
+
+```javascript
+console.log("hello");
+```
+"#;
+        let edits = parse_llm_fix_response(response, "rule-1");
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn test_parse_llm_response_single_fix() {
+        let response = r#"
+```fix
+LINE:1
+OLD:import { Chip } from '@patternfly/react-core';
+NEW:import { Label } from '@patternfly/react-core';
+```
+"#;
+        let edits = parse_llm_fix_response(response, "rename-rule");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].line, 1);
+        assert_eq!(
+            edits[0].old_text,
+            "import { Chip } from '@patternfly/react-core';"
+        );
+        assert_eq!(
+            edits[0].new_text,
+            "import { Label } from '@patternfly/react-core';"
+        );
+        assert_eq!(edits[0].rule_id, "rename-rule");
+    }
+
+    #[test]
+    fn test_parse_llm_response_incomplete_fix_block_skipped() {
+        // Missing NEW: line — should not produce an edit
+        let response = r#"
+```fix
+LINE:5
+OLD:something
+```
+"#;
+        let edits = parse_llm_fix_response(response, "rule-1");
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn test_parse_llm_response_missing_line_skipped() {
+        // Has OLD and NEW but no LINE: — should not produce an edit
+        let response = r#"
+```fix
+OLD:old text
+NEW:new text
+```
+"#;
+        let edits = parse_llm_fix_response(response, "rule-1");
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn test_parse_llm_response_whitespace_tolerance() {
+        let response = r#"
+```fix
+LINE:  42
+OLD:  <Chip />
+NEW:  <Label />
+```
+"#;
+        let edits = parse_llm_fix_response(response, "rule-1");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].line, 42);
+        // OLD/NEW preserve the text after the prefix
+        assert_eq!(edits[0].old_text, "  <Chip />");
+        assert_eq!(edits[0].new_text, "  <Label />");
+    }
+
+    #[test]
+    fn test_parse_llm_response_new_can_be_empty() {
+        // Removing a line entirely — NEW is empty
+        let response = r#"
+```fix
+LINE:10
+OLD:  isHidden={true}
+NEW:
+```
+"#;
+        let edits = parse_llm_fix_response(response, "rule-1");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].old_text, "  isHidden={true}");
+        assert_eq!(edits[0].new_text, "");
     }
 }

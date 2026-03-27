@@ -130,3 +130,192 @@ impl ProviderCondition {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_capabilities_list() {
+        assert_eq!(CAPABILITIES.len(), 4);
+        assert!(CAPABILITIES.contains(&"referenced"));
+        assert!(CAPABILITIES.contains(&"cssclass"));
+        assert!(CAPABILITIES.contains(&"cssvar"));
+        assert!(CAPABILITIES.contains(&"dependency"));
+    }
+
+    #[test]
+    fn test_parse_referenced_basic() {
+        let yaml = r#"pattern: "Button""#;
+        let cond = ProviderCondition::parse("referenced", yaml).unwrap();
+        match cond {
+            ProviderCondition::Referenced(c) => {
+                assert_eq!(c.pattern, "Button");
+                assert!(c.location.is_none());
+                assert!(c.component.is_none());
+                assert!(c.parent.is_none());
+                assert!(c.parent_from.is_none());
+                assert!(c.value.is_none());
+                assert!(c.from.is_none());
+                assert!(c.file_pattern.is_none());
+            }
+            _ => panic!("Expected Referenced variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_referenced_with_location() {
+        let yaml = r#"
+pattern: "isActive"
+location: JSX_PROP
+component: "Button"
+"#;
+        let cond = ProviderCondition::parse("referenced", yaml).unwrap();
+        match cond {
+            ProviderCondition::Referenced(c) => {
+                assert_eq!(c.pattern, "isActive");
+                assert_eq!(c.location, Some(ReferenceLocation::JsxProp));
+                assert_eq!(c.component.as_deref(), Some("Button"));
+            }
+            _ => panic!("Expected Referenced variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_referenced_with_all_fields() {
+        let yaml = r#"
+pattern: "EmptyStateHeader"
+location: JSX_COMPONENT
+parent: "EmptyState"
+parentFrom: "@patternfly/react-core"
+value: "primary"
+from: "@patternfly/react-core"
+filePattern: ".*\\.tsx$"
+"#;
+        let cond = ProviderCondition::parse("referenced", yaml).unwrap();
+        match cond {
+            ProviderCondition::Referenced(c) => {
+                assert_eq!(c.pattern, "EmptyStateHeader");
+                assert_eq!(c.location, Some(ReferenceLocation::JsxComponent));
+                assert_eq!(c.parent.as_deref(), Some("EmptyState"));
+                assert_eq!(c.parent_from.as_deref(), Some("@patternfly/react-core"));
+                assert_eq!(c.value.as_deref(), Some("primary"));
+                assert_eq!(c.from.as_deref(), Some("@patternfly/react-core"));
+                assert_eq!(c.file_pattern.as_deref(), Some(".*\\.tsx$"));
+            }
+            _ => panic!("Expected Referenced variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cssclass() {
+        let yaml = r#"pattern: "pf-m-expandable""#;
+        let cond = ProviderCondition::parse("cssclass", yaml).unwrap();
+        match cond {
+            ProviderCondition::CssClass(c) => {
+                assert_eq!(c.pattern, "pf-m-expandable");
+                assert!(c.file_pattern.is_none());
+            }
+            _ => panic!("Expected CssClass variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cssclass_with_file_pattern() {
+        let yaml = r#"
+pattern: "pf-v5-.*"
+filePattern: ".*\\.css$"
+"#;
+        let cond = ProviderCondition::parse("cssclass", yaml).unwrap();
+        match cond {
+            ProviderCondition::CssClass(c) => {
+                assert_eq!(c.pattern, "pf-v5-.*");
+                assert_eq!(c.file_pattern.as_deref(), Some(".*\\.css$"));
+            }
+            _ => panic!("Expected CssClass variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cssvar() {
+        let yaml = r#"pattern: "--pf-v5-.*""#;
+        let cond = ProviderCondition::parse("cssvar", yaml).unwrap();
+        match cond {
+            ProviderCondition::CssVar(c) => {
+                assert_eq!(c.pattern, "--pf-v5-.*");
+                assert!(c.file_pattern.is_none());
+            }
+            _ => panic!("Expected CssVar variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dependency() {
+        let yaml = r#"
+name: "@patternfly/react-core"
+upperbound: "6.0.0"
+"#;
+        let cond = ProviderCondition::parse("dependency", yaml).unwrap();
+        match cond {
+            ProviderCondition::Dependency(c) => {
+                assert_eq!(c.name.as_deref(), Some("@patternfly/react-core"));
+                assert_eq!(c.upperbound.as_deref(), Some("6.0.0"));
+                assert!(c.lowerbound.is_none());
+                assert!(c.nameregex.is_none());
+            }
+            _ => panic!("Expected Dependency variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dependency_with_nameregex() {
+        let yaml = r#"
+nameregex: "@patternfly/.*"
+lowerbound: "5.0.0"
+upperbound: "6.0.0"
+"#;
+        let cond = ProviderCondition::parse("dependency", yaml).unwrap();
+        match cond {
+            ProviderCondition::Dependency(c) => {
+                assert!(c.name.is_none());
+                assert_eq!(c.nameregex.as_deref(), Some("@patternfly/.*"));
+                assert_eq!(c.lowerbound.as_deref(), Some("5.0.0"));
+                assert_eq!(c.upperbound.as_deref(), Some("6.0.0"));
+            }
+            _ => panic!("Expected Dependency variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unknown_capability_errors() {
+        let result = ProviderCondition::parse("unknown", r#"pattern: "foo""#);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown capability"));
+    }
+
+    #[test]
+    fn test_parse_invalid_yaml_errors() {
+        let result = ProviderCondition::parse("referenced", "not: [valid: yaml:");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reference_location_serde_roundtrip() {
+        let locations = vec![
+            (ReferenceLocation::Import, "\"IMPORT\""),
+            (ReferenceLocation::JsxComponent, "\"JSX_COMPONENT\""),
+            (ReferenceLocation::JsxProp, "\"JSX_PROP\""),
+            (ReferenceLocation::FunctionCall, "\"FUNCTION_CALL\""),
+            (ReferenceLocation::TypeReference, "\"TYPE_REFERENCE\""),
+        ];
+        for (loc, expected_json) in locations {
+            let json = serde_json::to_string(&loc).unwrap();
+            assert_eq!(json, expected_json);
+            let back: ReferenceLocation = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, loc);
+        }
+    }
+}

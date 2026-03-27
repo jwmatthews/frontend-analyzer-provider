@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc"]
+members = ["crates/konveyor-core", "crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc", "crates/fix-engine", "crates/patternfly-fix-context"]
 resolver = "2"
 
 [package]
@@ -10,10 +10,11 @@ description = "Konveyor external provider for JS/TS/JSX/TSX and CSS/SCSS analysi
 license = "Apache-2.0"
 
 [dependencies]
+konveyor-core = { path = "crates/konveyor-core" }
 frontend-core = { path = "crates/core" }
-frontend-js-scanner = { path = "crates/js-scanner" }
-frontend-css-scanner = { path = "crates/css-scanner" }
 frontend-grpc = { path = "crates/grpc" }
+frontend-fix-engine = { path = "crates/fix-engine" }
+patternfly-fix-context = { path = "crates/patternfly-fix-context" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -32,14 +33,3 @@ anyhow = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# HTTP client (for LLM endpoint)
-reqwest = { version = "0.12", features = ["json"] }
-
-# Utilities
-regex = "1"
-walkdir = "2"
-
-# Unix process management (process group cleanup for goose subprocess)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

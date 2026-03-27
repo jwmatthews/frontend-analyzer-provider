@@ -144,3 +144,73 @@ fn callee_to_string(callee: &Expression<'_>, source: &str) -> Option<String> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn scan_source(source: &str, pattern: &str) -> Vec<Incident> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(pattern).unwrap();
+
+        ret.program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_function_calls(stmt, source, &re, "file:///test.tsx"))
+            .collect()
+    }
+
+    #[test]
+    fn test_simple_function_call() {
+        let incidents = scan_source("useToolbar();", r"^useToolbar$");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("functionName"),
+            Some(&serde_json::Value::String("useToolbar".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_member_expression_call() {
+        let incidents = scan_source("React.createElement('div');", r"^React\.createElement$");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("functionName"),
+            Some(&serde_json::Value::String(
+                "React.createElement".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_function_call_no_match() {
+        let incidents = scan_source("useState(0);", r"^useToolbar$");
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn test_function_call_in_variable_declaration() {
+        let incidents = scan_source("const toolbar = useToolbar();", r"^useToolbar$");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_function_call_in_function_body() {
+        let incidents = scan_source(
+            "function App() { const x = useToolbar(); return x; }",
+            r"^useToolbar$",
+        );
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_nested_function_call_in_arguments() {
+        let incidents = scan_source("console.log(useToolbar());", r"^useToolbar$");
+        assert_eq!(incidents.len(), 1);
+    }
+}

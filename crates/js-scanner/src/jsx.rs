@@ -712,3 +712,137 @@ fn jsx_member_expr_to_string(member: &JSXMemberExpression<'_>) -> String {
     };
     format!("{}.{}", obj, member.property.name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::imports::build_import_map;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn scan_source_jsx(
+        source: &str,
+        pattern: &str,
+        location: Option<&ReferenceLocation>,
+    ) -> Vec<Incident> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(pattern).unwrap();
+        let import_map = build_import_map(&ret.program);
+
+        ret.program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_jsx(stmt, source, &re, "file:///test.tsx", location, &import_map))
+            .collect()
+    }
+
+    #[test]
+    fn test_jsx_component_match() {
+        let source = r#"
+import { Button } from '@patternfly/react-core';
+const el = <Button>Click</Button>;
+"#;
+        let incidents =
+            scan_source_jsx(source, r"^Button$", Some(&ReferenceLocation::JsxComponent));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String("Button".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_component_no_match() {
+        let source = r#"const el = <Button>Click</Button>;"#;
+        let incidents = scan_source_jsx(source, r"^Alert$", Some(&ReferenceLocation::JsxComponent));
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn test_jsx_prop_match() {
+        let source = r#"
+import { Button } from '@patternfly/react-core';
+const el = <Button isActive>Click</Button>;
+"#;
+        let incidents = scan_source_jsx(source, r"^isActive$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("isActive".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_with_string_value() {
+        let source = r#"const el = <Button variant="primary">Click</Button>;"#;
+        let incidents = scan_source_jsx(source, r"^variant$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("propValue"),
+            Some(&serde_json::Value::String("primary".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_component_with_module_resolution() {
+        let source = r#"
+import { Button } from '@patternfly/react-core';
+const el = <Button>Click</Button>;
+"#;
+        let incidents =
+            scan_source_jsx(source, r"^Button$", Some(&ReferenceLocation::JsxComponent));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("module"),
+            Some(&serde_json::Value::String(
+                "@patternfly/react-core".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_jsx_member_expression_component() {
+        let source = r#"const el = <Toolbar.Item>hello</Toolbar.Item>;"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^Toolbar\.Item$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String("Toolbar.Item".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_nested_components_tracks_parent() {
+        let source = r#"
+import { Page, PageSection } from '@patternfly/react-core';
+const el = <Page><PageSection>content</PageSection></Page>;
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^PageSection$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String("Page".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_scan_without_location_filter() {
+        // Without a location filter, should match both component and prop usages
+        let source = r#"const el = <Button isActive>Click</Button>;"#;
+        let incidents = scan_source_jsx(source, r"^Button$", None);
+        // Should find Button as component
+        assert!(incidents.iter().any(|i| i.variables.get("componentName")
+            == Some(&serde_json::Value::String("Button".to_string()))));
+    }
+}

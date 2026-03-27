@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod fix;
-pub mod incident;
-pub mod report;
-pub mod rules;
+
+// Re-export konveyor-core types for convenience
+pub use konveyor_core::incident;
+pub use konveyor_core::report;

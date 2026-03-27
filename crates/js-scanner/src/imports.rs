@@ -135,3 +135,259 @@ pub fn scan_imports(
 
     incidents
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    // ── build_import_map tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_build_import_map_named_imports() {
+        let allocator = Allocator::default();
+        let source = r#"import { Button, Alert } from '@patternfly/react-core';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let map = build_import_map(&ret.program);
+
+        assert_eq!(
+            map.get("Button"),
+            Some(&"@patternfly/react-core".to_string())
+        );
+        assert_eq!(
+            map.get("Alert"),
+            Some(&"@patternfly/react-core".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_import_map_default_import() {
+        let allocator = Allocator::default();
+        let source = r#"import React from 'react';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let map = build_import_map(&ret.program);
+
+        assert_eq!(map.get("React"), Some(&"react".to_string()));
+    }
+
+    #[test]
+    fn test_build_import_map_namespace_import() {
+        let allocator = Allocator::default();
+        let source = r#"import * as PF from '@patternfly/react-core';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let map = build_import_map(&ret.program);
+
+        assert_eq!(map.get("PF"), Some(&"@patternfly/react-core".to_string()));
+    }
+
+    #[test]
+    fn test_build_import_map_aliased_import() {
+        let allocator = Allocator::default();
+        let source = r#"import { Button as PFButton } from '@patternfly/react-core';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let map = build_import_map(&ret.program);
+
+        // Keyed by local name
+        assert_eq!(
+            map.get("PFButton"),
+            Some(&"@patternfly/react-core".to_string())
+        );
+        assert!(map.get("Button").is_none()); // imported name, not local
+    }
+
+    #[test]
+    fn test_build_import_map_multiple_imports() {
+        let allocator = Allocator::default();
+        let source = r#"
+import { Button } from '@patternfly/react-core';
+import { Table } from '@patternfly/react-table';
+import React from 'react';
+"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let map = build_import_map(&ret.program);
+
+        assert_eq!(
+            map.get("Button"),
+            Some(&"@patternfly/react-core".to_string())
+        );
+        assert_eq!(
+            map.get("Table"),
+            Some(&"@patternfly/react-table".to_string())
+        );
+        assert_eq!(map.get("React"), Some(&"react".to_string()));
+    }
+
+    #[test]
+    fn test_build_import_map_empty_source() {
+        let allocator = Allocator::default();
+        let source = "const x = 1;";
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let map = build_import_map(&ret.program);
+
+        assert!(map.is_empty());
+    }
+
+    // ── scan_imports tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_scan_imports_matches_module_source() {
+        let allocator = Allocator::default();
+        let source = r#"import { Button } from '@patternfly/react-core';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let pattern = Regex::new(r"@patternfly/react-core").unwrap();
+
+        let incidents: Vec<Incident> = ret
+            .program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_imports(stmt, source, &pattern, "file:///test.tsx"))
+            .collect();
+
+        assert_eq!(incidents.len(), 1);
+        assert!(incidents[0].variables.contains_key("module"));
+        assert!(incidents[0].variables.contains_key("matchingText"));
+    }
+
+    #[test]
+    fn test_scan_imports_matches_specifier_name() {
+        let allocator = Allocator::default();
+        let source = r#"import { Chip, Button } from '@patternfly/react-core';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let pattern = Regex::new(r"^Chip$").unwrap();
+
+        let incidents: Vec<Incident> = ret
+            .program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_imports(stmt, source, &pattern, "file:///test.tsx"))
+            .collect();
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("importedName"),
+            Some(&serde_json::Value::String("Chip".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("module"),
+            Some(&serde_json::Value::String(
+                "@patternfly/react-core".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_scan_imports_no_match() {
+        let allocator = Allocator::default();
+        let source = r#"import { Button } from '@patternfly/react-core';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let pattern = Regex::new(r"^NonExistent$").unwrap();
+
+        let incidents: Vec<Incident> = ret
+            .program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_imports(stmt, source, &pattern, "file:///test.tsx"))
+            .collect();
+
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn test_scan_imports_default_import() {
+        let allocator = Allocator::default();
+        let source = r#"import React from 'react';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let pattern = Regex::new(r"^React$").unwrap();
+
+        let incidents: Vec<Incident> = ret
+            .program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_imports(stmt, source, &pattern, "file:///test.tsx"))
+            .collect();
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("importedName"),
+            Some(&serde_json::Value::String("React".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_scan_imports_aliased_matches_local() {
+        let allocator = Allocator::default();
+        let source = r#"import { Chip as OldChip } from '@patternfly/react-core';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let pattern = Regex::new(r"^OldChip$").unwrap();
+
+        let incidents: Vec<Incident> = ret
+            .program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_imports(stmt, source, &pattern, "file:///test.tsx"))
+            .collect();
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("importedName"),
+            Some(&serde_json::Value::String("Chip".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("localName"),
+            Some(&serde_json::Value::String("OldChip".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_scan_imports_namespace() {
+        let allocator = Allocator::default();
+        let source = r#"import * as PF from '@patternfly/react-core';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let pattern = Regex::new(r"^PF$").unwrap();
+
+        let incidents: Vec<Incident> = ret
+            .program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_imports(stmt, source, &pattern, "file:///test.tsx"))
+            .collect();
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("importedName"),
+            Some(&serde_json::Value::String("* as PF".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_scan_imports_non_import_statement_ignored() {
+        let allocator = Allocator::default();
+        let source = r#"const Button = 'not an import';"#;
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let pattern = Regex::new(r"Button").unwrap();
+
+        let incidents: Vec<Incident> = ret
+            .program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_imports(stmt, source, &pattern, "file:///test.tsx"))
+            .collect();
+
+        assert!(incidents.is_empty());
+    }
+}

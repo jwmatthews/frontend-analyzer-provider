@@ -3,9 +3,11 @@ use clap::Args;
 use frontend_core::fix::FixSource;
 use std::path::PathBuf;
 
-use crate::fix_engine;
-use crate::goose_client;
-use crate::llm_client;
+use frontend_fix_engine::engine as fix_engine;
+use frontend_fix_engine::goose_client;
+use frontend_fix_engine::llm_client;
+use frontend_fix_engine::registry::FixContextRegistry;
+use patternfly_fix_context::PatternFlyV5ToV6Context;
 
 #[derive(Args)]
 pub struct FixOpts {
@@ -62,20 +64,32 @@ pub async fn run(opts: FixOpts) -> Result<()> {
     let input_content = std::fs::read_to_string(&opts.input)?;
 
     // Parse the Konveyor output (try JSON first, then YAML)
-    let output: Vec<frontend_core::report::RuleSet> = {
+    let output: Vec<konveyor_core::report::RuleSet> = {
         let trimmed = input_content.trim_start();
         if trimmed.starts_with('[') || trimmed.starts_with('{') {
             serde_json::from_str(&input_content)?
         } else {
             // Try YAML — serde_yml can panic on large multiline strings,
             // so catch panics gracefully
-            match std::panic::catch_unwind(|| serde_yml::from_str::<Vec<frontend_core::report::RuleSet>>(&input_content)) {
+            match std::panic::catch_unwind(|| serde_yml::from_str::<Vec<konveyor_core::report::RuleSet>>(&input_content)) {
                 Ok(Ok(result)) => result,
                 Ok(Err(e)) => anyhow::bail!("Failed to parse YAML input: {}. Try using --output-format json with the analyze command.", e),
                 Err(_) => anyhow::bail!("YAML parser crashed on input file. Use --output-format json with the analyze command instead."),
             }
         }
     };
+
+    // Build fix context registry with framework-specific LLM guidance
+    let mut context_registry = FixContextRegistry::new();
+    context_registry.register(Box::new(PatternFlyV5ToV6Context::new()));
+
+    // Resolve the fix context from the first ruleset name in the analysis output.
+    // All rulesets in a single analysis run typically share the same framework.
+    let ruleset_name = output
+        .first()
+        .map(|rs| rs.name.as_str())
+        .unwrap_or("");
+    let fix_context = context_registry.get(ruleset_name);
 
     let total_violations: usize = output.iter().map(|rs| rs.violations.len()).sum();
     let total_incidents: usize = output
@@ -216,6 +230,7 @@ pub async fn run(opts: FixOpts) -> Result<()> {
                     let pending = std::mem::take(&mut plan.pending_llm);
                     let results = goose_client::run_all_goose_fixes(
                         &pending,
+                        fix_context,
                         opts.verbose,
                         opts.log_dir.as_deref(),
                     );
@@ -271,7 +286,7 @@ pub async fn run(opts: FixOpts) -> Result<()> {
                     let mut llm_errors = 0;
 
                     for request in &pending {
-                        match llm_client::request_llm_fix(endpoint, request).await {
+                        match llm_client::request_llm_fix(endpoint, request, fix_context).await {
                             Ok(fixes) => {
                                 for fix in fixes {
                                     if !fix.edits.is_empty() {

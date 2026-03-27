@@ -212,3 +212,70 @@ fn walk_jsx_child(
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn scan_source(source: &str, pattern: &str) -> Vec<Incident> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(pattern).unwrap();
+
+        ret.program
+            .body
+            .iter()
+            .flat_map(|stmt| scan_classname_usage(stmt, source, &re, "file:///test.tsx"))
+            .collect()
+    }
+
+    #[test]
+    fn test_jsx_classname_string_literal() {
+        let source = r#"const el = <div className="pf-m-expandable">hello</div>;"#;
+        let incidents = scan_source(source, r"pf-m-expandable");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("matchingText"),
+            Some(&serde_json::Value::String("pf-m-expandable".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_class_attribute() {
+        let source = r#"const el = <div class="pf-m-expandable">hello</div>;"#;
+        let incidents = scan_source(source, r"pf-m-expandable");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_string_literal_in_variable() {
+        let source = r#"const cls = "pf-m-expandable";"#;
+        let incidents = scan_source(source, r"pf-m-expandable");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_template_literal() {
+        let source = r#"const cls = `pf-m-expandable ${other}`;"#;
+        let incidents = scan_source(source, r"pf-m-expandable");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_no_match() {
+        let source = r#"const el = <div className="something-else">hello</div>;"#;
+        let incidents = scan_source(source, r"pf-m-expandable");
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn test_nested_jsx_classname() {
+        let source = r#"const el = <div><span className="pf-m-expandable">hi</span></div>;"#;
+        let incidents = scan_source(source, r"pf-m-expandable");
+        assert_eq!(incidents.len(), 1);
+    }
+}
