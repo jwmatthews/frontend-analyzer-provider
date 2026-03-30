@@ -3,6 +3,8 @@ name = "frontend-js-scanner"
 version = "0.0.1"
 edition = "2021"
 description = "OXC-based JS/TS/JSX/TSX analysis for frontend-analyzer-provider"
+license = "Apache-2.0"
+repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [dependencies]
 frontend-core = { version = "0.0.1", path = "../core" }
@@ -23,4 +25,5 @@ anyhow = "1"
 # Utilities
 regex = "1"
 walkdir = "2"
+glob = "0.3"
 tracing = "0.1"

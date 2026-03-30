@@ -3,6 +3,8 @@ name = "frontend-grpc"
 version = "0.0.1"
 edition = "2021"
 description = "Konveyor gRPC provider interface for frontend-analyzer-provider"
+license = "Apache-2.0"
+repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [features]
 generate-proto = ["dep:tonic-build", "dep:dlprotoc"]

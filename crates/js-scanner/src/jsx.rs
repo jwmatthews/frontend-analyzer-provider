@@ -583,6 +583,37 @@ fn walk_jsx_expression(
                 }
             }
         }
+        // Optional chaining: {items?.map(item => <Component />)}
+        JSXExpression::ChainExpression(chain) => match &chain.expression {
+            ChainElement::CallExpression(call) => {
+                for arg in &call.arguments {
+                    if let Argument::SpreadElement(spread) = arg {
+                        walk_expression_for_jsx(
+                            &spread.argument,
+                            source,
+                            pattern,
+                            file_uri,
+                            location,
+                            incidents,
+                            parent_name,
+                            import_map,
+                        );
+                    } else if let Some(expr) = arg.as_expression() {
+                        walk_expression_for_jsx(
+                            expr,
+                            source,
+                            pattern,
+                            file_uri,
+                            location,
+                            incidents,
+                            parent_name,
+                            import_map,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -877,5 +908,68 @@ const el = <Page><PageSection>content</PageSection></Page>;
         // Should find Button as component
         assert!(incidents.iter().any(|i| i.variables.get("componentName")
             == Some(&serde_json::Value::String("Button".to_string()))));
+    }
+
+    // ── ChainExpression tests ────────────────────────────────────────
+
+    #[test]
+    fn test_jsx_inside_optional_chaining_map() {
+        // JSX inside items?.map() should be detected
+        let source = r#"
+import { Switch } from '@patternfly/react-core';
+const el = <div>{items?.map(item => <Switch labelOff="No" />)}</div>;
+"#;
+        let incidents =
+            scan_source_jsx(source, r"^Switch$", Some(&ReferenceLocation::JsxComponent));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect <Switch> inside optional chaining ?.map()"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_inside_optional_chaining() {
+        // Props on JSX inside ?.map() should be detected
+        let source = r#"
+import { Switch } from '@patternfly/react-core';
+const el = <div>{items?.map(item => <Switch labelOff="No" />)}</div>;
+"#;
+        let incidents = scan_source_jsx(source, r"^labelOff$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect labelOff prop inside optional chaining ?.map()"
+        );
+    }
+
+    #[test]
+    fn test_jsx_inside_optional_chaining_filter_map() {
+        // JSX inside chained ?.filter()?.map() - only the outer ?. is a ChainExpression
+        let source = r#"
+import { Tr } from '@patternfly/react-table';
+const el = <div>{data?.filter(x => x.active).map(x => <Tr key={x.id} />)}</div>;
+"#;
+        let incidents = scan_source_jsx(source, r"^Tr$", Some(&ReferenceLocation::JsxComponent));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect <Tr> inside ?.filter().map() chain"
+        );
+    }
+
+    #[test]
+    fn test_jsx_without_optional_chaining_still_works() {
+        // Ensure regular .map() (non-optional) still works
+        let source = r#"
+import { Td } from '@patternfly/react-table';
+const el = <div>{items.map(item => <Td>{item.name}</Td>)}</div>;
+"#;
+        let incidents = scan_source_jsx(source, r"^Td$", Some(&ReferenceLocation::JsxComponent));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect <Td> inside regular .map()"
+        );
     }
 }
