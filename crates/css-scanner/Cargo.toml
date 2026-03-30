@@ -5,7 +5,7 @@ edition = "2021"
 description = "CSS/SCSS analysis for frontend-analyzer-provider"
 
 [dependencies]
-frontend-core = { path = "../core" }
+frontend-core = { version = "0.0.1", path = "../core" }
 
 # CSS parsing
 lightningcss = "1.0.0-alpha.71"

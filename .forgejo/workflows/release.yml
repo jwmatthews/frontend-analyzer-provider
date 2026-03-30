@@ -134,7 +134,10 @@ jobs:
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "next=$NEXT" >> "$GITHUB_OUTPUT"
 
-      - name: Bump all Cargo.toml versions
+      - name: Install Rust stable
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+
+      - name: Bump all Cargo.toml versions and dependency constraints
         run: |
           CURRENT="${{ steps.next.outputs.current }}"
           NEXT="${{ steps.next.outputs.next }}"
@@ -146,14 +149,20 @@ jobs:
             crates/grpc/Cargo.toml \
             crates/fix-engine/Cargo.toml \
             crates/patternfly-fix-context/Cargo.toml; do
+            # Bump package version (start-of-line version = "...")
             sed -i "s/^version *= *\"${CURRENT}\"/version = \"${NEXT}\"/" "$manifest"
+            # Bump workspace dependency version constraints (inline version = "...")
+            sed -i "s/version = \"${CURRENT}\", path/version = \"${NEXT}\", path/g" "$manifest"
           done
+
+      - name: Update Cargo.lock
+        run: cargo generate-lockfile
 
       - name: Create branch and commit
         run: |
           BRANCH="chore/bump-v${{ steps.next.outputs.next }}"
           git checkout -b "$BRANCH"
-          git add Cargo.toml crates/*/Cargo.toml
+          git add Cargo.toml Cargo.lock crates/*/Cargo.toml
           git commit -m "chore: bump version to ${{ steps.next.outputs.next }}"
           git push origin "$BRANCH"
 

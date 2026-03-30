@@ -362,6 +362,37 @@ fn walk_expression_for_jsx(
                 }
             }
         }
+        Expression::ChainExpression(chain) => {
+            // Handle optional chaining (e.g., `items?.map(item => <Component />)`)
+            // Without this, JSX inside `?.map()` calls is invisible to the scanner.
+            if let ChainElement::CallExpression(call) = &chain.expression {
+                for arg in &call.arguments {
+                    if let Argument::SpreadElement(spread) = arg {
+                        walk_expression_for_jsx(
+                            &spread.argument,
+                            source,
+                            pattern,
+                            file_uri,
+                            location,
+                            incidents,
+                            parent_name,
+                            import_map,
+                        );
+                    } else if let Some(expr) = arg.as_expression() {
+                        walk_expression_for_jsx(
+                            expr,
+                            source,
+                            pattern,
+                            file_uri,
+                            location,
+                            incidents,
+                            parent_name,
+                            import_map,
+                        );
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }

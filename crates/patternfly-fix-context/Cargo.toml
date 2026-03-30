@@ -6,4 +6,4 @@ description = "PatternFly v5-to-v6 migration context for the fix engine's LLM-as
 license = "Apache-2.0"
 
 [dependencies]
-frontend-fix-engine = { path = "../fix-engine" }
+frontend-fix-engine = { version = "0.0.1", path = "../fix-engine" }

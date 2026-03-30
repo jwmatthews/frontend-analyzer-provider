@@ -11,10 +11,10 @@ license = "Apache-2.0"
 
 [dependencies]
 konveyor-core = "0.0.1"
-frontend-core = { path = "crates/core" }
-frontend-grpc = { path = "crates/grpc" }
-frontend-fix-engine = { path = "crates/fix-engine" }
-patternfly-fix-context = { path = "crates/patternfly-fix-context" }
+frontend-core = { version = "0.0.1", path = "crates/core" }
+frontend-grpc = { version = "0.0.1", path = "crates/grpc" }
+frontend-fix-engine = { version = "0.0.1", path = "crates/fix-engine" }
+patternfly-fix-context = { version = "0.0.1", path = "crates/patternfly-fix-context" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
