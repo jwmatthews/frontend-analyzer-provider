@@ -97,7 +97,7 @@ jobs:
       - name: Publish frontend-core
         run: |
           output=$(cargo publish --package frontend-core 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already uploaded"; then
+            if echo "$output" | grep -q "already exists"; then
               echo "frontend-core already published, skipping"
             else
               echo "$output"
@@ -113,7 +113,7 @@ jobs:
       - name: Publish frontend-js-scanner
         run: |
           output=$(cargo publish --package frontend-js-scanner 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already uploaded"; then
+            if echo "$output" | grep -q "already exists"; then
               echo "frontend-js-scanner already published, skipping"
             else
               echo "$output"
@@ -126,7 +126,7 @@ jobs:
       - name: Publish frontend-css-scanner
         run: |
           output=$(cargo publish --package frontend-css-scanner 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already uploaded"; then
+            if echo "$output" | grep -q "already exists"; then
               echo "frontend-css-scanner already published, skipping"
             else
               echo "$output"
@@ -139,7 +139,7 @@ jobs:
       - name: Publish frontend-fix-engine
         run: |
           output=$(cargo publish --package frontend-fix-engine 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already uploaded"; then
+            if echo "$output" | grep -q "already exists"; then
               echo "frontend-fix-engine already published, skipping"
             else
               echo "$output"
@@ -155,7 +155,7 @@ jobs:
       - name: Publish frontend-grpc
         run: |
           output=$(cargo publish --package frontend-grpc 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already uploaded"; then
+            if echo "$output" | grep -q "already exists"; then
               echo "frontend-grpc already published, skipping"
             else
               echo "$output"
@@ -168,7 +168,7 @@ jobs:
       - name: Publish patternfly-fix-context
         run: |
           output=$(cargo publish --package patternfly-fix-context 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already uploaded"; then
+            if echo "$output" | grep -q "already exists"; then
               echo "patternfly-fix-context already published, skipping"
             else
               echo "$output"
@@ -184,7 +184,7 @@ jobs:
       - name: Publish frontend-analyzer-provider
         run: |
           output=$(cargo publish --package frontend-analyzer-provider 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already uploaded"; then
+            if echo "$output" | grep -q "already exists"; then
               echo "frontend-analyzer-provider already published, skipping"
             else
               echo "$output"
