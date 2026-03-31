@@ -141,6 +141,7 @@ fn parse_llm_fix_response(content: &str, rule_id: &str) -> Vec<TextEdit> {
                     new_text: rest.to_string(),
                     rule_id: rule_id.to_string(),
                     description: "LLM-generated fix".to_string(),
+                    replace_all: false,
                 });
             }
             current_line = None;

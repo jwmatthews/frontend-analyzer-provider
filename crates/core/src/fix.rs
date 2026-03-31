@@ -26,6 +26,11 @@ pub struct TextEdit {
     pub rule_id: String,
     /// Human-readable description of what this fix does.
     pub description: String,
+    /// When true, replace ALL occurrences of old_text on this line (not just the first).
+    /// Used for prefix replacements (e.g. CssVariablePrefix) where a single line
+    /// may contain multiple instances of the old prefix.
+    #[serde(default)]
+    pub replace_all: bool,
 }
 
 /// A planned fix for a single incident.

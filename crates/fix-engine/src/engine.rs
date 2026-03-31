@@ -75,7 +75,13 @@ pub fn plan_fixes(
                             old: old_prefix.clone(),
                             new: new_prefix.clone(),
                         }];
-                        if let Some(fix) = plan_rename(rule_id, incident, &mappings, &file_path) {
+                        if let Some(mut fix) = plan_rename(rule_id, incident, &mappings, &file_path)
+                        {
+                            // CSS prefix edits should replace ALL occurrences on a line,
+                            // e.g. className="pf-v5-u-color-200 pf-v5-u-font-weight-light"
+                            for edit in &mut fix.edits {
+                                edit.replace_all = true;
+                            }
                             plan.files.entry(file_path).or_default().push(fix);
                         }
                     }
@@ -159,7 +165,11 @@ pub fn apply_fixes(plan: &FixPlan) -> Result<FixResult> {
                 if idx < lines.len() {
                     let line = &lines[idx];
                     if line.contains(&edit.old_text) {
-                        lines[idx] = line.replacen(&edit.old_text, &edit.new_text, 1);
+                        lines[idx] = if edit.replace_all {
+                            line.replace(&edit.old_text, &edit.new_text)
+                        } else {
+                            line.replacen(&edit.old_text, &edit.new_text, 1)
+                        };
                         result.edits_applied += 1;
                         any_changed = true;
                     } else {
@@ -215,7 +225,11 @@ pub fn preview_fixes(plan: &FixPlan) -> Result<String> {
                         .map(String::as_str)
                         .unwrap_or(lines[idx]);
                     if current.contains(&edit.old_text) {
-                        let new_line = current.replacen(&edit.old_text, &edit.new_text, 1);
+                        let new_line = if edit.replace_all {
+                            current.replace(&edit.old_text, &edit.new_text)
+                        } else {
+                            current.replacen(&edit.old_text, &edit.new_text, 1)
+                        };
                         changed_lines.insert(idx, new_line);
                     }
                 }
@@ -327,6 +341,7 @@ fn plan_rename(
                         new_text: m.new.clone(),
                         rule_id: rule_id.to_string(),
                         description: format!("Rename '{}' to '{}'", m.old, m.new),
+                        replace_all: false,
                     });
                     consumed.push(&m.old);
                 }
@@ -343,6 +358,7 @@ fn plan_rename(
             new_text: mapping.new.clone(),
             rule_id: rule_id.to_string(),
             description: format!("Rename '{}' to '{}'", mapping.old, mapping.new),
+            replace_all: false,
         });
 
         // Also scan the incident line for value-level renames from other mappings.
@@ -375,6 +391,7 @@ fn plan_rename(
                         new_text: m.new.clone(),
                         rule_id: rule_id.to_string(),
                         description: format!("Rename '{}' to '{}'", m.old, m.new),
+                        replace_all: false,
                     });
                 }
             }
@@ -395,6 +412,7 @@ fn plan_rename(
                         new_text: m.new.clone(),
                         rule_id: rule_id.to_string(),
                         description: format!("Rename '{}' to '{}'", m.old, m.new),
+                        replace_all: false,
                     });
                 }
             }
@@ -452,6 +470,7 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &PathBuf) -> 
                     new_text: String::new(),
                     rule_id: rule_id.to_string(),
                     description: format!("Remove prop '{}' (entire line)", prop_name),
+                    replace_all: false,
                 }],
                 confidence: FixConfidence::High,
                 source: FixSource::Pattern,
@@ -502,6 +521,7 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &PathBuf) -> 
                             prop_name,
                             i - line_idx + 1
                         ),
+                        replace_all: false,
                     });
                 }
             }
@@ -551,6 +571,7 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &PathBuf) -> 
                     new_text: String::new(),
                     rule_id: rule_id.to_string(),
                     description: format!("Remove prop '{}'", prop_name),
+                    replace_all: false,
                 }],
                 confidence: FixConfidence::High,
                 source: FixSource::Pattern,
@@ -590,6 +611,7 @@ fn plan_import_path_change(
             new_text: new_path.to_string(),
             rule_id: rule_id.to_string(),
             description: format!("Change import path '{}' → '{}'", old_path, new_path),
+            replace_all: false,
         }],
         confidence: FixConfidence::Exact,
         source: FixSource::Pattern,
@@ -635,6 +657,7 @@ fn plan_update_dependency(
                     "Update {} from {} to {}",
                     package, old_version, new_ver_quoted
                 ),
+                replace_all: false,
             }],
             confidence: FixConfidence::Exact,
             source: FixSource::Pattern,

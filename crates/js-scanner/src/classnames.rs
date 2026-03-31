@@ -152,6 +152,36 @@ fn walk_expr(
                 }
             }
         }
+        Expression::LogicalExpression(logical) => {
+            walk_expr(&logical.left, source, pattern, file_uri, incidents);
+            walk_expr(&logical.right, source, pattern, file_uri, incidents);
+        }
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                    walk_expr(&p.value, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        Expression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                if let Some(e) = elem.as_expression() {
+                    walk_expr(e, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        Expression::TSAsExpression(ts) => {
+            walk_expr(&ts.expression, source, pattern, file_uri, incidents);
+        }
+        Expression::TSSatisfiesExpression(ts) => {
+            walk_expr(&ts.expression, source, pattern, file_uri, incidents);
+        }
+        Expression::TSNonNullExpression(ts) => {
+            walk_expr(&ts.expression, source, pattern, file_uri, incidents);
+        }
+        Expression::TSTypeAssertion(ts) => {
+            walk_expr(&ts.expression, source, pattern, file_uri, incidents);
+        }
         _ => {}
     }
 }
@@ -205,6 +235,11 @@ fn walk_jsx_child(
         JSXChild::Fragment(frag) => {
             for c in &frag.children {
                 walk_jsx_child(c, source, pattern, file_uri, incidents);
+            }
+        }
+        JSXChild::ExpressionContainer(expr_container) => {
+            if let Some(expr) = expr_container.expression.as_expression() {
+                walk_expr(expr, source, pattern, file_uri, incidents);
             }
         }
         _ => {}
@@ -274,6 +309,72 @@ mod tests {
     fn test_nested_jsx_classname() {
         let source = r#"const el = <div><span className="pf-m-expandable">hi</span></div>;"#;
         let incidents = scan_source(source, r"pf-m-expandable");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_classname_inside_map_callback() {
+        let source = r#"
+            const el = <ul>{items.map((item) => (
+                <li className="pf-v5-c-tabs__item">text</li>
+            ))}</ul>;
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("matchingText"),
+            Some(&serde_json::Value::String("pf-v5-c-tabs__item".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_classname_inside_ternary() {
+        let source = r#"
+            const el = <div>{condition ? (
+                <span className="pf-v5-c-button pf-m-plain">click</span>
+            ) : null}</div>;
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_classname_inside_logical_and() {
+        let source = r#"
+            const el = <div>{show && <span className="pf-v5-c-icon">icon</span>}</div>;
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_classname_inside_nested_map_and_ternary() {
+        let source = r#"
+            const el = <div>{items.map((item) => (
+                item.visible ? <span className="pf-v5-c-label">label</span> : null
+            ))}</div>;
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_classname_in_get_elements_by_classname() {
+        let source = r#"
+            const els = document.getElementsByClassName("pf-c-wizard__main-body");
+        "#;
+        let incidents = scan_source(source, r"pf-c-wizard");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_classname_inside_ts_as_expression() {
+        let source = r#"
+            const el = <div style={{
+                color: "red"
+            } as React.CSSProperties} className="pf-v5-c-button">click</div>;
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
         assert_eq!(incidents.len(), 1);
     }
 }
