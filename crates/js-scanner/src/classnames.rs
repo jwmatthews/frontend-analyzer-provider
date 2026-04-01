@@ -216,6 +216,18 @@ fn check_jsx_classnames(
         }
     }
 
+    // Walk into attribute values that contain expressions (e.g., JSX inside prop values).
+    // This catches patterns like `labelIcon={<Popover><button className="pf-v5-...">}`.
+    for attr in &el.opening_element.attributes {
+        if let JSXAttributeItem::Attribute(a) = attr {
+            if let Some(JSXAttributeValue::ExpressionContainer(expr_container)) = &a.value {
+                if let Some(expr) = expr_container.expression.as_expression() {
+                    walk_expr(expr, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+    }
+
     for child in &el.children {
         walk_jsx_child(child, source, pattern, file_uri, incidents);
     }
@@ -365,6 +377,35 @@ mod tests {
         "#;
         let incidents = scan_source(source, r"pf-c-wizard");
         assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_classname_inside_prop_value_ternary() {
+        // Simulates platform-form.tsx: className on <button> inside a ternary
+        // inside a JSX prop value on a non-exported component
+        let source = r#"
+            const MyForm: React.FC = () => {
+                return (
+                    <FormGroup
+                        labelIcon={
+                            condition ? (
+                                <Popover>
+                                    <button className="pf-v5-c-button pf-m-plain">
+                                        <HelpIcon />
+                                    </button>
+                                </Popover>
+                            ) : undefined
+                        }
+                    />
+                );
+            };
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find pf-v5 inside prop value ternary"
+        );
     }
 
     #[test]

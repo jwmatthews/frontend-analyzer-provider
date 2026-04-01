@@ -617,6 +617,69 @@ fn walk_jsx_expression(
     }
 }
 
+/// Check object literal property keys for pattern matches.
+///
+/// When a JSX prop value is an object expression (e.g., `formGroupProps={{ labelIcon: ... }}`),
+/// this function checks each property key against the pattern. If matched, an incident is
+/// created with the owning JSX component as the `componentName`, so that the `from` and
+/// `component` filters work correctly.
+///
+/// This catches indirect prop spreading — where an object is passed to a wrapper component
+/// that spreads it onto a PF component internally.
+fn check_object_keys_in_expression(
+    expr: &JSXExpression<'_>,
+    source: &str,
+    pattern: &Regex,
+    file_uri: &str,
+    component_name: &str,
+    import_map: &ImportMap,
+    incidents: &mut Vec<Incident>,
+) {
+    let obj = match expr {
+        JSXExpression::ObjectExpression(obj) => obj,
+        // Handle parenthesized: prop={( { key: value } )}
+        JSXExpression::ParenthesizedExpression(paren) => {
+            if let Expression::ObjectExpression(obj) = &paren.expression {
+                obj
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            let key_name = match &p.key {
+                PropertyKey::StaticIdentifier(ident) => Some(ident.name.as_str()),
+                PropertyKey::StringLiteral(s) => Some(s.value.as_str()),
+                _ => None,
+            };
+            if let Some(name) = key_name {
+                if pattern.is_match(name) {
+                    let span = p.key.span();
+                    let mut incident = make_incident(source, file_uri, span.start, span.end);
+                    incident.variables.insert(
+                        "propName".into(),
+                        serde_json::Value::String(name.to_string()),
+                    );
+                    incident.variables.insert(
+                        "componentName".into(),
+                        serde_json::Value::String(component_name.to_string()),
+                    );
+                    // Resolve the owning component's import source for `from` filtering
+                    if let Some(module) = import_map.get(component_name) {
+                        incident
+                            .variables
+                            .insert("module".into(), serde_json::Value::String(module.clone()));
+                    }
+                    incidents.push(incident);
+                }
+            }
+        }
+    }
+}
+
 fn check_jsx_element(
     el: &JSXElement<'_>,
     source: &str,
@@ -716,6 +779,25 @@ fn check_jsx_element(
 
                         incidents.push(incident);
                     }
+                }
+            }
+        }
+
+        // Also check object literal keys inside prop values.
+        // This catches patterns like `formGroupProps={{ labelIcon: ... }}`
+        // where `labelIcon` is an indirect prop passed via spreading.
+        for attr in &opening.attributes {
+            if let JSXAttributeItem::Attribute(a) = attr {
+                if let Some(JSXAttributeValue::ExpressionContainer(expr_container)) = &a.value {
+                    check_object_keys_in_expression(
+                        &expr_container.expression,
+                        source,
+                        pattern,
+                        file_uri,
+                        &component_name,
+                        import_map,
+                        incidents,
+                    );
                 }
             }
         }
@@ -970,5 +1052,75 @@ const el = <div>{items.map(item => <Td>{item.name}</Td>)}</div>;
             1,
             "Should detect <Td> inside regular .map()"
         );
+    }
+
+    // ── Object key scanning tests ────────────────────────────────────
+
+    #[test]
+    fn test_jsx_prop_match_in_object_literal() {
+        // formGroupProps={{ labelIcon: ... }} should match ^labelIcon$
+        let source = r#"
+import { HookFormPFGroupController } from './components';
+const el = <HookFormPFGroupController formGroupProps={{ labelIcon: <Popover /> }} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^labelIcon$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect labelIcon as object key inside prop value"
+        );
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("labelIcon".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String(
+                "HookFormPFGroupController".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_object_key_with_import_resolution() {
+        // Object key incidents should carry the module from the owning component
+        let source = r#"
+import { FormGroup } from '@patternfly/react-core';
+const el = <FormGroup extraProps={{ labelIcon: "help" }} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^labelIcon$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("module"),
+            Some(&serde_json::Value::String(
+                "@patternfly/react-core".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_direct_still_preferred_over_object_key() {
+        // Direct JSX prop should still match, and object key shouldn't duplicate
+        let source = r#"
+import { FormGroup } from '@patternfly/react-core';
+const el = <FormGroup labelIcon={<Popover />} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^labelIcon$", Some(&ReferenceLocation::JsxProp));
+        // Should match only once (direct prop), not also as object key
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("labelIcon".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_object_key_no_false_positive() {
+        // Object keys that don't match the pattern should not produce incidents
+        let source = r#"
+const el = <Widget config={{ enabled: true, name: "test" }} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^labelIcon$", Some(&ReferenceLocation::JsxProp));
+        assert!(incidents.is_empty());
     }
 }
