@@ -172,16 +172,29 @@ pub fn scan_file_referenced(
         });
     }
 
-    // Filter by prop value if specified
+    // Filter by prop value if specified.
+    // Checks both direct propValue (e.g., align="alignRight") and
+    // propObjectValues (e.g., align={{ default: "alignRight" }}).
     if let Some(value_pattern) = &condition.value {
         let value_re = Regex::new(value_pattern)?;
         incidents.retain(|inc| {
+            // Check direct string value
             if let Some(serde_json::Value::String(val)) = inc.variables.get("propValue") {
-                value_re.is_match(val)
-            } else {
-                // No propValue = boolean prop or no value, filter out
-                false
+                if value_re.is_match(val) {
+                    return true;
+                }
             }
+            // Check object literal string values (responsive breakpoint objects)
+            if let Some(serde_json::Value::Array(vals)) = inc.variables.get("propObjectValues") {
+                return vals.iter().any(|v| {
+                    if let serde_json::Value::String(s) = v {
+                        value_re.is_match(s)
+                    } else {
+                        false
+                    }
+                });
+            }
+            false
         });
     }
 

@@ -617,6 +617,48 @@ fn walk_jsx_expression(
     }
 }
 
+/// Extract all string literal values from an object expression's properties.
+///
+/// Given `{ default: 'alignRight', md: 'alignLeft' }`, returns
+/// `["alignRight", "alignLeft"]`. This allows value-based rules to match
+/// prop values inside responsive breakpoint objects.
+fn extract_object_string_values(expr: &JSXExpression<'_>, _source: &str) -> Vec<String> {
+    let obj = match expr {
+        JSXExpression::ObjectExpression(obj) => obj,
+        JSXExpression::ParenthesizedExpression(paren) => {
+            if let Expression::ObjectExpression(obj) = &paren.expression {
+                obj
+            } else {
+                return vec![];
+            }
+        }
+        _ => return vec![],
+    };
+
+    let mut values = Vec::new();
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            match &p.value {
+                Expression::StringLiteral(s) => {
+                    values.push(s.value.to_string());
+                }
+                // Handle nested objects: { default: 'value', md: { nested: 'value2' } }
+                Expression::ObjectExpression(nested) => {
+                    for nested_prop in &nested.properties {
+                        if let ObjectPropertyKind::ObjectProperty(np) = nested_prop {
+                            if let Expression::StringLiteral(s) = &np.value {
+                                values.push(s.value.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    values
+}
+
 /// Check object literal property keys for pattern matches.
 ///
 /// When a JSX prop value is an object expression (e.g., `formGroupProps={{ labelIcon: ... }}`),
@@ -743,7 +785,10 @@ fn check_jsx_element(
                             serde_json::Value::String(component_name.clone()),
                         );
 
-                        // Extract prop value for value-based filtering
+                        // Extract prop value for value-based filtering.
+                        // For object expressions like `align={{ default: 'alignRight' }}`,
+                        // also extract the string literal values from properties so that
+                        // value-based rules (e.g., value: ^alignRight$) can match.
                         if let Some(value) = &a.value {
                             let prop_value = match value {
                                 JSXAttributeValue::StringLiteral(s) => Some(s.value.to_string()),
@@ -765,6 +810,24 @@ fn check_jsx_element(
                                 incident
                                     .variables
                                     .insert("propValue".into(), serde_json::Value::String(pv));
+                            }
+
+                            // For object expressions, also extract individual string values
+                            // from properties and store them as propObjectValues for matching.
+                            if let Some(JSXAttributeValue::ExpressionContainer(expr)) = &a.value {
+                                let obj_values =
+                                    extract_object_string_values(&expr.expression, source);
+                                if !obj_values.is_empty() {
+                                    incident.variables.insert(
+                                        "propObjectValues".into(),
+                                        serde_json::Value::Array(
+                                            obj_values
+                                                .into_iter()
+                                                .map(serde_json::Value::String)
+                                                .collect(),
+                                        ),
+                                    );
+                                }
                             }
                         }
 
@@ -1122,5 +1185,65 @@ const el = <Widget config={{ enabled: true, name: "test" }} />;
 "#;
         let incidents = scan_source_jsx(source, r"^labelIcon$", Some(&ReferenceLocation::JsxProp));
         assert!(incidents.is_empty());
+    }
+
+    // ── Object value extraction tests ────────────────────────────────
+
+    #[test]
+    fn test_jsx_prop_object_values_extracted() {
+        // align={{ default: 'alignRight' }} should extract 'alignRight' as propObjectValues
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+const el = <ToolbarItem align={{ default: 'alignRight' }} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+
+        let obj_values = incidents[0].variables.get("propObjectValues");
+        assert!(
+            obj_values.is_some(),
+            "Should extract propObjectValues from object literal"
+        );
+        let values = obj_values.unwrap().as_array().unwrap();
+        assert!(
+            values.contains(&serde_json::Value::String("alignRight".to_string())),
+            "propObjectValues should contain 'alignRight', got: {:?}",
+            values
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_object_values_multiple_breakpoints() {
+        // align={{ default: 'alignRight', md: 'alignLeft' }} should extract both values
+        let source = r#"
+import { ToolbarGroup } from '@patternfly/react-core';
+const el = <ToolbarGroup align={{ default: 'alignRight', md: 'alignLeft' }} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+
+        let values = incidents[0]
+            .variables
+            .get("propObjectValues")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(values.contains(&serde_json::Value::String("alignRight".to_string())));
+        assert!(values.contains(&serde_json::Value::String("alignLeft".to_string())));
+    }
+
+    #[test]
+    fn test_jsx_prop_direct_string_no_object_values() {
+        // align="alignRight" should NOT have propObjectValues (it's a direct string)
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+const el = <ToolbarItem align="alignRight" />;
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        assert!(
+            incidents[0].variables.get("propObjectValues").is_none(),
+            "Direct string props should not have propObjectValues"
+        );
     }
 }
