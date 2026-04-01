@@ -72,6 +72,36 @@ impl ProviderService for FrontendProvider {
             }));
         }
 
+        // Install npm dependencies so that `npm ls` can resolve the full
+        // dependency tree for the `GetDependencies` RPC. Without this,
+        // dependency rules (e.g., "update @patternfly/react-core to v6")
+        // cannot match because the resolved versions are unknown.
+        let pkg_json = root.join("package.json");
+        if pkg_json.exists() {
+            tracing::info!("Running npm install in {}", location);
+            let output = std::process::Command::new("npm")
+                .arg("install")
+                .arg("--ignore-scripts")
+                .arg("--no-audit")
+                .arg("--no-fund")
+                .current_dir(&root)
+                .output();
+
+            match output {
+                Ok(result) => {
+                    if result.status.success() {
+                        tracing::info!("npm install completed successfully");
+                    } else {
+                        let stderr = String::from_utf8_lossy(&result.stderr);
+                        tracing::warn!("npm install failed (non-fatal): {}", stderr.chars().take(500).collect::<String>());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("npm install could not run (non-fatal): {}", e);
+                }
+            }
+        }
+
         *self
             .config
             .lock()
@@ -129,11 +159,74 @@ impl ProviderService for FrontendProvider {
         &self,
         _request: Request<ServiceRequest>,
     ) -> Result<Response<DependencyResponse>, Status> {
-        // TODO: implement dependency listing from package.json
+        let root = self
+            .project_root
+            .lock()
+            .map_err(|_| Status::internal("Project root lock poisoned"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("Provider not initialized"))?;
+
+        let file_uri = format!("file://{}", root.join("package.json").display());
+
+        // Use `npm ls --json --depth=0` to get resolved dependency versions.
+        // This requires `npm install` to have run first (done in init).
+        let output = std::process::Command::new("npm")
+            .args(["ls", "--json", "--depth=0", "--long=false"])
+            .current_dir(&root)
+            .output();
+
+        let deps = match output {
+            Ok(result) => {
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                match serde_json::from_str::<serde_json::Value>(&stdout) {
+                    Ok(tree) => {
+                        let mut deps = Vec::new();
+                        if let Some(dep_map) = tree.get("dependencies").and_then(|d| d.as_object())
+                        {
+                            for (name, info) in dep_map {
+                                let version = info
+                                    .get("version")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("0.0.0")
+                                    .to_string();
+                                deps.push(Dependency {
+                                    name: name.clone(),
+                                    version,
+                                    classifier: String::new(),
+                                    r#type: "dependencies".to_string(),
+                                    resolved_identifier: String::new(),
+                                    file_uri_prefix: String::new(),
+                                    indirect: false,
+                                    extras: None,
+                                    labels: vec![],
+                                });
+                            }
+                        }
+                        deps
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse npm ls output: {}", e);
+                        vec![]
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("npm ls failed: {}", e);
+                vec![]
+            }
+        };
+
+        tracing::info!("Returning {} resolved dependencies", deps.len());
+
+        let file_dep = vec![FileDep {
+            file_uri,
+            list: Some(DependencyList { deps }),
+        }];
+
         Ok(Response::new(DependencyResponse {
             successful: true,
             error: String::new(),
-            file_dep: vec![],
+            file_dep,
         }))
     }
 
