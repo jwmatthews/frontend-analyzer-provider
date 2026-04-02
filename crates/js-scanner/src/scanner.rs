@@ -16,6 +16,24 @@ use walkdir::WalkDir;
 /// Result of scanning: a list of incidents.
 pub type ScanResult = Vec<Incident>;
 
+/// A parse error encountered when scanning a file.
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    /// Path of the file that could not be parsed.
+    pub file_path: PathBuf,
+    /// Human-readable error message from the parser.
+    pub message: String,
+}
+
+/// Output from a scan that includes both incidents and any parse errors.
+#[derive(Debug, Default)]
+pub struct ScanOutput {
+    /// Incidents found in files that parsed successfully.
+    pub incidents: Vec<Incident>,
+    /// Files that could not be parsed (OXC fatal errors).
+    pub parse_errors: Vec<ParseError>,
+}
+
 /// Directories to skip during scanning.
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -71,11 +89,15 @@ pub fn collect_files(root: &Path, file_pattern: Option<&str>) -> Result<Vec<Path
 }
 
 /// Scan a single file for `referenced` condition matches.
+///
+/// Returns `(incidents, Option<ParseError>)`. When the parser cannot
+/// recover, `incidents` will be empty and `parse_error` will describe
+/// the failure.
 pub fn scan_file_referenced(
     file_path: &Path,
     root: &Path,
     condition: &ReferencedCondition,
-) -> Result<ScanResult> {
+) -> Result<(ScanResult, Option<ParseError>)> {
     let source = std::fs::read_to_string(file_path)?;
     let source_type = source_type_for_file(file_path, &source);
 
@@ -83,8 +105,19 @@ pub fn scan_file_referenced(
     let ret = Parser::new(&allocator, &source, source_type).parse();
 
     if ret.panicked {
-        tracing::warn!("Parser panicked on {}", file_path.display());
-        return Ok(Vec::new());
+        let error_msg = ret
+            .errors
+            .first()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown parser error".to_string());
+        tracing::warn!("Parser panicked on {}: {}", file_path.display(), error_msg);
+        return Ok((
+            Vec::new(),
+            Some(ParseError {
+                file_path: file_path.to_path_buf(),
+                message: error_msg,
+            }),
+        ));
     }
 
     let pattern_re = Regex::new(&condition.pattern)?;
@@ -97,6 +130,22 @@ pub fn scan_file_referenced(
     // import source (e.g., Button → @patternfly/react-core).
     let import_map = crate::imports::build_import_map(&ret.program);
 
+    // JSX scanning at file level — enables resolving local function calls
+    // (e.g., {renderDropdownItems()}) to their bodies for parent context tracing.
+    match location {
+        Some(ReferenceLocation::JsxComponent) | Some(ReferenceLocation::JsxProp) | None => {
+            incidents.extend(crate::jsx::scan_jsx_file(
+                &ret.program.body,
+                &source,
+                &pattern_re,
+                &file_uri,
+                location,
+                &import_map,
+            ));
+        }
+        _ => {}
+    }
+
     for stmt in &ret.program.body {
         match location {
             Some(ReferenceLocation::Import) | None => {
@@ -105,19 +154,6 @@ pub fn scan_file_referenced(
                     &source,
                     &pattern_re,
                     &file_uri,
-                ));
-            }
-            _ => {}
-        }
-        match location {
-            Some(ReferenceLocation::JsxComponent) | Some(ReferenceLocation::JsxProp) | None => {
-                incidents.extend(crate::jsx::scan_jsx(
-                    stmt,
-                    &source,
-                    &pattern_re,
-                    &file_uri,
-                    location,
-                    &import_map,
                 ));
             }
             _ => {}
@@ -241,11 +277,15 @@ pub fn scan_file_referenced(
         ));
     }
 
-    Ok(incidents)
+    Ok((incidents, None))
 }
 
 /// Scan a single file for CSS class name references in JS/TS (className attributes, etc.).
-pub fn scan_file_classnames(file_path: &Path, root: &Path, pattern: &Regex) -> Result<ScanResult> {
+pub fn scan_file_classnames(
+    file_path: &Path,
+    root: &Path,
+    pattern: &Regex,
+) -> Result<(ScanResult, Option<ParseError>)> {
     let source = std::fs::read_to_string(file_path)?;
     let source_type = source_type_for_file(file_path, &source);
 
@@ -253,8 +293,19 @@ pub fn scan_file_classnames(file_path: &Path, root: &Path, pattern: &Regex) -> R
     let ret = Parser::new(&allocator, &source, source_type).parse();
 
     if ret.panicked {
-        tracing::warn!("Parser panicked on {}", file_path.display());
-        return Ok(Vec::new());
+        let error_msg = ret
+            .errors
+            .first()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown parser error".to_string());
+        tracing::warn!("Parser panicked on {}: {}", file_path.display(), error_msg);
+        return Ok((
+            Vec::new(),
+            Some(ParseError {
+                file_path: file_path.to_path_buf(),
+                message: error_msg,
+            }),
+        ));
     }
 
     let file_uri = path_to_uri(file_path, root);
@@ -274,11 +325,15 @@ pub fn scan_file_classnames(file_path: &Path, root: &Path, pattern: &Regex) -> R
         ));
     }
 
-    Ok(incidents)
+    Ok((incidents, None))
 }
 
 /// Scan a single file for CSS variable references in JS/TS.
-pub fn scan_file_css_vars(file_path: &Path, root: &Path, pattern: &Regex) -> Result<ScanResult> {
+pub fn scan_file_css_vars(
+    file_path: &Path,
+    root: &Path,
+    pattern: &Regex,
+) -> Result<(ScanResult, Option<ParseError>)> {
     let source = std::fs::read_to_string(file_path)?;
     let source_type = source_type_for_file(file_path, &source);
 
@@ -286,8 +341,19 @@ pub fn scan_file_css_vars(file_path: &Path, root: &Path, pattern: &Regex) -> Res
     let ret = Parser::new(&allocator, &source, source_type).parse();
 
     if ret.panicked {
-        tracing::warn!("Parser panicked on {}", file_path.display());
-        return Ok(Vec::new());
+        let error_msg = ret
+            .errors
+            .first()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown parser error".to_string());
+        tracing::warn!("Parser panicked on {}: {}", file_path.display(), error_msg);
+        return Ok((
+            Vec::new(),
+            Some(ParseError {
+                file_path: file_path.to_path_buf(),
+                message: error_msg,
+            }),
+        ));
     }
 
     let file_uri = path_to_uri(file_path, root);
@@ -307,7 +373,7 @@ pub fn scan_file_css_vars(file_path: &Path, root: &Path, pattern: &Regex) -> Res
         ));
     }
 
-    Ok(incidents)
+    Ok((incidents, None))
 }
 
 /// Determine the OXC SourceType from a file path and source content.
@@ -533,5 +599,90 @@ mod tests {
     fn test_source_type_mjs() {
         let st = source_type_for_file(Path::new("app.mjs"), "");
         assert!(st.is_jsx());
+    }
+
+    // ── parse error reporting tests ──────────────────────────────────────
+
+    #[test]
+    fn test_scan_file_referenced_returns_parse_error_for_broken_syntax() {
+        use frontend_core::capabilities::ReferencedCondition;
+
+        // Create a temp file with broken import syntax (@ in import binding)
+        let dir = std::env::temp_dir().join("scanner_test_parse_error");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("broken.tsx");
+        std::fs::write(
+            &file_path,
+            "import { @invalid/path } from \"some-package\";\n",
+        )
+        .unwrap();
+
+        let condition = ReferencedCondition {
+            pattern: ".*".to_string(),
+            location: None,
+            component: None,
+            parent: None,
+            value: None,
+            from: None,
+            parent_from: None,
+            file_pattern: None,
+        };
+
+        let (incidents, parse_error) = scan_file_referenced(&file_path, &dir, &condition).unwrap();
+
+        // Should return no incidents (parser couldn't produce an AST)
+        assert!(incidents.is_empty());
+        // Should return a parse error with the file path and a message
+        assert!(
+            parse_error.is_some(),
+            "Expected parse error for broken syntax"
+        );
+        let err = parse_error.unwrap();
+        assert_eq!(err.file_path, file_path);
+        assert!(
+            !err.message.is_empty(),
+            "Parse error message should not be empty"
+        );
+
+        // Cleanup
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_file_referenced_no_parse_error_for_valid_syntax() {
+        use frontend_core::capabilities::ReferencedCondition;
+
+        let dir = std::env::temp_dir().join("scanner_test_no_parse_error");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("valid.tsx");
+        std::fs::write(
+            &file_path,
+            "import { Button } from '@patternfly/react-core';\n",
+        )
+        .unwrap();
+
+        let condition = ReferencedCondition {
+            pattern: "^Button$".to_string(),
+            location: None,
+            component: None,
+            parent: None,
+            value: None,
+            from: None,
+            parent_from: None,
+            file_pattern: None,
+        };
+
+        let (incidents, parse_error) = scan_file_referenced(&file_path, &dir, &condition).unwrap();
+
+        // Valid file should have no parse error
+        assert!(
+            parse_error.is_none(),
+            "Valid file should not produce a parse error"
+        );
+        // Should find the import
+        assert!(!incidents.is_empty());
+
+        // Cleanup
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

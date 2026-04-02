@@ -294,8 +294,10 @@ fn plan_rename(
 ) -> Option<PlannedFix> {
     let line = incident.line_number?;
 
-    // Determine what text to look for from incident variables
-    let matched_text = get_matched_text(incident);
+    // Determine what text to look for from incident variables.
+    // For value-level renames (e.g., variant="light" → "secondary"),
+    // the mapping's `old` is the value, not the prop name.
+    let matched_text = get_matched_text_for_rename(incident, mappings);
 
     // Check if this is a component/import rename (detected via importedName variable).
     // For these, we need to scan the entire file since JSX usage of the component
@@ -629,46 +631,45 @@ fn plan_update_dependency(
     new_version: &str,
     file_path: &PathBuf,
 ) -> Option<PlannedFix> {
-    let line = incident.line_number?;
     let source = std::fs::read_to_string(file_path).ok()?;
-    let file_line = source.lines().nth((line as usize).saturating_sub(1))?;
 
-    // Verify this line references the expected package
-    if !file_line.contains(package) {
-        return None;
-    }
-
-    // Match the version string after the package name.
-    // Handles common patterns: "^5.4.0", "~5.3.1", "5.4.0", ">=5.0.0", etc.
+    // Find the line containing this package name, regardless of incident line number.
+    // Kantra may not pass through the provider's line number correctly.
+    let package_quoted = format!("\"{}\"", package);
     let version_re = regex::Regex::new(r#"("[\^~><=]*\d+\.\d+\.\d+[^"]*")"#).ok()?;
 
-    if let Some(m) = version_re.find(file_line) {
-        let old_version = m.as_str();
-        // Build new version string preserving the quote style
-        let new_ver_quoted = format!("\"{}\"", new_version);
+    for (idx, file_line) in source.lines().enumerate() {
+        if !file_line.contains(&package_quoted) {
+            continue;
+        }
+        if let Some(m) = version_re.find(file_line) {
+            let line = (idx + 1) as u32;
+            let old_version = m.as_str();
+            let new_ver_quoted = format!("\"{}\"", new_version);
 
-        Some(PlannedFix {
-            edits: vec![TextEdit {
-                line,
-                old_text: old_version.to_string(),
-                new_text: new_ver_quoted.clone(),
+            return Some(PlannedFix {
+                edits: vec![TextEdit {
+                    line,
+                    old_text: old_version.to_string(),
+                    new_text: new_ver_quoted.clone(),
+                    rule_id: rule_id.to_string(),
+                    description: format!(
+                        "Update {} from {} to {}",
+                        package, old_version, new_ver_quoted
+                    ),
+                    replace_all: false,
+                }],
+                confidence: FixConfidence::Exact,
+                source: FixSource::Pattern,
                 rule_id: rule_id.to_string(),
-                description: format!(
-                    "Update {} from {} to {}",
-                    package, old_version, new_ver_quoted
-                ),
-                replace_all: false,
-            }],
-            confidence: FixConfidence::Exact,
-            source: FixSource::Pattern,
-            rule_id: rule_id.to_string(),
-            file_uri: incident.file_uri.clone(),
-            line,
-            description: format!("Update {} to {}", package, new_version),
-        })
-    } else {
-        None
+                file_uri: incident.file_uri.clone(),
+                line,
+                description: format!("Update {} to {}", package, new_version),
+            });
+        }
     }
+
+    None
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -756,6 +757,39 @@ fn get_matched_text(incident: &Incident) -> String {
         }
     }
     String::new()
+}
+
+/// Get the matched text, considering both prop names and prop values.
+/// Used by `plan_rename` to find the correct mapping — for value-level
+/// renames (e.g., variant="light" → "secondary"), the mapping's `old`
+/// is the value, not the prop name.
+fn get_matched_text_for_rename(incident: &Incident, mappings: &[RenameMapping]) -> String {
+    let prop_name = get_matched_text(incident);
+
+    // If a mapping matches the prop name directly, use it
+    if mappings.iter().any(|m| m.old == prop_name) {
+        return prop_name;
+    }
+
+    // Check if a mapping matches the prop VALUE instead (enum value renames)
+    if let Some(serde_json::Value::String(val)) = incident.variables.get("propValue") {
+        if mappings.iter().any(|m| m.old == val.as_str()) {
+            return val.clone();
+        }
+    }
+
+    // Check propObjectValues (responsive breakpoint objects)
+    if let Some(serde_json::Value::Array(vals)) = incident.variables.get("propObjectValues") {
+        for v in vals {
+            if let serde_json::Value::String(s) = v {
+                if mappings.iter().any(|m| m.old == s.as_str()) {
+                    return s.clone();
+                }
+            }
+        }
+    }
+
+    prop_name
 }
 
 /// Convert a file:// URI to a filesystem path, relative to project root.
@@ -1061,5 +1095,61 @@ mod tests {
         ];
         let strategy = infer_strategy_from_labels(&labels);
         assert!(matches!(strategy, Some(&FixStrategy::RemoveProp)));
+    }
+
+    #[test]
+    fn test_get_matched_text_for_rename_prefers_prop_name() {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "propName".into(),
+            serde_json::Value::String("spaceItems".into()),
+        );
+        let incident = make_test_incident("file:///test.tsx", 1, vars);
+        let mappings = vec![RenameMapping {
+            old: "spaceItems".into(),
+            new: "gap".into(),
+        }];
+        assert_eq!(
+            get_matched_text_for_rename(&incident, &mappings),
+            "spaceItems"
+        );
+    }
+
+    #[test]
+    fn test_get_matched_text_for_rename_falls_back_to_prop_value() {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "propName".into(),
+            serde_json::Value::String("variant".into()),
+        );
+        vars.insert(
+            "propValue".into(),
+            serde_json::Value::String("light".into()),
+        );
+        let incident = make_test_incident("file:///test.tsx", 1, vars);
+        let mappings = vec![RenameMapping {
+            old: "light".into(),
+            new: "secondary".into(),
+        }];
+        assert_eq!(get_matched_text_for_rename(&incident, &mappings), "light");
+    }
+
+    #[test]
+    fn test_get_matched_text_for_rename_checks_object_values() {
+        let mut vars = BTreeMap::new();
+        vars.insert("propName".into(), serde_json::Value::String("gap".into()));
+        vars.insert(
+            "propObjectValues".into(),
+            serde_json::json!(["spaceItemsMd", "spaceItemsNone"]),
+        );
+        let incident = make_test_incident("file:///test.tsx", 1, vars);
+        let mappings = vec![RenameMapping {
+            old: "spaceItemsMd".into(),
+            new: "gapMd".into(),
+        }];
+        assert_eq!(
+            get_matched_text_for_rename(&incident, &mappings),
+            "spaceItemsMd"
+        );
     }
 }

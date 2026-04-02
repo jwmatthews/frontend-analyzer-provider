@@ -137,11 +137,29 @@ impl ProviderService for FrontendProvider {
             &req.condition_info
         );
         match crate::evaluate::evaluate_condition(&root, &req.cap, &req.condition_info) {
-            Ok(response) => Ok(Response::new(EvaluateResponse {
-                error: String::new(),
-                successful: true,
-                response: Some(response),
-            })),
+            Ok(result) => {
+                // Build an error summary if any files could not be parsed.
+                let error = if result.parse_errors.is_empty() {
+                    String::new()
+                } else {
+                    let file_list: Vec<String> = result
+                        .parse_errors
+                        .iter()
+                        .map(|e| format!("{}: {}", e.file_path.display(), e.message))
+                        .collect();
+                    format!(
+                        "{} file(s) could not be parsed and were skipped:\n{}",
+                        result.parse_errors.len(),
+                        file_list.join("\n")
+                    )
+                };
+
+                Ok(Response::new(EvaluateResponse {
+                    error,
+                    successful: true,
+                    response: Some(result.response),
+                }))
+            }
             Err(e) => Ok(Response::new(EvaluateResponse {
                 error: e.to_string(),
                 successful: false,

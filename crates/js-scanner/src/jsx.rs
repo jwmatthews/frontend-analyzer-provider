@@ -18,6 +18,128 @@ use std::collections::HashMap;
 /// can be resolved to their import source (e.g., Button → @patternfly/react-core).
 type ImportMap = HashMap<String, String>;
 
+/// Map of local function/variable names → the expression body they hold.
+///
+/// Built from variable declarations like `const renderItems = () => { ... }`
+/// or `const renderItems = function() { ... }`. Used to resolve call
+/// expressions in JSX children (e.g., `{renderItems()}`) to the function body,
+/// so the parent context propagates through the call.
+type LocalFnMap<'a> = HashMap<String, &'a Expression<'a>>;
+
+/// Build a map of all function declarations in the AST, including those
+/// nested inside component bodies. Recurses into function/arrow bodies
+/// to find declarations like:
+/// ```ts
+/// const MyComponent = () => {
+///   const renderItems = () => <Item />;  // ← captured
+///   return <Parent>{renderItems()}</Parent>;
+/// };
+/// ```
+fn build_local_fn_map<'a>(stmts: &'a [Statement<'a>], source: &str) -> LocalFnMap<'a> {
+    let mut map = LocalFnMap::new();
+    for stmt in stmts {
+        collect_fn_declarations_from_stmt(stmt, source, &mut map);
+    }
+    map
+}
+
+fn collect_fn_declarations_from_stmt<'a>(
+    stmt: &'a Statement<'a>,
+    source: &str,
+    map: &mut LocalFnMap<'a>,
+) {
+    let var_decl = match stmt {
+        Statement::VariableDeclaration(v) => Some(v.as_ref()),
+        Statement::ExportNamedDeclaration(exp) => {
+            if let Some(Declaration::VariableDeclaration(v)) = &exp.declaration {
+                Some(v.as_ref())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(var_decl) = var_decl {
+        for declarator in &var_decl.declarations {
+            if let Some(init) = &declarator.init {
+                let is_fn = matches!(
+                    init,
+                    Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                );
+                if is_fn {
+                    // Register this function
+                    let id_span = declarator.id.span();
+                    let start = id_span.start as usize;
+                    let end = id_span.end as usize;
+                    if let Some(name_str) = source.get(start..end) {
+                        let name = name_str.split(':').next().unwrap_or("").trim();
+                        if !name.is_empty() {
+                            map.insert(name.to_string(), init);
+                        }
+                    }
+                    // Recurse into the function body to find nested declarations
+                    collect_fn_declarations_from_expr(init, source, map);
+                }
+            }
+        }
+    }
+}
+
+fn collect_fn_declarations_from_expr<'a>(
+    expr: &'a Expression<'a>,
+    source: &str,
+    map: &mut LocalFnMap<'a>,
+) {
+    match expr {
+        Expression::ArrowFunctionExpression(arrow) => {
+            for stmt in &arrow.body.statements {
+                collect_fn_declarations_from_stmt(stmt, source, map);
+            }
+        }
+        Expression::FunctionExpression(func) => {
+            if let Some(body) = &func.body {
+                for stmt in &body.statements {
+                    collect_fn_declarations_from_stmt(stmt, source, map);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scan all statements in a program body for JSX component and prop usage.
+///
+/// This file-level entry point builds a local function map first, then walks
+/// each statement. The function map enables resolving call expressions like
+/// `{renderItems()}` in JSX children to their function bodies, propagating
+/// the parent JSX element context through the call.
+pub fn scan_jsx_file<'a>(
+    stmts: &'a [Statement<'a>],
+    source: &str,
+    pattern: &Regex,
+    file_uri: &str,
+    location: Option<&ReferenceLocation>,
+    import_map: &ImportMap,
+) -> Vec<Incident> {
+    let local_fns = build_local_fn_map(stmts, source);
+    let mut incidents = Vec::new();
+    for stmt in stmts {
+        walk_statement_for_jsx(
+            stmt,
+            source,
+            pattern,
+            file_uri,
+            location,
+            &mut incidents,
+            None,
+            import_map,
+            &local_fns,
+        );
+    }
+    incidents
+}
+
 /// Scan a statement for JSX component and prop usage.
 pub fn scan_jsx(
     stmt: &Statement<'_>,
@@ -27,6 +149,7 @@ pub fn scan_jsx(
     location: Option<&ReferenceLocation>,
     import_map: &ImportMap,
 ) -> Vec<Incident> {
+    let empty_fns = LocalFnMap::new();
     let mut incidents = Vec::new();
     walk_statement_for_jsx(
         stmt,
@@ -37,6 +160,7 @@ pub fn scan_jsx(
         &mut incidents,
         None,
         import_map,
+        &empty_fns,
     );
     incidents
 }
@@ -50,6 +174,7 @@ fn walk_statement_for_jsx(
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
     import_map: &ImportMap,
+    local_fns: &LocalFnMap,
 ) {
     match stmt {
         Statement::ExportDefaultDeclaration(decl) => {
@@ -64,6 +189,7 @@ fn walk_statement_for_jsx(
                         incidents,
                         parent_name,
                         import_map,
+                        local_fns,
                     );
                 }
             }
@@ -80,6 +206,7 @@ fn walk_statement_for_jsx(
                         incidents,
                         parent_name,
                         import_map,
+                        local_fns,
                     );
                 }
             }
@@ -93,6 +220,7 @@ fn walk_statement_for_jsx(
                     incidents,
                     parent_name,
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -107,6 +235,7 @@ fn walk_statement_for_jsx(
                     incidents,
                     parent_name,
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -120,6 +249,7 @@ fn walk_statement_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         Statement::ReturnStatement(ret) => {
@@ -133,6 +263,7 @@ fn walk_statement_for_jsx(
                     incidents,
                     parent_name,
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -146,6 +277,7 @@ fn walk_statement_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         Statement::BlockStatement(block) => {
@@ -159,6 +291,7 @@ fn walk_statement_for_jsx(
                     incidents,
                     parent_name,
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -172,6 +305,7 @@ fn walk_statement_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
             if let Some(alt) = &if_stmt.alternate {
                 walk_statement_for_jsx(
@@ -183,6 +317,7 @@ fn walk_statement_for_jsx(
                     incidents,
                     parent_name,
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -199,8 +334,19 @@ fn walk_variable_declaration(
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
     import_map: &ImportMap,
+    local_fns: &LocalFnMap,
 ) {
     for declarator in &var_decl.declarations {
+        // Check for typed object literals that represent component props.
+        // e.g., `const x: ToolbarItemProps = { align: { default: 'alignRight' } }`
+        // This catches prop values set in helper files outside JSX context,
+        // where the object is later spread onto a JSX element in another file.
+        if matches!(location, Some(ReferenceLocation::JsxProp) | None) {
+            check_typed_object_literal(
+                declarator, source, pattern, file_uri, import_map, incidents,
+            );
+        }
+
         if let Some(init) = &declarator.init {
             walk_expression_for_jsx(
                 init,
@@ -211,6 +357,7 @@ fn walk_variable_declaration(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
     }
@@ -225,6 +372,7 @@ fn walk_function_body(
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
     import_map: &ImportMap,
+    local_fns: &LocalFnMap,
 ) {
     for stmt in &body.statements {
         walk_statement_for_jsx(
@@ -236,6 +384,7 @@ fn walk_function_body(
             incidents,
             parent_name,
             import_map,
+            local_fns,
         );
     }
 }
@@ -249,6 +398,7 @@ fn walk_expression_for_jsx(
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
     import_map: &ImportMap,
+    local_fns: &LocalFnMap,
 ) {
     match expr {
         Expression::JSXElement(el) => {
@@ -261,6 +411,7 @@ fn walk_expression_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         Expression::JSXFragment(frag) => {
@@ -274,6 +425,7 @@ fn walk_expression_for_jsx(
                     incidents,
                     parent_name,
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -287,6 +439,7 @@ fn walk_expression_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         Expression::ConditionalExpression(cond) => {
@@ -299,6 +452,7 @@ fn walk_expression_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
             walk_expression_for_jsx(
                 &cond.alternate,
@@ -309,6 +463,7 @@ fn walk_expression_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         Expression::LogicalExpression(logic) => {
@@ -321,6 +476,7 @@ fn walk_expression_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         Expression::ArrowFunctionExpression(arrow) => {
@@ -333,6 +489,7 @@ fn walk_expression_for_jsx(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         Expression::CallExpression(call) => {
@@ -347,6 +504,7 @@ fn walk_expression_for_jsx(
                         incidents,
                         parent_name,
                         import_map,
+                        local_fns,
                     );
                 } else if let Some(expr) = arg.as_expression() {
                     walk_expression_for_jsx(
@@ -358,6 +516,7 @@ fn walk_expression_for_jsx(
                         incidents,
                         parent_name,
                         import_map,
+                        local_fns,
                     );
                 }
             }
@@ -377,6 +536,7 @@ fn walk_expression_for_jsx(
                             incidents,
                             parent_name,
                             import_map,
+                            local_fns,
                         );
                     } else if let Some(expr) = arg.as_expression() {
                         walk_expression_for_jsx(
@@ -388,6 +548,7 @@ fn walk_expression_for_jsx(
                             incidents,
                             parent_name,
                             import_map,
+                            local_fns,
                         );
                     }
                 }
@@ -406,6 +567,7 @@ fn walk_jsx_child(
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
     import_map: &ImportMap,
+    local_fns: &LocalFnMap,
 ) {
     match child {
         JSXChild::Element(el) => {
@@ -418,6 +580,7 @@ fn walk_jsx_child(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         JSXChild::Fragment(frag) => {
@@ -431,6 +594,7 @@ fn walk_jsx_child(
                     incidents,
                     parent_name,
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -446,6 +610,7 @@ fn walk_jsx_child(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         _ => {}
@@ -464,6 +629,7 @@ fn walk_jsx_expression(
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
     import_map: &ImportMap,
+    local_fns: &LocalFnMap,
 ) {
     match jsx_expr {
         JSXExpression::EmptyExpression(_) => {}
@@ -478,6 +644,7 @@ fn walk_jsx_expression(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         JSXExpression::JSXFragment(frag) => {
@@ -491,6 +658,7 @@ fn walk_jsx_expression(
                     incidents,
                     parent_name,
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -505,6 +673,7 @@ fn walk_jsx_expression(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         // Arrow functions: {ref => (<Component />)} or {() => <Component />}
@@ -518,6 +687,7 @@ fn walk_jsx_expression(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         // Conditionals: {condition && <Component />} or {cond ? <A/> : <B/>}
@@ -531,6 +701,7 @@ fn walk_jsx_expression(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
             walk_expression_for_jsx(
                 &cond.alternate,
@@ -541,6 +712,7 @@ fn walk_jsx_expression(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         JSXExpression::LogicalExpression(logic) => {
@@ -553,10 +725,52 @@ fn walk_jsx_expression(
                 incidents,
                 parent_name,
                 import_map,
+                local_fns,
             );
         }
         // Function calls: {renderFn(<Component />)} or {fn(arg)}
         JSXExpression::CallExpression(call) => {
+            // Resolve local function calls: if the callee is a known local
+            // function (e.g., `renderDropdownItems`), walk its body with the
+            // current parent context so JSX returned by that function inherits
+            // the parent element (e.g., <Dropdown>).
+            if let Expression::Identifier(ident) = &call.callee {
+                if let Some(fn_expr) = local_fns.get(ident.name.as_str()) {
+                    match fn_expr {
+                        Expression::ArrowFunctionExpression(arrow) => {
+                            walk_function_body(
+                                &arrow.body,
+                                source,
+                                pattern,
+                                file_uri,
+                                location,
+                                incidents,
+                                parent_name,
+                                import_map,
+                                local_fns,
+                            );
+                        }
+                        Expression::FunctionExpression(func) => {
+                            if let Some(body) = &func.body {
+                                walk_function_body(
+                                    body,
+                                    source,
+                                    pattern,
+                                    file_uri,
+                                    location,
+                                    incidents,
+                                    parent_name,
+                                    import_map,
+                                    local_fns,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Also walk call arguments for JSX passed as args
             for arg in &call.arguments {
                 if let Argument::SpreadElement(spread) = arg {
                     walk_expression_for_jsx(
@@ -568,6 +782,7 @@ fn walk_jsx_expression(
                         incidents,
                         parent_name,
                         import_map,
+                        local_fns,
                     );
                 } else if let Some(expr) = arg.as_expression() {
                     walk_expression_for_jsx(
@@ -579,6 +794,7 @@ fn walk_jsx_expression(
                         incidents,
                         parent_name,
                         import_map,
+                        local_fns,
                     );
                 }
             }
@@ -597,6 +813,7 @@ fn walk_jsx_expression(
                             incidents,
                             parent_name,
                             import_map,
+                            local_fns,
                         );
                     } else if let Some(expr) = arg.as_expression() {
                         walk_expression_for_jsx(
@@ -608,6 +825,7 @@ fn walk_jsx_expression(
                             incidents,
                             parent_name,
                             import_map,
+                            local_fns,
                         );
                     }
                 }
@@ -617,24 +835,12 @@ fn walk_jsx_expression(
     }
 }
 
-/// Extract all string literal values from an object expression's properties.
+/// Extract all string literal values from an `ObjectExpression` (non-JSX context).
 ///
 /// Given `{ default: 'alignRight', md: 'alignLeft' }`, returns
-/// `["alignRight", "alignLeft"]`. This allows value-based rules to match
-/// prop values inside responsive breakpoint objects.
-fn extract_object_string_values(expr: &JSXExpression<'_>, _source: &str) -> Vec<String> {
-    let obj = match expr {
-        JSXExpression::ObjectExpression(obj) => obj,
-        JSXExpression::ParenthesizedExpression(paren) => {
-            if let Expression::ObjectExpression(obj) = &paren.expression {
-                obj
-            } else {
-                return vec![];
-            }
-        }
-        _ => return vec![],
-    };
-
+/// `["alignRight", "alignLeft"]`. Used for typed object literal scanning
+/// where the object is not wrapped in a JSX expression container.
+fn extract_object_expression_string_values(obj: &ObjectExpression<'_>) -> Vec<String> {
     let mut values = Vec::new();
     for prop in &obj.properties {
         if let ObjectPropertyKind::ObjectProperty(p) = prop {
@@ -642,7 +848,6 @@ fn extract_object_string_values(expr: &JSXExpression<'_>, _source: &str) -> Vec<
                 Expression::StringLiteral(s) => {
                     values.push(s.value.to_string());
                 }
-                // Handle nested objects: { default: 'value', md: { nested: 'value2' } }
                 Expression::ObjectExpression(nested) => {
                     for nested_prop in &nested.properties {
                         if let ObjectPropertyKind::ObjectProperty(np) = nested_prop {
@@ -657,6 +862,44 @@ fn extract_object_string_values(expr: &JSXExpression<'_>, _source: &str) -> Vec<
         }
     }
     values
+}
+
+/// Extract all string literal values from an object expression's properties.
+///
+/// Given `{ default: 'alignRight', md: 'alignLeft' }`, returns
+/// `["alignRight", "alignLeft"]`. This allows value-based rules to match
+/// prop values inside responsive breakpoint objects.
+/// Extract string literal values from an object expression inside a regular `Expression`.
+/// Handles direct objects, parenthesized, and ternary branches.
+fn extract_object_string_values_from_expr(expr: &Expression<'_>) -> Vec<String> {
+    match expr {
+        Expression::ObjectExpression(obj) => extract_object_expression_string_values(obj),
+        Expression::ParenthesizedExpression(paren) => {
+            extract_object_string_values_from_expr(&paren.expression)
+        }
+        Expression::ConditionalExpression(cond) => {
+            let mut values = extract_object_string_values_from_expr(&cond.consequent);
+            values.extend(extract_object_string_values_from_expr(&cond.alternate));
+            values
+        }
+        Expression::StringLiteral(s) => vec![s.value.to_string()],
+        _ => vec![],
+    }
+}
+
+fn extract_object_string_values(expr: &JSXExpression<'_>, _source: &str) -> Vec<String> {
+    match expr {
+        JSXExpression::ObjectExpression(obj) => extract_object_expression_string_values(obj),
+        JSXExpression::ParenthesizedExpression(paren) => {
+            extract_object_string_values_from_expr(&paren.expression)
+        }
+        JSXExpression::ConditionalExpression(cond) => {
+            let mut values = extract_object_string_values_from_expr(&cond.consequent);
+            values.extend(extract_object_string_values_from_expr(&cond.alternate));
+            values
+        }
+        _ => vec![],
+    }
 }
 
 /// Check object literal property keys for pattern matches.
@@ -722,6 +965,184 @@ fn check_object_keys_in_expression(
     }
 }
 
+/// Resolve a Props-type annotation on a variable declarator to its component name and module.
+///
+/// Given `const x: ToolbarItemProps = { ... }` where `ToolbarItemProps` is imported from
+/// `@patternfly/react-core`, returns `("ToolbarItem", "@patternfly/react-core")`.
+///
+/// Returns `None` if:
+/// - The declarator has no type annotation
+/// - The type annotation is not a TSTypeReference
+/// - The type name doesn't end with "Props"
+/// - The type name is not found in the import map
+///
+/// Also handles common utility type wrappers like `Partial<FooProps>`,
+/// `Required<FooProps>`, `Readonly<FooProps>` by unwrapping one level.
+fn resolve_props_type_info(
+    declarator: &VariableDeclarator<'_>,
+    source: &str,
+    import_map: &ImportMap,
+) -> Option<(String, String)> {
+    let annotation = declarator.type_annotation.as_ref()?;
+
+    // Try direct type reference first, then unwrap utility types
+    resolve_type_to_props(&annotation.type_annotation, source, import_map)
+}
+
+/// Try to resolve a TSType to a (component_name, module) pair.
+///
+/// Handles direct references like `ToolbarItemProps` and utility wrappers
+/// like `Partial<ToolbarItemProps>`.
+fn resolve_type_to_props(
+    ts_type: &TSType<'_>,
+    source: &str,
+    import_map: &ImportMap,
+) -> Option<(String, String)> {
+    if let TSType::TSTypeReference(type_ref) = ts_type {
+        let name_span = type_ref.type_name.span();
+        let type_name = source
+            .get(name_span.start as usize..name_span.end as usize)
+            .unwrap_or_default();
+
+        // Check if this is directly a Props type in the import map
+        if let Some(component_name) = type_name.strip_suffix("Props") {
+            if !component_name.is_empty() {
+                if let Some(module) = import_map.get(type_name) {
+                    return Some((component_name.to_string(), module.clone()));
+                }
+            }
+        }
+
+        // Check if this is a utility wrapper like Partial<FooProps>
+        const UTILITY_TYPES: &[&str] = &["Partial", "Required", "Readonly", "Pick", "Omit"];
+        if UTILITY_TYPES.contains(&type_name) {
+            if let Some(type_args) = &type_ref.type_arguments {
+                if let Some(first_arg) = type_args.params.first() {
+                    return resolve_type_to_props(first_arg, source, import_map);
+                }
+            }
+        }
+    }
+
+    // Handle intersection types: FooProps & { extraProp: string }
+    if let TSType::TSIntersectionType(inter) = ts_type {
+        for t in &inter.types {
+            if let Some(result) = resolve_type_to_props(t, source, import_map) {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+/// Check a typed object literal for prop pattern matches.
+///
+/// When a variable is declared with a Props-type annotation and initialized with
+/// an object literal, the object's properties represent component props. This
+/// function matches property keys against the pattern and creates incidents as
+/// if they were JSX prop usages.
+///
+/// Example:
+/// ```typescript
+/// import { ToolbarItemProps } from '@patternfly/react-core';
+/// const x: ToolbarItemProps = { align: { default: 'alignRight' } };
+/// //                           ^^^^^
+/// //                           This property key is matched as a "prop" on ToolbarItem
+/// ```
+///
+/// This catches prop values set in helper files where the object is later spread
+/// onto a JSX element in a different file (e.g., `<ToolbarItem {...x} />`).
+fn check_typed_object_literal(
+    declarator: &VariableDeclarator<'_>,
+    source: &str,
+    pattern: &Regex,
+    file_uri: &str,
+    import_map: &ImportMap,
+    incidents: &mut Vec<Incident>,
+) {
+    let (component_name, module) = match resolve_props_type_info(declarator, source, import_map) {
+        Some(info) => info,
+        None => return,
+    };
+
+    let obj = match &declarator.init {
+        Some(Expression::ObjectExpression(obj)) => obj.as_ref(),
+        _ => return,
+    };
+
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            let key_name = match &p.key {
+                PropertyKey::StaticIdentifier(ident) => Some(ident.name.as_str()),
+                PropertyKey::StringLiteral(s) => Some(s.value.as_str()),
+                _ => None,
+            };
+            if let Some(name) = key_name {
+                if pattern.is_match(name) {
+                    let span = p.key.span();
+                    let mut incident = make_incident(source, file_uri, span.start, span.end);
+                    incident.variables.insert(
+                        "propName".into(),
+                        serde_json::Value::String(name.to_string()),
+                    );
+                    incident.variables.insert(
+                        "componentName".into(),
+                        serde_json::Value::String(component_name.clone()),
+                    );
+                    incident
+                        .variables
+                        .insert("module".into(), serde_json::Value::String(module.clone()));
+
+                    // Extract prop value — same logic as JSX attribute value extraction
+                    match &p.value {
+                        Expression::StringLiteral(s) => {
+                            incident.variables.insert(
+                                "propValue".into(),
+                                serde_json::Value::String(s.value.to_string()),
+                            );
+                        }
+                        Expression::ObjectExpression(nested) => {
+                            // Responsive breakpoint objects: { default: 'alignRight', md: 'alignLeft' }
+                            let values = extract_object_expression_string_values(nested);
+                            if !values.is_empty() {
+                                incident.variables.insert(
+                                    "propObjectValues".into(),
+                                    serde_json::Value::Array(
+                                        values.into_iter().map(serde_json::Value::String).collect(),
+                                    ),
+                                );
+                            }
+                            // Also set propValue to the source text of the object
+                            let expr_span = nested.span();
+                            let start = (expr_span.start as usize).min(source.len());
+                            let end = (expr_span.end as usize).min(source.len());
+                            let text = &source[start..end];
+                            incident.variables.insert(
+                                "propValue".into(),
+                                serde_json::Value::String(text.trim().to_string()),
+                            );
+                        }
+                        _ => {
+                            // For other expressions, capture source text
+                            let val_span = p.value.span();
+                            let start = (val_span.start as usize).min(source.len());
+                            let end = (val_span.end as usize).min(source.len());
+                            let text = &source[start..end];
+                            incident.variables.insert(
+                                "propValue".into(),
+                                serde_json::Value::String(text.trim().to_string()),
+                            );
+                        }
+                    }
+
+                    incidents.push(incident);
+                }
+            }
+        }
+    }
+}
+
 fn check_jsx_element(
     el: &JSXElement<'_>,
     source: &str,
@@ -731,6 +1152,7 @@ fn check_jsx_element(
     incidents: &mut Vec<Incident>,
     parent_name: Option<&str>,
     import_map: &ImportMap,
+    local_fns: &LocalFnMap,
 ) {
     let opening = &el.opening_element;
     let component_name = jsx_element_name_to_string(&opening.name);
@@ -880,6 +1302,7 @@ fn check_jsx_element(
                     incidents,
                     Some(&component_name),
                     import_map,
+                    local_fns,
                 );
             }
         }
@@ -896,6 +1319,7 @@ fn check_jsx_element(
             incidents,
             Some(&component_name),
             import_map,
+            local_fns,
         );
     }
 }
@@ -940,11 +1364,14 @@ mod tests {
         let re = Regex::new(pattern).unwrap();
         let import_map = build_import_map(&ret.program);
 
-        ret.program
-            .body
-            .iter()
-            .flat_map(|stmt| scan_jsx(stmt, source, &re, "file:///test.tsx", location, &import_map))
-            .collect()
+        scan_jsx_file(
+            &ret.program.body,
+            source,
+            &re,
+            "file:///test.tsx",
+            location,
+            &import_map,
+        )
     }
 
     #[test]
@@ -1244,6 +1671,438 @@ const el = <ToolbarItem align="alignRight" />;
         assert!(
             incidents[0].variables.get("propObjectValues").is_none(),
             "Direct string props should not have propObjectValues"
+        );
+    }
+
+    // ── Ternary / conditional expression value tests ──────────────────
+
+    #[test]
+    fn test_jsx_prop_ternary_object_values() {
+        // spaceItems={condition ? { default: 'spaceItemsMd' } : undefined}
+        // should extract 'spaceItemsMd' from the ternary's consequent branch
+        let source = r#"
+import { ToolbarToggleGroup } from '@patternfly/react-core';
+const el = <ToolbarToggleGroup spaceItems={showFilters ? { default: 'spaceItemsMd' } : undefined} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^spaceItems$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+
+        let values = incidents[0]
+            .variables
+            .get("propObjectValues")
+            .expect("Should extract propObjectValues from ternary branch")
+            .as_array()
+            .unwrap();
+        assert!(
+            values.contains(&serde_json::Value::String("spaceItemsMd".to_string())),
+            "Should find 'spaceItemsMd' inside ternary consequent. Got: {:?}",
+            values
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_ternary_direct_string_values() {
+        // variant={isActive ? 'primary' : 'secondary'}
+        // should extract both 'primary' and 'secondary'
+        let source = r#"
+import { Button } from '@patternfly/react-core';
+const el = <Button variant={isActive ? 'primary' : 'secondary'} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^variant$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+
+        let values = incidents[0]
+            .variables
+            .get("propObjectValues")
+            .expect("Should extract values from ternary branches")
+            .as_array()
+            .unwrap();
+        assert!(
+            values.contains(&serde_json::Value::String("primary".to_string())),
+            "Should find 'primary' in ternary. Got: {:?}",
+            values
+        );
+        assert!(
+            values.contains(&serde_json::Value::String("secondary".to_string())),
+            "Should find 'secondary' in ternary. Got: {:?}",
+            values
+        );
+    }
+
+    // ── Typed object literal scanning tests ──────────────────────────
+
+    #[test]
+    fn test_typed_object_literal_basic() {
+        // const x: ToolbarItemProps = { align: ... } should match ^align$
+        let source = r#"
+import { ToolbarItemProps } from '@patternfly/react-core';
+const paginationToolbarItemProps: ToolbarItemProps = {
+    variant: 'pagination',
+    align: { default: 'alignRight' }
+};
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect 'align' as a prop on typed object literal"
+        );
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("align".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String("ToolbarItem".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("module"),
+            Some(&serde_json::Value::String(
+                "@patternfly/react-core".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_typed_object_literal_with_object_values() {
+        // Should extract propObjectValues from nested responsive breakpoint object
+        let source = r#"
+import { ToolbarItemProps } from '@patternfly/react-core';
+const x: ToolbarItemProps = { align: { default: 'alignRight', md: 'alignLeft' } };
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+
+        let values = incidents[0]
+            .variables
+            .get("propObjectValues")
+            .expect("Should have propObjectValues")
+            .as_array()
+            .unwrap();
+        assert!(values.contains(&serde_json::Value::String("alignRight".to_string())));
+        assert!(values.contains(&serde_json::Value::String("alignLeft".to_string())));
+    }
+
+    #[test]
+    fn test_typed_object_literal_with_string_value() {
+        // Direct string property values should be captured as propValue
+        let source = r#"
+import { ButtonProps } from '@patternfly/react-core';
+const x: ButtonProps = { variant: 'primary' };
+"#;
+        let incidents = scan_source_jsx(source, r"^variant$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("propValue"),
+            Some(&serde_json::Value::String("primary".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String("Button".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_typed_object_literal_no_match_without_import() {
+        // Type not in import map should not produce incidents
+        let source = r#"
+type LocalProps = { align: string };
+const x: LocalProps = { align: 'right' };
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert!(
+            incidents.is_empty(),
+            "Should not match typed objects where type is not imported"
+        );
+    }
+
+    #[test]
+    fn test_typed_object_literal_no_match_non_props_type() {
+        // Type that doesn't end with "Props" should not match
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+const x: ToolbarItem = { align: 'right' };
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert!(
+            incidents.is_empty(),
+            "Should not match types that don't end with 'Props'"
+        );
+    }
+
+    #[test]
+    fn test_typed_object_literal_partial_wrapper() {
+        // Partial<ToolbarItemProps> should unwrap to ToolbarItem
+        let source = r#"
+import { ToolbarItemProps } from '@patternfly/react-core';
+const x: Partial<ToolbarItemProps> = { align: { default: 'alignRight' } };
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should unwrap Partial<> to find Props type"
+        );
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String("ToolbarItem".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_typed_object_literal_exported() {
+        // export const x: FooProps = { ... } should also work
+        let source = r#"
+import { ToolbarGroupProps } from '@patternfly/react-core';
+export const groupProps: ToolbarGroupProps = {
+    variant: 'icon-button-group',
+    align: { default: 'alignRight' }
+};
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect props in exported variable declarations"
+        );
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String("ToolbarGroup".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_typed_object_literal_no_match_wrong_prop() {
+        // Only the matching property key should create an incident
+        let source = r#"
+import { ToolbarItemProps } from '@patternfly/react-core';
+const x: ToolbarItemProps = { variant: 'pagination', align: { default: 'alignRight' } };
+"#;
+        let incidents = scan_source_jsx(source, r"^spaceItems$", Some(&ReferenceLocation::JsxProp));
+        assert!(
+            incidents.is_empty(),
+            "Should not match properties that don't match the pattern"
+        );
+    }
+
+    #[test]
+    fn test_typed_object_literal_coexists_with_jsx() {
+        // Both JSX prop and typed object literal should produce incidents
+        let source = r#"
+import { ToolbarItem, ToolbarItemProps } from '@patternfly/react-core';
+const x: ToolbarItemProps = { align: { default: 'alignRight' } };
+const el = <ToolbarItem align={{ default: 'alignRight' }} />;
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            2,
+            "Should detect both typed object literal and JSX prop"
+        );
+    }
+
+    #[test]
+    fn test_typed_object_literal_real_world_pagination() {
+        // Exact pattern from quipucords-ui usePaginationPropHelpers.ts
+        let source = r#"
+import { PaginationProps, ToolbarItemProps } from '@patternfly/react-core';
+
+export const usePaginationPropHelpers = (args: any) => {
+    const paginationProps: PaginationProps = {
+        itemCount: 100,
+        perPage: 10,
+        page: 1,
+    };
+
+    const paginationToolbarItemProps: ToolbarItemProps = {
+        variant: 'pagination',
+        align: { default: 'alignRight' }
+    };
+
+    return { paginationProps, paginationToolbarItemProps };
+};
+"#;
+        let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect 'align' in typed object literal inside function"
+        );
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String("ToolbarItem".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("module"),
+            Some(&serde_json::Value::String(
+                "@patternfly/react-core".to_string()
+            ))
+        );
+
+        // Check that propObjectValues are extracted
+        let values = incidents[0]
+            .variables
+            .get("propObjectValues")
+            .expect("Should have propObjectValues")
+            .as_array()
+            .unwrap();
+        assert!(values.contains(&serde_json::Value::String("alignRight".to_string())));
+    }
+
+    // ── Function-return tracing tests ────────────────────────────────
+
+    #[test]
+    fn test_function_return_inherits_parent_context() {
+        // renderDropdownItems() returns <DropdownItem>, called inside <Dropdown>.
+        // The scanner should see DropdownItem with parent Dropdown.
+        let source = r#"
+import { Dropdown, DropdownItem } from '@patternfly/react-core';
+const renderItems = () => {
+    return <DropdownItem>Item</DropdownItem>;
+};
+const el = <Dropdown>{renderItems()}</Dropdown>;
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^DropdownItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        // Should have incidents: one from function body (no parent) + one from call site (parent=Dropdown)
+        let with_dropdown_parent: Vec<_> = incidents
+            .iter()
+            .filter(|i| {
+                i.variables.get("parentName")
+                    == Some(&serde_json::Value::String("Dropdown".to_string()))
+            })
+            .collect();
+        assert!(
+            !with_dropdown_parent.is_empty(),
+            "Should have DropdownItem with parent Dropdown from call site. Incidents: {:?}",
+            incidents.iter().map(|i| &i.variables).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_function_return_with_map_inherits_parent() {
+        // Common pattern: function returns items.map(x => <Component />)
+        let source = r#"
+import { Dropdown, DropdownItem } from '@patternfly/react-core';
+const renderItems = () => {
+    return [1, 2].map(i => <DropdownItem key={i}>Item {i}</DropdownItem>);
+};
+const el = <Dropdown>{renderItems()}</Dropdown>;
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^DropdownItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        let with_dropdown_parent: Vec<_> = incidents
+            .iter()
+            .filter(|i| {
+                i.variables.get("parentName")
+                    == Some(&serde_json::Value::String("Dropdown".to_string()))
+            })
+            .collect();
+        assert!(
+            !with_dropdown_parent.is_empty(),
+            "Should trace through .map() arrow and inherit Dropdown parent. Incidents: {:?}",
+            incidents.iter().map(|i| &i.variables).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_nested_function_return_inherits_parent() {
+        // Function declared INSIDE a component body (not top-level).
+        // This is the FilterToolbar pattern.
+        let source = r#"
+import { Dropdown, DropdownItem } from '@patternfly/react-core';
+const FilterToolbar = () => {
+    const renderDropdownItems = () => {
+        return <DropdownItem>Item</DropdownItem>;
+    };
+    return (
+        <Dropdown>{renderDropdownItems()}</Dropdown>
+    );
+};
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^DropdownItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        let with_dropdown_parent: Vec<_> = incidents
+            .iter()
+            .filter(|i| {
+                i.variables.get("parentName")
+                    == Some(&serde_json::Value::String("Dropdown".to_string()))
+            })
+            .collect();
+        assert!(
+            !with_dropdown_parent.is_empty(),
+            "Should find nested function's DropdownItem with parent Dropdown. Incidents: {:?}",
+            incidents.iter().map(|i| &i.variables).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_function_return_inside_wrapper_has_correct_parent() {
+        // renderItems() called inside <DropdownList> inside <Dropdown>.
+        // The call-site parent should be DropdownList, not Dropdown.
+        let source = r#"
+import { Dropdown, DropdownList, DropdownItem } from '@patternfly/react-core';
+const renderItems = () => {
+    return <DropdownItem>Item</DropdownItem>;
+};
+const el = (
+    <Dropdown>
+        <DropdownList>{renderItems()}</DropdownList>
+    </Dropdown>
+);
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^DropdownItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        let with_list_parent: Vec<_> = incidents
+            .iter()
+            .filter(|i| {
+                i.variables.get("parentName")
+                    == Some(&serde_json::Value::String("DropdownList".to_string()))
+            })
+            .collect();
+        assert!(
+            !with_list_parent.is_empty(),
+            "Should have DropdownItem with parent DropdownList. Incidents: {:?}",
+            incidents.iter().map(|i| &i.variables).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_function_return_no_double_count() {
+        // DropdownItem should not be double-counted — once from the function
+        // body walk and once from the call-site resolution.
+        let source = r#"
+import { Dropdown, DropdownItem } from '@patternfly/react-core';
+const renderItems = () => <DropdownItem>Item</DropdownItem>;
+const el = <Dropdown>{renderItems()}</Dropdown>;
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^DropdownItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        // Two incidents: one from function body (no parent), one from call site (parent=Dropdown)
+        // The function body walk sees it with no parent, the call-site walk sees it with parent=Dropdown
+        // Both are valid — the conformance rule filters by parent=Dropdown
+        let with_parent: Vec<_> = incidents
+            .iter()
+            .filter(|i| i.variables.contains_key("parentName"))
+            .collect();
+        assert!(
+            !with_parent.is_empty(),
+            "Should have at least one incident with parent context from call site"
         );
     }
 }

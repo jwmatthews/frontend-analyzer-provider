@@ -7,36 +7,60 @@ use crate::proto::{IncidentContext, Location, Position, ProviderEvaluateResponse
 use anyhow::Result;
 use frontend_core::capabilities::ProviderCondition;
 use frontend_core::incident::Incident;
+use frontend_js_scanner::scanner::ParseError;
 use regex::Regex;
+use std::collections::HashSet;
 use std::path::Path;
+
+/// Result of evaluating a condition, including any files that could not be parsed.
+pub struct EvaluationResult {
+    /// The gRPC response with matched incidents.
+    pub response: ProviderEvaluateResponse,
+    /// Files that could not be parsed (syntax errors, broken imports, etc.).
+    /// Deduplicated by file path so each file is reported at most once.
+    pub parse_errors: Vec<ParseError>,
+}
 
 /// Evaluate a single condition against the project.
 ///
 /// When called via kantra/analyzer-lsp, `condition_yaml` contains a wrapper
 /// with `tags`, `template`, `ruleID`, `depLabelSelector` and the actual
 /// condition nested under the capability key. We extract the nested condition.
+///
+/// Returns both the matched incidents and any parse errors encountered.
+/// Parse errors indicate files that could not be analyzed due to syntax
+/// problems (e.g., broken imports from a previous migration run).
 pub fn evaluate_condition(
     root: &Path,
     capability: &str,
     condition_yaml: &str,
-) -> Result<ProviderEvaluateResponse> {
+) -> Result<EvaluationResult> {
     // Try to extract the nested condition from the kantra wrapper format.
     // The wrapper has the condition under a key matching the capability name.
     let effective_yaml = extract_nested_condition(capability, condition_yaml)
         .unwrap_or_else(|| condition_yaml.to_string());
 
     let condition = ProviderCondition::parse(capability, &effective_yaml)?;
-    let incidents = match condition {
+
+    let mut all_incidents = Vec::new();
+    let mut parse_errors = Vec::new();
+    // Track which files we've already reported errors for to avoid duplicates.
+    let mut errored_files: HashSet<std::path::PathBuf> = HashSet::new();
+
+    match condition {
         ProviderCondition::Referenced(cond) => {
             let files =
                 frontend_js_scanner::scanner::collect_files(root, cond.file_pattern.as_deref())?;
-            let mut all_incidents = Vec::new();
             for file in files {
-                let result =
+                let (incidents, parse_error) =
                     frontend_js_scanner::scanner::scan_file_referenced(&file, root, &cond)?;
-                all_incidents.extend(result);
+                all_incidents.extend(incidents);
+                if let Some(err) = parse_error {
+                    if errored_files.insert(err.file_path.clone()) {
+                        parse_errors.push(err);
+                    }
+                }
             }
-            all_incidents
         }
         ProviderCondition::CssClass(cond) => {
             let pattern = Regex::new(&cond.pattern)?;
@@ -46,7 +70,6 @@ pub fn evaluate_condition(
                 root,
                 cond.file_pattern.as_deref(),
             )?;
-            let mut all_incidents = Vec::new();
             for file in &css_files {
                 let result =
                     frontend_css_scanner::scanner::scan_css_file_classes(file, root, &pattern)?;
@@ -57,12 +80,15 @@ pub fn evaluate_condition(
             let js_files =
                 frontend_js_scanner::scanner::collect_files(root, cond.file_pattern.as_deref())?;
             for file in &js_files {
-                let result =
+                let (incidents, parse_error) =
                     frontend_js_scanner::scanner::scan_file_classnames(file, root, &pattern)?;
-                all_incidents.extend(result);
+                all_incidents.extend(incidents);
+                if let Some(err) = parse_error {
+                    if errored_files.insert(err.file_path.clone()) {
+                        parse_errors.push(err);
+                    }
+                }
             }
-
-            all_incidents
         }
         ProviderCondition::CssVar(cond) => {
             let pattern = Regex::new(&cond.pattern)?;
@@ -72,7 +98,6 @@ pub fn evaluate_condition(
                 root,
                 cond.file_pattern.as_deref(),
             )?;
-            let mut all_incidents = Vec::new();
             for file in &css_files {
                 let result =
                     frontend_css_scanner::scanner::scan_css_file_vars(file, root, &pattern)?;
@@ -83,25 +108,34 @@ pub fn evaluate_condition(
             let js_files =
                 frontend_js_scanner::scanner::collect_files(root, cond.file_pattern.as_deref())?;
             for file in &js_files {
-                let result =
+                let (incidents, parse_error) =
                     frontend_js_scanner::scanner::scan_file_css_vars(file, root, &pattern)?;
-                all_incidents.extend(result);
+                all_incidents.extend(incidents);
+                if let Some(err) = parse_error {
+                    if errored_files.insert(err.file_path.clone()) {
+                        parse_errors.push(err);
+                    }
+                }
             }
-
-            all_incidents
         }
         ProviderCondition::Dependency(cond) => {
-            frontend_js_scanner::dependency::check_dependencies(root, &cond)?
+            all_incidents.extend(frontend_js_scanner::dependency::check_dependencies(
+                root, &cond,
+            )?);
         }
     };
 
-    let incident_contexts: Vec<IncidentContext> = incidents.iter().map(incident_to_proto).collect();
+    let incident_contexts: Vec<IncidentContext> =
+        all_incidents.iter().map(incident_to_proto).collect();
     let matched = !incident_contexts.is_empty();
 
-    Ok(ProviderEvaluateResponse {
-        matched,
-        incident_contexts,
-        template_context: None,
+    Ok(EvaluationResult {
+        response: ProviderEvaluateResponse {
+            matched,
+            incident_contexts,
+            template_context: None,
+        },
+        parse_errors,
     })
 }
 
