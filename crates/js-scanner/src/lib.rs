@@ -4,5 +4,7 @@ pub mod dependency;
 pub mod function_calls;
 pub mod imports;
 pub mod jsx;
+pub mod resolve;
 pub mod scanner;
+pub mod transparency;
 pub mod type_refs;

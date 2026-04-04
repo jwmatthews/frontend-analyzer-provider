@@ -11,7 +11,7 @@ use frontend_core::incident::Incident;
 use oxc_ast::ast::*;
 use oxc_span::GetSpan;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Import map: local identifier name → module source path.
 /// Built from import declarations, passed through JSX scanning so components
@@ -25,6 +25,29 @@ type ImportMap = HashMap<String, String>;
 /// expressions in JSX children (e.g., `{renderItems()}`) to the function body,
 /// so the parent context propagates through the call.
 type LocalFnMap<'a> = HashMap<String, &'a Expression<'a>>;
+
+/// Shared scanning context passed through the JSX walk tree.
+///
+/// Bundles the parameters that every walk function needs, avoiding
+/// long argument lists (source, pattern, file_uri, location, etc.).
+struct ScanContext<'a, 'b> {
+    source: &'a str,
+    pattern: &'b Regex,
+    file_uri: &'a str,
+    location: Option<&'b ReferenceLocation>,
+    incidents: &'b mut Vec<Incident>,
+    import_map: &'b ImportMap,
+    local_fns: &'b LocalFnMap<'a>,
+    /// When set, matches the parent component (via `pattern`) and emits
+    /// incidents for each direct JSX child whose name does NOT match this
+    /// regex. Used for "exclusive wrapper" rules.
+    not_child: Option<&'b Regex>,
+    /// Components identified as transparent (children-passthrough) wrappers
+    /// via cross-file resolution. When a transparent component is encountered
+    /// as a JSX parent, its children inherit the parent from above rather than
+    /// seeing the transparent component as their parent.
+    transparent_components: &'b HashSet<String>,
+}
 
 /// Build a map of all function declarations in the AST, including those
 /// nested inside component bodies. Recurses into function/arrow bodies
@@ -114,6 +137,11 @@ fn collect_fn_declarations_from_expr<'a>(
 /// each statement. The function map enables resolving call expressions like
 /// `{renderItems()}` in JSX children to their function bodies, propagating
 /// the parent JSX element context through the call.
+///
+/// `transparent_components` is the set of locally-imported component names
+/// that have been identified as children-passthrough wrappers via cross-file
+/// resolution. When encountered as a JSX parent, they are collapsed out of
+/// the parent chain so their children inherit the grandparent.
 pub fn scan_jsx_file<'a>(
     stmts: &'a [Statement<'a>],
     source: &str,
@@ -121,21 +149,24 @@ pub fn scan_jsx_file<'a>(
     file_uri: &str,
     location: Option<&ReferenceLocation>,
     import_map: &ImportMap,
+    not_child: Option<&Regex>,
+    transparent_components: &HashSet<String>,
 ) -> Vec<Incident> {
     let local_fns = build_local_fn_map(stmts, source);
     let mut incidents = Vec::new();
+    let mut ctx = ScanContext {
+        source,
+        pattern,
+        file_uri,
+        location,
+        incidents: &mut incidents,
+        import_map,
+        local_fns: &local_fns,
+        not_child,
+        transparent_components,
+    };
     for stmt in stmts {
-        walk_statement_for_jsx(
-            stmt,
-            source,
-            pattern,
-            file_uri,
-            location,
-            &mut incidents,
-            None,
-            import_map,
-            &local_fns,
-        );
+        walk_statement_for_jsx(stmt, &mut ctx, None);
     }
     incidents
 }
@@ -150,175 +181,67 @@ pub fn scan_jsx(
     import_map: &ImportMap,
 ) -> Vec<Incident> {
     let empty_fns = LocalFnMap::new();
+    let empty_transparent = HashSet::new();
     let mut incidents = Vec::new();
-    walk_statement_for_jsx(
-        stmt,
+    let mut ctx = ScanContext {
         source,
         pattern,
         file_uri,
         location,
-        &mut incidents,
-        None,
+        incidents: &mut incidents,
         import_map,
-        &empty_fns,
-    );
+        local_fns: &empty_fns,
+        not_child: None,
+        transparent_components: &empty_transparent,
+    };
+    walk_statement_for_jsx(stmt, &mut ctx, None);
     incidents
 }
 
-fn walk_statement_for_jsx(
-    stmt: &Statement<'_>,
-    source: &str,
-    pattern: &Regex,
-    file_uri: &str,
-    location: Option<&ReferenceLocation>,
-    incidents: &mut Vec<Incident>,
-    parent_name: Option<&str>,
-    import_map: &ImportMap,
-    local_fns: &LocalFnMap,
-) {
+fn walk_statement_for_jsx(stmt: &Statement<'_>, ctx: &mut ScanContext, parent_name: Option<&str>) {
     match stmt {
         Statement::ExportDefaultDeclaration(decl) => {
             if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &decl.declaration {
                 if let Some(body) = &func.body {
-                    walk_function_body(
-                        body,
-                        source,
-                        pattern,
-                        file_uri,
-                        location,
-                        incidents,
-                        parent_name,
-                        import_map,
-                        local_fns,
-                    );
+                    walk_function_body(body, ctx, parent_name);
                 }
             }
         }
         Statement::ExportNamedDeclaration(decl) => {
             if let Some(Declaration::FunctionDeclaration(func)) = &decl.declaration {
                 if let Some(body) = &func.body {
-                    walk_function_body(
-                        body,
-                        source,
-                        pattern,
-                        file_uri,
-                        location,
-                        incidents,
-                        parent_name,
-                        import_map,
-                        local_fns,
-                    );
+                    walk_function_body(body, ctx, parent_name);
                 }
             }
             if let Some(Declaration::VariableDeclaration(var_decl)) = &decl.declaration {
-                walk_variable_declaration(
-                    var_decl,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    parent_name,
-                    import_map,
-                    local_fns,
-                );
+                walk_variable_declaration(var_decl, ctx, parent_name);
             }
         }
         Statement::FunctionDeclaration(func) => {
             if let Some(body) = &func.body {
-                walk_function_body(
-                    body,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    parent_name,
-                    import_map,
-                    local_fns,
-                );
+                walk_function_body(body, ctx, parent_name);
             }
         }
         Statement::VariableDeclaration(var_decl) => {
-            walk_variable_declaration(
-                var_decl,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_variable_declaration(var_decl, ctx, parent_name);
         }
         Statement::ReturnStatement(ret) => {
             if let Some(arg) = &ret.argument {
-                walk_expression_for_jsx(
-                    arg,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    parent_name,
-                    import_map,
-                    local_fns,
-                );
+                walk_expression_for_jsx(arg, ctx, parent_name);
             }
         }
         Statement::ExpressionStatement(expr) => {
-            walk_expression_for_jsx(
-                &expr.expression,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_expression_for_jsx(&expr.expression, ctx, parent_name);
         }
         Statement::BlockStatement(block) => {
             for s in &block.body {
-                walk_statement_for_jsx(
-                    s,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    parent_name,
-                    import_map,
-                    local_fns,
-                );
+                walk_statement_for_jsx(s, ctx, parent_name);
             }
         }
         Statement::IfStatement(if_stmt) => {
-            walk_statement_for_jsx(
-                &if_stmt.consequent,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_statement_for_jsx(&if_stmt.consequent, ctx, parent_name);
             if let Some(alt) = &if_stmt.alternate {
-                walk_statement_for_jsx(
-                    alt,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    parent_name,
-                    import_map,
-                    local_fns,
-                );
+                walk_statement_for_jsx(alt, ctx, parent_name);
             }
         }
         _ => {}
@@ -327,197 +250,70 @@ fn walk_statement_for_jsx(
 
 fn walk_variable_declaration(
     var_decl: &VariableDeclaration<'_>,
-    source: &str,
-    pattern: &Regex,
-    file_uri: &str,
-    location: Option<&ReferenceLocation>,
-    incidents: &mut Vec<Incident>,
+    ctx: &mut ScanContext,
     parent_name: Option<&str>,
-    import_map: &ImportMap,
-    local_fns: &LocalFnMap,
 ) {
     for declarator in &var_decl.declarations {
         // Check for typed object literals that represent component props.
         // e.g., `const x: ToolbarItemProps = { align: { default: 'alignRight' } }`
         // This catches prop values set in helper files outside JSX context,
         // where the object is later spread onto a JSX element in another file.
-        if matches!(location, Some(ReferenceLocation::JsxProp) | None) {
+        if matches!(ctx.location, Some(ReferenceLocation::JsxProp) | None) {
             check_typed_object_literal(
-                declarator, source, pattern, file_uri, import_map, incidents,
+                declarator,
+                ctx.source,
+                ctx.pattern,
+                ctx.file_uri,
+                ctx.import_map,
+                ctx.incidents,
             );
         }
 
         if let Some(init) = &declarator.init {
-            walk_expression_for_jsx(
-                init,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_expression_for_jsx(init, ctx, parent_name);
         }
     }
 }
 
-fn walk_function_body(
-    body: &FunctionBody<'_>,
-    source: &str,
-    pattern: &Regex,
-    file_uri: &str,
-    location: Option<&ReferenceLocation>,
-    incidents: &mut Vec<Incident>,
-    parent_name: Option<&str>,
-    import_map: &ImportMap,
-    local_fns: &LocalFnMap,
-) {
+fn walk_function_body(body: &FunctionBody<'_>, ctx: &mut ScanContext, parent_name: Option<&str>) {
     for stmt in &body.statements {
-        walk_statement_for_jsx(
-            stmt,
-            source,
-            pattern,
-            file_uri,
-            location,
-            incidents,
-            parent_name,
-            import_map,
-            local_fns,
-        );
+        walk_statement_for_jsx(stmt, ctx, parent_name);
     }
 }
 
 fn walk_expression_for_jsx(
     expr: &Expression<'_>,
-    source: &str,
-    pattern: &Regex,
-    file_uri: &str,
-    location: Option<&ReferenceLocation>,
-    incidents: &mut Vec<Incident>,
+    ctx: &mut ScanContext,
     parent_name: Option<&str>,
-    import_map: &ImportMap,
-    local_fns: &LocalFnMap,
 ) {
     match expr {
         Expression::JSXElement(el) => {
-            check_jsx_element(
-                el,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            check_jsx_element(el, ctx, parent_name);
         }
         Expression::JSXFragment(frag) => {
             for child in &frag.children {
-                walk_jsx_child(
-                    child,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    parent_name,
-                    import_map,
-                    local_fns,
-                );
+                walk_jsx_child(child, ctx, parent_name);
             }
         }
         Expression::ParenthesizedExpression(paren) => {
-            walk_expression_for_jsx(
-                &paren.expression,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_expression_for_jsx(&paren.expression, ctx, parent_name);
         }
         Expression::ConditionalExpression(cond) => {
-            walk_expression_for_jsx(
-                &cond.consequent,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
-            walk_expression_for_jsx(
-                &cond.alternate,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_expression_for_jsx(&cond.consequent, ctx, parent_name);
+            walk_expression_for_jsx(&cond.alternate, ctx, parent_name);
         }
         Expression::LogicalExpression(logic) => {
-            walk_expression_for_jsx(
-                &logic.right,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_expression_for_jsx(&logic.right, ctx, parent_name);
         }
         Expression::ArrowFunctionExpression(arrow) => {
-            walk_function_body(
-                &arrow.body,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_function_body(&arrow.body, ctx, parent_name);
         }
         Expression::CallExpression(call) => {
             for arg in &call.arguments {
                 if let Argument::SpreadElement(spread) = arg {
-                    walk_expression_for_jsx(
-                        &spread.argument,
-                        source,
-                        pattern,
-                        file_uri,
-                        location,
-                        incidents,
-                        parent_name,
-                        import_map,
-                        local_fns,
-                    );
+                    walk_expression_for_jsx(&spread.argument, ctx, parent_name);
                 } else if let Some(expr) = arg.as_expression() {
-                    walk_expression_for_jsx(
-                        expr,
-                        source,
-                        pattern,
-                        file_uri,
-                        location,
-                        incidents,
-                        parent_name,
-                        import_map,
-                        local_fns,
-                    );
+                    walk_expression_for_jsx(expr, ctx, parent_name);
                 }
             }
         }
@@ -527,29 +323,9 @@ fn walk_expression_for_jsx(
             if let ChainElement::CallExpression(call) = &chain.expression {
                 for arg in &call.arguments {
                     if let Argument::SpreadElement(spread) = arg {
-                        walk_expression_for_jsx(
-                            &spread.argument,
-                            source,
-                            pattern,
-                            file_uri,
-                            location,
-                            incidents,
-                            parent_name,
-                            import_map,
-                            local_fns,
-                        );
+                        walk_expression_for_jsx(&spread.argument, ctx, parent_name);
                     } else if let Some(expr) = arg.as_expression() {
-                        walk_expression_for_jsx(
-                            expr,
-                            source,
-                            pattern,
-                            file_uri,
-                            location,
-                            incidents,
-                            parent_name,
-                            import_map,
-                            local_fns,
-                        );
+                        walk_expression_for_jsx(expr, ctx, parent_name);
                     }
                 }
             }
@@ -558,60 +334,20 @@ fn walk_expression_for_jsx(
     }
 }
 
-fn walk_jsx_child(
-    child: &JSXChild<'_>,
-    source: &str,
-    pattern: &Regex,
-    file_uri: &str,
-    location: Option<&ReferenceLocation>,
-    incidents: &mut Vec<Incident>,
-    parent_name: Option<&str>,
-    import_map: &ImportMap,
-    local_fns: &LocalFnMap,
-) {
+fn walk_jsx_child(child: &JSXChild<'_>, ctx: &mut ScanContext, parent_name: Option<&str>) {
     match child {
         JSXChild::Element(el) => {
-            check_jsx_element(
-                el,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            check_jsx_element(el, ctx, parent_name);
         }
         JSXChild::Fragment(frag) => {
             for c in &frag.children {
-                walk_jsx_child(
-                    c,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    parent_name,
-                    import_map,
-                    local_fns,
-                );
+                walk_jsx_child(c, ctx, parent_name);
             }
         }
         JSXChild::ExpressionContainer(container) => {
             // JSXExpression inherits Expression variants via @inherit macro.
             // Walk into the expression to find nested JSX elements.
-            walk_jsx_expression(
-                &container.expression,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_jsx_expression(&container.expression, ctx, parent_name);
         }
         _ => {}
     }
@@ -622,111 +358,35 @@ fn walk_jsx_child(
 /// prop value expressions (toggle={ref => (<MenuToggle ...>)}).
 fn walk_jsx_expression(
     jsx_expr: &JSXExpression<'_>,
-    source: &str,
-    pattern: &Regex,
-    file_uri: &str,
-    location: Option<&ReferenceLocation>,
-    incidents: &mut Vec<Incident>,
+    ctx: &mut ScanContext,
     parent_name: Option<&str>,
-    import_map: &ImportMap,
-    local_fns: &LocalFnMap,
 ) {
     match jsx_expr {
         JSXExpression::EmptyExpression(_) => {}
         // Direct JSX nesting: {<Component />}
         JSXExpression::JSXElement(el) => {
-            check_jsx_element(
-                el,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            check_jsx_element(el, ctx, parent_name);
         }
         JSXExpression::JSXFragment(frag) => {
             for child in &frag.children {
-                walk_jsx_child(
-                    child,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    parent_name,
-                    import_map,
-                    local_fns,
-                );
+                walk_jsx_child(child, ctx, parent_name);
             }
         }
         // Parenthesized: {(<Component />)}
         JSXExpression::ParenthesizedExpression(paren) => {
-            walk_expression_for_jsx(
-                &paren.expression,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_expression_for_jsx(&paren.expression, ctx, parent_name);
         }
         // Arrow functions: {ref => (<Component />)} or {() => <Component />}
         JSXExpression::ArrowFunctionExpression(arrow) => {
-            walk_function_body(
-                &arrow.body,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_function_body(&arrow.body, ctx, parent_name);
         }
         // Conditionals: {condition && <Component />} or {cond ? <A/> : <B/>}
         JSXExpression::ConditionalExpression(cond) => {
-            walk_expression_for_jsx(
-                &cond.consequent,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
-            walk_expression_for_jsx(
-                &cond.alternate,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_expression_for_jsx(&cond.consequent, ctx, parent_name);
+            walk_expression_for_jsx(&cond.alternate, ctx, parent_name);
         }
         JSXExpression::LogicalExpression(logic) => {
-            walk_expression_for_jsx(
-                &logic.right,
-                source,
-                pattern,
-                file_uri,
-                location,
-                incidents,
-                parent_name,
-                import_map,
-                local_fns,
-            );
+            walk_expression_for_jsx(&logic.right, ctx, parent_name);
         }
         // Function calls: {renderFn(<Component />)} or {fn(arg)}
         JSXExpression::CallExpression(call) => {
@@ -735,34 +395,14 @@ fn walk_jsx_expression(
             // current parent context so JSX returned by that function inherits
             // the parent element (e.g., <Dropdown>).
             if let Expression::Identifier(ident) = &call.callee {
-                if let Some(fn_expr) = local_fns.get(ident.name.as_str()) {
+                if let Some(fn_expr) = ctx.local_fns.get(ident.name.as_str()) {
                     match fn_expr {
                         Expression::ArrowFunctionExpression(arrow) => {
-                            walk_function_body(
-                                &arrow.body,
-                                source,
-                                pattern,
-                                file_uri,
-                                location,
-                                incidents,
-                                parent_name,
-                                import_map,
-                                local_fns,
-                            );
+                            walk_function_body(&arrow.body, ctx, parent_name);
                         }
                         Expression::FunctionExpression(func) => {
                             if let Some(body) = &func.body {
-                                walk_function_body(
-                                    body,
-                                    source,
-                                    pattern,
-                                    file_uri,
-                                    location,
-                                    incidents,
-                                    parent_name,
-                                    import_map,
-                                    local_fns,
-                                );
+                                walk_function_body(body, ctx, parent_name);
                             }
                         }
                         _ => {}
@@ -773,29 +413,9 @@ fn walk_jsx_expression(
             // Also walk call arguments for JSX passed as args
             for arg in &call.arguments {
                 if let Argument::SpreadElement(spread) = arg {
-                    walk_expression_for_jsx(
-                        &spread.argument,
-                        source,
-                        pattern,
-                        file_uri,
-                        location,
-                        incidents,
-                        parent_name,
-                        import_map,
-                        local_fns,
-                    );
+                    walk_expression_for_jsx(&spread.argument, ctx, parent_name);
                 } else if let Some(expr) = arg.as_expression() {
-                    walk_expression_for_jsx(
-                        expr,
-                        source,
-                        pattern,
-                        file_uri,
-                        location,
-                        incidents,
-                        parent_name,
-                        import_map,
-                        local_fns,
-                    );
+                    walk_expression_for_jsx(expr, ctx, parent_name);
                 }
             }
         }
@@ -804,29 +424,9 @@ fn walk_jsx_expression(
             if let ChainElement::CallExpression(call) = &chain.expression {
                 for arg in &call.arguments {
                     if let Argument::SpreadElement(spread) = arg {
-                        walk_expression_for_jsx(
-                            &spread.argument,
-                            source,
-                            pattern,
-                            file_uri,
-                            location,
-                            incidents,
-                            parent_name,
-                            import_map,
-                            local_fns,
-                        );
+                        walk_expression_for_jsx(&spread.argument, ctx, parent_name);
                     } else if let Some(expr) = arg.as_expression() {
-                        walk_expression_for_jsx(
-                            expr,
-                            source,
-                            pattern,
-                            file_uri,
-                            location,
-                            incidents,
-                            parent_name,
-                            import_map,
-                            local_fns,
-                        );
+                        walk_expression_for_jsx(expr, ctx, parent_name);
                     }
                 }
             }
@@ -1143,31 +743,21 @@ fn check_typed_object_literal(
     }
 }
 
-fn check_jsx_element(
-    el: &JSXElement<'_>,
-    source: &str,
-    pattern: &Regex,
-    file_uri: &str,
-    location: Option<&ReferenceLocation>,
-    incidents: &mut Vec<Incident>,
-    parent_name: Option<&str>,
-    import_map: &ImportMap,
-    local_fns: &LocalFnMap,
-) {
+fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Option<&str>) {
     let opening = &el.opening_element;
     let component_name = jsx_element_name_to_string(&opening.name);
 
     // Check component name
-    let search_component = matches!(location, Some(ReferenceLocation::JsxComponent) | None);
-    if search_component && pattern.is_match(&component_name) {
+    let search_component = matches!(ctx.location, Some(ReferenceLocation::JsxComponent) | None);
+    if search_component && ctx.pattern.is_match(&component_name) {
         let span = opening.name.span();
-        let mut incident = make_incident(source, file_uri, span.start, span.end);
+        let mut incident = make_incident(ctx.source, ctx.file_uri, span.start, span.end);
         incident.variables.insert(
             "componentName".into(),
             serde_json::Value::String(component_name.clone()),
         );
         // Resolve the matched component's import source
-        if let Some(module) = import_map.get(&component_name) {
+        if let Some(module) = ctx.import_map.get(&component_name) {
             incident
                 .variables
                 .insert("module".into(), serde_json::Value::String(module.clone()));
@@ -1178,26 +768,67 @@ fn check_jsx_element(
                 serde_json::Value::String(parent.to_string()),
             );
             // Resolve the parent component's import source
-            if let Some(parent_module) = import_map.get(parent) {
+            if let Some(parent_module) = ctx.import_map.get(parent) {
                 incident.variables.insert(
                     "parentFrom".into(),
                     serde_json::Value::String(parent_module.clone()),
                 );
             }
         }
-        incidents.push(incident);
+        if ctx.not_child.is_none() {
+            ctx.incidents.push(incident);
+        }
+
+        // notChild: emit incidents for direct JSX children that don't match
+        if let Some(not_child_re) = ctx.not_child {
+            for child in &el.children {
+                if let JSXChild::Element(child_el) = child {
+                    let child_name = jsx_element_name_to_string(&child_el.opening_element.name);
+                    if !not_child_re.is_match(&child_name) {
+                        let child_span = child_el.opening_element.name.span();
+                        let mut child_incident = make_incident(
+                            ctx.source,
+                            ctx.file_uri,
+                            child_span.start,
+                            child_span.end,
+                        );
+                        child_incident.variables.insert(
+                            "componentName".into(),
+                            serde_json::Value::String(child_name.clone()),
+                        );
+                        child_incident.variables.insert(
+                            "parentName".into(),
+                            serde_json::Value::String(component_name.clone()),
+                        );
+                        if let Some(module) = ctx.import_map.get(&child_name) {
+                            child_incident
+                                .variables
+                                .insert("module".into(), serde_json::Value::String(module.clone()));
+                        }
+                        if let Some(parent_module) = ctx.import_map.get(&component_name) {
+                            child_incident.variables.insert(
+                                "parentFrom".into(),
+                                serde_json::Value::String(parent_module.clone()),
+                            );
+                        }
+                        ctx.incidents.push(child_incident);
+                    }
+                }
+            }
+        }
     }
 
     // Check props
-    let search_props = matches!(location, Some(ReferenceLocation::JsxProp) | None);
+    let search_props = matches!(ctx.location, Some(ReferenceLocation::JsxProp) | None);
     if search_props {
         for attr in &opening.attributes {
             if let JSXAttributeItem::Attribute(a) = attr {
                 if let JSXAttributeName::Identifier(ident) = &a.name {
                     let prop_name = ident.name.as_str();
-                    if pattern.is_match(prop_name) {
+                    if ctx.pattern.is_match(prop_name) {
                         let span = ident.span();
-                        let mut incident = make_incident(source, file_uri, span.start, span.end);
+                        let mut incident =
+                            make_incident(ctx.source, ctx.file_uri, span.start, span.end);
                         incident.variables.insert(
                             "propName".into(),
                             serde_json::Value::String(prop_name.to_string()),
@@ -1218,12 +849,13 @@ fn check_jsx_element(
                                     // For expressions, capture the source text
                                     let expr_span = expr.span();
                                     // Strip the { } wrapper, with bounds checking
-                                    let start = (expr_span.start as usize + 1).min(source.len());
+                                    let start =
+                                        (expr_span.start as usize + 1).min(ctx.source.len());
                                     let end = (expr_span.end as usize)
                                         .saturating_sub(1)
                                         .max(start)
-                                        .min(source.len());
-                                    let text = &source[start..end];
+                                        .min(ctx.source.len());
+                                    let text = &ctx.source[start..end];
                                     Some(text.trim().to_string())
                                 }
                                 _ => None,
@@ -1238,7 +870,7 @@ fn check_jsx_element(
                             // from properties and store them as propObjectValues for matching.
                             if let Some(JSXAttributeValue::ExpressionContainer(expr)) = &a.value {
                                 let obj_values =
-                                    extract_object_string_values(&expr.expression, source);
+                                    extract_object_string_values(&expr.expression, ctx.source);
                                 if !obj_values.is_empty() {
                                     incident.variables.insert(
                                         "propObjectValues".into(),
@@ -1256,13 +888,13 @@ fn check_jsx_element(
                         // Resolve the owning component's import source so
                         // that the `from` filter can check it. Without this,
                         // JSX_PROP incidents bypass the `from` constraint.
-                        if let Some(module) = import_map.get(&component_name) {
+                        if let Some(module) = ctx.import_map.get(&component_name) {
                             incident
                                 .variables
                                 .insert("module".into(), serde_json::Value::String(module.clone()));
                         }
 
-                        incidents.push(incident);
+                        ctx.incidents.push(incident);
                     }
                 }
             }
@@ -1276,12 +908,12 @@ fn check_jsx_element(
                 if let Some(JSXAttributeValue::ExpressionContainer(expr_container)) = &a.value {
                     check_object_keys_in_expression(
                         &expr_container.expression,
-                        source,
-                        pattern,
-                        file_uri,
+                        ctx.source,
+                        ctx.pattern,
+                        ctx.file_uri,
                         &component_name,
-                        import_map,
-                        incidents,
+                        ctx.import_map,
+                        ctx.incidents,
                     );
                 }
             }
@@ -1293,34 +925,25 @@ fn check_jsx_element(
     for attr in &opening.attributes {
         if let JSXAttributeItem::Attribute(a) = attr {
             if let Some(JSXAttributeValue::ExpressionContainer(expr)) = &a.value {
-                walk_jsx_expression(
-                    &expr.expression,
-                    source,
-                    pattern,
-                    file_uri,
-                    location,
-                    incidents,
-                    Some(&component_name),
-                    import_map,
-                    local_fns,
-                );
+                walk_jsx_expression(&expr.expression, ctx, Some(&component_name));
             }
         }
     }
 
-    // Recurse into children — this element becomes the parent context
+    // Recurse into children.
+    //
+    // If this component is a transparent wrapper (passes {children} through,
+    // identified via cross-file resolution), its children inherit the parent
+    // from above rather than seeing this component as their parent. This makes
+    // conformance rules like "Tbody must be inside Table" work correctly even
+    // when a non-library wrapper like ConditionalTableBody sits between them.
+    let effective_parent = if ctx.transparent_components.contains(&component_name) {
+        parent_name
+    } else {
+        Some(component_name.as_str())
+    };
     for child in &el.children {
-        walk_jsx_child(
-            child,
-            source,
-            pattern,
-            file_uri,
-            location,
-            incidents,
-            Some(&component_name),
-            import_map,
-            local_fns,
-        );
+        walk_jsx_child(child, ctx, effective_parent);
     }
 }
 
@@ -1364,6 +987,7 @@ mod tests {
         let re = Regex::new(pattern).unwrap();
         let import_map = build_import_map(&ret.program);
 
+        let empty_transparent = HashSet::new();
         scan_jsx_file(
             &ret.program.body,
             source,
@@ -1371,6 +995,8 @@ mod tests {
             "file:///test.tsx",
             location,
             &import_map,
+            None,
+            &empty_transparent,
         )
     }
 
@@ -2103,6 +1729,104 @@ const el = <Dropdown>{renderItems()}</Dropdown>;
         assert!(
             !with_parent.is_empty(),
             "Should have at least one incident with parent context from call site"
+        );
+    }
+
+    // ── notChild tests ──────────────────────────────────────────────
+
+    fn scan_source_jsx_not_child(source: &str, pattern: &str, not_child: &str) -> Vec<Incident> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(pattern).unwrap();
+        let not_child_re = Regex::new(not_child).unwrap();
+        let import_map = build_import_map(&ret.program);
+
+        let empty_transparent = HashSet::new();
+        scan_jsx_file(
+            &ret.program.body,
+            source,
+            &re,
+            "file:///test.tsx",
+            Some(&ReferenceLocation::JsxComponent),
+            &import_map,
+            Some(&not_child_re),
+            &empty_transparent,
+        )
+    }
+
+    #[test]
+    fn test_not_child_basic() {
+        let source = r#"
+import { InputGroup, InputGroupItem, TextInput, Button } from '@patternfly/react-core';
+const el = (
+    <InputGroup>
+        <InputGroupItem><TextInput /></InputGroupItem>
+        <TextInput />
+        <Button>Go</Button>
+    </InputGroup>
+);
+"#;
+        let incidents = scan_source_jsx_not_child(
+            source,
+            r"^InputGroup$",
+            r"^(InputGroupItem|InputGroupText)$",
+        );
+        // TextInput and Button are direct children not matching notChild
+        assert_eq!(incidents.len(), 2);
+        let names: Vec<_> = incidents
+            .iter()
+            .map(|i| i.variables["componentName"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"TextInput"));
+        assert!(names.contains(&"Button"));
+        // All should have parentName = InputGroup
+        for inc in &incidents {
+            assert_eq!(inc.variables["parentName"].as_str().unwrap(), "InputGroup");
+        }
+    }
+
+    #[test]
+    fn test_not_child_all_valid() {
+        let source = r#"
+import { InputGroup, InputGroupItem, InputGroupText } from '@patternfly/react-core';
+const el = (
+    <InputGroup>
+        <InputGroupItem><div /></InputGroupItem>
+        <InputGroupText>@</InputGroupText>
+    </InputGroup>
+);
+"#;
+        let incidents = scan_source_jsx_not_child(
+            source,
+            r"^InputGroup$",
+            r"^(InputGroupItem|InputGroupText)$",
+        );
+        // All children match — no incidents
+        assert_eq!(incidents.len(), 0);
+    }
+
+    #[test]
+    fn test_not_child_no_parent_incident() {
+        // When notChild is set, the parent itself should NOT produce an incident
+        let source = r#"
+import { InputGroup, TextInput } from '@patternfly/react-core';
+const el = (
+    <InputGroup>
+        <TextInput />
+    </InputGroup>
+);
+"#;
+        let incidents = scan_source_jsx_not_child(
+            source,
+            r"^InputGroup$",
+            r"^(InputGroupItem|InputGroupText)$",
+        );
+        // Only one incident for TextInput, NOT one for InputGroup itself
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables["componentName"].as_str().unwrap(),
+            "TextInput"
         );
     }
 }

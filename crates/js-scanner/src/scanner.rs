@@ -10,8 +10,11 @@ use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 use regex::Regex;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+use crate::transparency::TransparencyCache;
 
 /// Result of scanning: a list of incidents.
 pub type ScanResult = Vec<Incident>;
@@ -93,10 +96,17 @@ pub fn collect_files(root: &Path, file_pattern: Option<&str>) -> Result<Vec<Path
 /// Returns `(incidents, Option<ParseError>)`. When the parser cannot
 /// recover, `incidents` will be empty and `parse_error` will describe
 /// the failure.
+///
+/// The `transparency_cache` enables cross-file component resolution:
+/// when a JSX parent is a locally-imported wrapper component that passes
+/// `{children}` through, the scanner "sees through" it and assigns the
+/// grandparent as the effective parent. This prevents false positives on
+/// conformance rules that check parent nesting.
 pub fn scan_file_referenced(
     file_path: &Path,
     root: &Path,
     condition: &ReferencedCondition,
+    transparency_cache: &mut TransparencyCache,
 ) -> Result<(ScanResult, Option<ParseError>)> {
     let source = std::fs::read_to_string(file_path)?;
     let source_type = source_type_for_file(file_path, &source);
@@ -130,6 +140,16 @@ pub fn scan_file_referenced(
     // import source (e.g., Button → @patternfly/react-core).
     let import_map = crate::imports::build_import_map(&ret.program);
 
+    // Build the set of transparent (children-passthrough) components
+    // imported into this file. Uses cross-file resolution to parse
+    // locally-imported component source files and determine if they
+    // pass {children} through.
+    let transparent_components =
+        build_transparency_set(file_path, &import_map, root, transparency_cache);
+
+    // Compile optional notChild regex for JSX exclusive-wrapper rules.
+    let not_child_re = condition.not_child.as_deref().map(Regex::new).transpose()?;
+
     // JSX scanning at file level — enables resolving local function calls
     // (e.g., {renderDropdownItems()}) to their bodies for parent context tracing.
     match location {
@@ -141,6 +161,8 @@ pub fn scan_file_referenced(
                 &file_uri,
                 location,
                 &import_map,
+                not_child_re.as_ref(),
+                &transparent_components,
             ));
         }
         _ => {}
@@ -208,6 +230,22 @@ pub fn scan_file_referenced(
         });
     }
 
+    // Negative parent filter: keep incidents where parent does NOT match.
+    // Used for conformance rules like "ModalHeader must be inside Modal" —
+    // fires when ModalHeader is used outside a Modal parent.
+    if let Some(not_parent_pattern) = &condition.not_parent {
+        let not_parent_re = Regex::new(not_parent_pattern)?;
+        incidents.retain(|inc| {
+            if let Some(serde_json::Value::String(name)) = inc.variables.get("parentName") {
+                !not_parent_re.is_match(name)
+            } else {
+                // No parentName = not inside any JSX parent, keep the incident
+                // (component is at the top level, which is wrong for a must-be-in rule)
+                true
+            }
+        });
+    }
+
     // Filter by prop value if specified.
     // Checks both direct propValue (e.g., align="alignRight") and
     // propObjectValues (e.g., align={{ default: "alignRight" }}).
@@ -229,6 +267,13 @@ pub fn scan_file_referenced(
                         false
                     }
                 });
+            }
+            // Check function call first argument value
+            // e.g., getByRole('button') → callArgValue: "button"
+            if let Some(serde_json::Value::String(val)) = inc.variables.get("callArgValue") {
+                if value_re.is_match(val) {
+                    return true;
+                }
             }
             false
         });
@@ -278,6 +323,54 @@ pub fn scan_file_referenced(
     }
 
     Ok((incidents, None))
+}
+
+/// Build the set of transparent component names for a given file.
+///
+/// For each import in the file's import map, checks whether it's a relative
+/// import that can be resolved to a local source file. If so, parses that
+/// file (or uses the cache) to determine which exported components are
+/// children-passthrough wrappers. Returns the set of local names that are
+/// transparent.
+fn build_transparency_set(
+    file_path: &Path,
+    import_map: &std::collections::HashMap<String, String>,
+    root: &Path,
+    cache: &mut TransparencyCache,
+) -> HashSet<String> {
+    let mut transparent = HashSet::new();
+
+    for (local_name, module_source) in import_map {
+        // Try to resolve the import to a local file
+        let resolved = match crate::resolve::resolve_import(file_path, module_source, root) {
+            Some(path) => path,
+            None => continue, // npm package or unresolvable — skip
+        };
+
+        // Check cache first, then analyze
+        let file_transparency = if let Some(cached) = cache.get(&resolved) {
+            cached.clone()
+        } else {
+            let result =
+                crate::transparency::analyze_file_transparency(&resolved).unwrap_or_default();
+            cache.insert(resolved.clone(), result.clone());
+            result
+        };
+
+        // The import map maps local_name → module_source.
+        // The transparency analysis returns component names as declared in the source file.
+        // For named imports (`import { Foo } from './Foo'`), the local name and
+        // exported name may differ (aliasing). We check both the local name and
+        // whether the local name matches any transparent export.
+        //
+        // For the common case (`import { ConditionalTableBody } from './ConditionalTableBody'`),
+        // the local name matches the export name directly.
+        if file_transparency.contains(local_name) {
+            transparent.insert(local_name.clone());
+        }
+    }
+
+    transparent
 }
 
 /// Scan a single file for CSS class name references in JS/TS (className attributes, etc.).
@@ -626,9 +719,13 @@ mod tests {
             from: None,
             parent_from: None,
             file_pattern: None,
+            not_child: None,
+            not_parent: None,
         };
 
-        let (incidents, parse_error) = scan_file_referenced(&file_path, &dir, &condition).unwrap();
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, parse_error) =
+            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
 
         // Should return no incidents (parser couldn't produce an AST)
         assert!(incidents.is_empty());
@@ -670,9 +767,13 @@ mod tests {
             from: None,
             parent_from: None,
             file_pattern: None,
+            not_child: None,
+            not_parent: None,
         };
 
-        let (incidents, parse_error) = scan_file_referenced(&file_path, &dir, &condition).unwrap();
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, parse_error) =
+            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
 
         // Valid file should have no parse error
         assert!(
@@ -683,6 +784,288 @@ mod tests {
         assert!(!incidents.is_empty());
 
         // Cleanup
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Transparent wrapper integration tests ────────────────────────────
+
+    /// Helper: create a project with multiple files and scan one of them.
+    /// Returns the incidents found by `scan_file_referenced`.
+    fn scan_with_wrapper_project(
+        wrapper_source: &str,
+        consumer_source: &str,
+        condition: &ReferencedCondition,
+    ) -> Vec<frontend_core::incident::Incident> {
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_transparency_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        let components_dir = src_dir.join("components");
+        std::fs::create_dir_all(&components_dir).unwrap();
+
+        // Write the wrapper component file
+        std::fs::write(
+            components_dir.join("ConditionalTableBody.tsx"),
+            wrapper_source,
+        )
+        .unwrap();
+
+        // Write the consumer file
+        let consumer_path = src_dir.join("App.tsx");
+        std::fs::write(&consumer_path, consumer_source).unwrap();
+
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&consumer_path, &dir, condition, &mut cache).unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+        incidents
+    }
+
+    #[test]
+    fn test_transparent_wrapper_tbody_gets_table_parent() {
+        // Simulates the real ConditionalTableBody pattern:
+        // <Table><ConditionalTableBody><Tbody/></ConditionalTableBody></Table>
+        // Tbody should see parentName = "Table", not "ConditionalTableBody"
+        let wrapper = r#"
+import React from 'react';
+import { Tbody, Tr, Td } from '@patternfly/react-table';
+
+export const ConditionalTableBody = ({
+    isLoading,
+    isError,
+    children
+}) => (
+    <React.Fragment>
+        {isLoading ? (
+            <Tbody><Tr><Td>Loading...</Td></Tr></Tbody>
+        ) : isError ? (
+            <Tbody><Tr><Td>Error</Td></Tr></Tbody>
+        ) : (
+            children
+        )}
+    </React.Fragment>
+);
+"#;
+
+        let consumer = r#"
+import { Table, Thead, Tbody, Tr, Th, Td } from '@patternfly/react-table';
+import { ConditionalTableBody } from './components/ConditionalTableBody';
+
+const App = () => (
+    <Table aria-label="Example table">
+        <Thead>
+            <Tr><Th>Name</Th></Tr>
+        </Thead>
+        <ConditionalTableBody isLoading={false} isError={false} numRenderedColumns={1}>
+            <Tbody>
+                <Tr><Td>Row 1</Td></Tr>
+            </Tbody>
+        </ConditionalTableBody>
+    </Table>
+);
+"#;
+
+        // Rule: find Tbody, check its parent
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: Some("^Table$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            not_child: None,
+            not_parent: None,
+        };
+
+        let incidents = scan_with_wrapper_project(wrapper, consumer, &condition);
+
+        // Tbody inside ConditionalTableBody should have parentName="Table"
+        // because ConditionalTableBody is transparent, so the parent filter
+        // `parent: ^Table$` should match.
+        assert!(
+            !incidents.is_empty(),
+            "Tbody should match with parent=Table (transparent wrapper collapsed)"
+        );
+
+        // Verify the parentName is actually "Table"
+        let tbody_incident = incidents
+            .iter()
+            .find(|i| i.variables.get("componentName").and_then(|v| v.as_str()) == Some("Tbody"))
+            .expect("Should have a Tbody incident");
+
+        assert_eq!(
+            tbody_incident
+                .variables
+                .get("parentName")
+                .and_then(|v| v.as_str()),
+            Some("Table"),
+            "Tbody's parentName should be 'Table', not 'ConditionalTableBody'"
+        );
+    }
+
+    #[test]
+    fn test_transparent_wrapper_not_parent_rule_no_false_positive() {
+        // Simulates: conformance rule "Tbody must be inside Table"
+        // using notParent: ^Table$. With the wrapper collapsed,
+        // the rule should NOT fire (Tbody IS inside Table).
+        let wrapper = r#"
+import React from 'react';
+export const ConditionalTableBody = ({ children, isLoading }) => (
+    <React.Fragment>
+        {isLoading ? <div>Loading</div> : children}
+    </React.Fragment>
+);
+"#;
+
+        let consumer = r#"
+import { Table, Tbody, Tr, Td } from '@patternfly/react-table';
+import { ConditionalTableBody } from './components/ConditionalTableBody';
+
+const App = () => (
+    <Table>
+        <ConditionalTableBody isLoading={false}>
+            <Tbody><Tr><Td>Data</Td></Tr></Tbody>
+        </ConditionalTableBody>
+    </Table>
+);
+"#;
+
+        // Conformance rule: Tbody must be inside Table (fire when NOT inside Table)
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Table$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            not_child: None,
+        };
+
+        let incidents = scan_with_wrapper_project(wrapper, consumer, &condition);
+
+        // Should find NO incidents: Tbody IS inside Table (wrapper is transparent)
+        assert!(
+            incidents.is_empty(),
+            "notParent rule should not fire — Tbody is inside Table (wrapper collapsed). Got {} incidents",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn test_opaque_component_preserves_parent() {
+        // A component that does NOT pass children through should still
+        // become the parent for its children (existing behavior).
+        let wrapper = r#"
+import React from 'react';
+export const OpaqueWrapper = ({ title }) => (
+    <div>
+        <h1>{title}</h1>
+        <p>No children rendering here</p>
+    </div>
+);
+"#;
+
+        let consumer = r#"
+import { Table, Tbody } from '@patternfly/react-table';
+import { OpaqueWrapper } from './components/ConditionalTableBody';
+
+const App = () => (
+    <Table>
+        <OpaqueWrapper title="hello">
+            <Tbody />
+        </OpaqueWrapper>
+    </Table>
+);
+"#;
+
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: Some("^Table$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            not_child: None,
+            not_parent: None,
+        };
+
+        let incidents = scan_with_wrapper_project(wrapper, consumer, &condition);
+
+        // OpaqueWrapper is NOT transparent, so Tbody should have
+        // parentName="OpaqueWrapper", not "Table". The parent filter
+        // `parent: ^Table$` should NOT match.
+        assert!(
+            incidents.is_empty(),
+            "Tbody inside opaque wrapper should NOT match parent=Table"
+        );
+    }
+
+    #[test]
+    fn test_npm_package_component_not_resolved() {
+        // Components from npm packages should NOT be treated as transparent,
+        // even if they happen to pass children through. Only local imports
+        // are resolved.
+        let consumer = r#"
+import { Table, Tbody } from '@patternfly/react-table';
+import { Bullseye } from '@patternfly/react-core';
+
+const App = () => (
+    <Table>
+        <Bullseye>
+            <Tbody />
+        </Bullseye>
+    </Table>
+);
+"#;
+
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: Some("^Bullseye$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            not_child: None,
+            not_parent: None,
+        };
+
+        // For this test we don't need a wrapper file since Bullseye is from npm
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_npm_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let consumer_path = src_dir.join("App.tsx");
+        std::fs::write(&consumer_path, consumer).unwrap();
+
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&consumer_path, &dir, &condition, &mut cache).unwrap();
+
+        // Tbody should have parentName="Bullseye" (npm component stays opaque)
+        assert!(
+            !incidents.is_empty(),
+            "Tbody should match with parent=Bullseye (npm component is opaque)"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

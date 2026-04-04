@@ -51,9 +51,18 @@ pub fn evaluate_condition(
         ProviderCondition::Referenced(cond) => {
             let files =
                 frontend_js_scanner::scanner::collect_files(root, cond.file_pattern.as_deref())?;
+            // Transparency cache: shared across all file scans within this
+            // rule evaluation. Avoids re-parsing the same imported component
+            // files when multiple scan targets import the same wrappers.
+            let mut transparency_cache =
+                frontend_js_scanner::transparency::TransparencyCache::new();
             for file in files {
-                let (incidents, parse_error) =
-                    frontend_js_scanner::scanner::scan_file_referenced(&file, root, &cond)?;
+                let (incidents, parse_error) = frontend_js_scanner::scanner::scan_file_referenced(
+                    &file,
+                    root,
+                    &cond,
+                    &mut transparency_cache,
+                )?;
                 all_incidents.extend(incidents);
                 if let Some(err) = parse_error {
                     if errored_files.insert(err.file_path.clone()) {
