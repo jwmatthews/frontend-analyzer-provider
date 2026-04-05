@@ -237,6 +237,13 @@ pub fn scan_file_referenced(
         let not_parent_re = Regex::new(not_parent_pattern)?;
         incidents.retain(|inc| {
             if let Some(serde_json::Value::String(name)) = inc.variables.get("parentName") {
+                // React.Fragment is a transparent render boundary — the
+                // component inside it is composed into the correct parent
+                // by the consumer at the call site. Don't fire notParent
+                // rules for these; it's not a real composition violation.
+                if name == "React.Fragment" {
+                    return false;
+                }
                 !not_parent_re.is_match(name)
             } else {
                 // No parentName = not inside any JSX parent, keep the incident
@@ -1064,6 +1071,129 @@ const App = () => (
         assert!(
             !incidents.is_empty(),
             "Tbody should match with parent=Bullseye (npm component is opaque)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_not_parent_suppressed_for_react_fragment() {
+        // Components rendered inside React.Fragment are at a render boundary —
+        // the real parent is supplied by the consumer. notParent rules should
+        // not fire for these.
+        use frontend_core::capabilities::ReferencedCondition;
+
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_fragment_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        // Simulates ConditionalTableBody.tsx: renders <Tbody> inside <React.Fragment>
+        let source = r#"
+import React from 'react';
+import { Tbody, Tr, Td } from '@patternfly/react-table';
+
+export const ConditionalTableBody = ({ isLoading, children }) => (
+    <React.Fragment>
+        {isLoading ? (
+            <Tbody>
+                <Tr><Td>Loading...</Td></Tr>
+            </Tbody>
+        ) : (
+            children
+        )}
+    </React.Fragment>
+);
+"#;
+        let file_path = src_dir.join("ConditionalTableBody.tsx");
+        std::fs::write(&file_path, source).unwrap();
+
+        // Conformance rule: Tbody must be inside Table (fire when NOT inside Table)
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Table$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            not_child: None,
+        };
+
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+
+        // Tbody inside React.Fragment should NOT trigger — it's a render boundary
+        assert!(
+            incidents.is_empty(),
+            "notParent rule should not fire when parent is React.Fragment (render boundary). Got {} incidents",
+            incidents.len()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_not_parent_still_fires_for_wrong_parent() {
+        // When the parent IS a real component (not Fragment) and doesn't match,
+        // the rule should still fire.
+        use frontend_core::capabilities::ReferencedCondition;
+
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_wrong_parent_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let source = r#"
+import { Tbody, Tr } from '@patternfly/react-table';
+import { Card } from '@patternfly/react-core';
+
+const App = () => (
+    <Card>
+        <Tbody>
+            <Tr />
+        </Tbody>
+    </Card>
+);
+"#;
+        let file_path = src_dir.join("App.tsx");
+        std::fs::write(&file_path, source).unwrap();
+
+        // Tbody must be inside Table — Card is wrong
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Table$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            not_child: None,
+        };
+
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+
+        // Tbody inside Card should fire — Card is not Table
+        assert!(
+            !incidents.is_empty(),
+            "notParent rule should fire when parent is a real wrong component"
         );
 
         std::fs::remove_dir_all(&dir).ok();
