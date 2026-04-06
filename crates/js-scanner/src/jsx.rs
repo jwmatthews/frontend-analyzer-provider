@@ -52,6 +52,75 @@ struct ScanContext<'a, 'b> {
 /// Build a map of all function declarations in the AST, including those
 /// nested inside component bodies. Recurses into function/arrow bodies
 /// to find declarations like:
+/// Sentinel parent name for JSX found at the root of a React component
+/// definition (e.g., `const Foo: React.FC = () => <X />`). The real parent
+/// is determined at the consumer's call site, not here.
+const COMPONENT_RETURN_SENTINEL: &str = "__ComponentReturn__";
+
+/// Sentinel parent name for JSX found inside a React hook body
+/// (e.g., `function useMyHook() { return <X />; }`). Hooks always compose
+/// their return values into a parent at the call site.
+const HOOK_RETURN_SENTINEL: &str = "__HookReturn__";
+
+/// Check whether a name follows the React hook naming convention: starts
+/// with `use` followed by an uppercase letter (e.g., `useToolbar`, `useMyHook`).
+fn is_hook_name(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("use") {
+        rest.chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_uppercase())
+    } else {
+        false
+    }
+}
+
+/// Check whether a `VariableDeclarator` has a type annotation that refers to a
+/// React component type (`React.FC`, `React.FunctionComponent`,
+/// `React.ComponentType`, `FC`, `FunctionComponent`).
+///
+/// Handles generic wrappers like `React.FC<Props>`.
+fn has_component_type_annotation(declarator: &VariableDeclarator<'_>, source: &str) -> bool {
+    let annotation = match declarator.type_annotation.as_ref() {
+        Some(a) => a,
+        None => return false,
+    };
+    type_is_react_component(&annotation.type_annotation, source)
+}
+
+/// Return `true` if `ts_type` is a React component type reference.
+fn type_is_react_component(ts_type: &TSType<'_>, source: &str) -> bool {
+    if let TSType::TSTypeReference(type_ref) = ts_type {
+        let span = type_ref.type_name.span();
+        let name = source
+            .get(span.start as usize..span.end as usize)
+            .unwrap_or_default();
+        matches!(
+            name,
+            "React.FC"
+                | "React.FunctionComponent"
+                | "React.ComponentType"
+                | "FC"
+                | "FunctionComponent"
+        )
+    } else {
+        false
+    }
+}
+
+/// Extract a simple binding name from a `BindingPattern`.
+/// Returns `None` for destructured patterns.
+fn binding_name<'a>(binding: &'a BindingPattern<'a>, source: &'a str) -> Option<&'a str> {
+    let span = binding.span();
+    let raw = source.get(span.start as usize..span.end as usize)?;
+    // Strip optional type annotation portion (e.g., "Foo: React.FC" → "Foo")
+    let name = raw.split(':').next().unwrap_or("").trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// ```ts
 /// const MyComponent = () => {
 ///   const renderItems = () => <Item />;  // ← captured
@@ -198,19 +267,36 @@ pub fn scan_jsx(
     incidents
 }
 
+/// If the function declaration is a React hook (name starts with `use` +
+/// uppercase), return the hook sentinel so JSX in its body is treated as
+/// indirect usage. Otherwise, return the passed-in parent unchanged.
+fn fn_decl_effective_parent<'a>(
+    func: &Function<'_>,
+    parent_name: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(ref id) = func.id {
+        if is_hook_name(id.name.as_str()) {
+            return Some(HOOK_RETURN_SENTINEL);
+        }
+    }
+    parent_name
+}
+
 fn walk_statement_for_jsx(stmt: &Statement<'_>, ctx: &mut ScanContext, parent_name: Option<&str>) {
     match stmt {
         Statement::ExportDefaultDeclaration(decl) => {
             if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &decl.declaration {
                 if let Some(body) = &func.body {
-                    walk_function_body(body, ctx, parent_name);
+                    let effective = fn_decl_effective_parent(func, parent_name);
+                    walk_function_body(body, ctx, effective);
                 }
             }
         }
         Statement::ExportNamedDeclaration(decl) => {
             if let Some(Declaration::FunctionDeclaration(func)) = &decl.declaration {
                 if let Some(body) = &func.body {
-                    walk_function_body(body, ctx, parent_name);
+                    let effective = fn_decl_effective_parent(func, parent_name);
+                    walk_function_body(body, ctx, effective);
                 }
             }
             if let Some(Declaration::VariableDeclaration(var_decl)) = &decl.declaration {
@@ -219,7 +305,8 @@ fn walk_statement_for_jsx(stmt: &Statement<'_>, ctx: &mut ScanContext, parent_na
         }
         Statement::FunctionDeclaration(func) => {
             if let Some(body) = &func.body {
-                walk_function_body(body, ctx, parent_name);
+                let effective = fn_decl_effective_parent(func, parent_name);
+                walk_function_body(body, ctx, effective);
             }
         }
         Statement::VariableDeclaration(var_decl) => {
@@ -270,7 +357,22 @@ fn walk_variable_declaration(
         }
 
         if let Some(init) = &declarator.init {
-            walk_expression_for_jsx(init, ctx, parent_name);
+            // Detect component/hook boundaries to set sentinel parents.
+            //
+            // When a variable is typed as React.FC (or similar), JSX inside
+            // the initializer is a component definition — its real parent
+            // will be determined at the consumer's call site, not here.
+            //
+            // When a variable name follows the React hook convention (use*),
+            // any JSX in its body is indirect usage composed elsewhere.
+            let effective_parent = if has_component_type_annotation(declarator, ctx.source) {
+                Some(COMPONENT_RETURN_SENTINEL)
+            } else if binding_name(&declarator.id, ctx.source).map_or(false, is_hook_name) {
+                Some(HOOK_RETURN_SENTINEL)
+            } else {
+                parent_name
+            };
+            walk_expression_for_jsx(init, ctx, effective_parent);
         }
     }
 }
@@ -1827,6 +1929,250 @@ const el = (
         assert_eq!(
             incidents[0].variables["componentName"].as_str().unwrap(),
             "TextInput"
+        );
+    }
+
+    // ── Component boundary sentinel tests ───────────────────────────
+
+    #[test]
+    fn test_is_hook_name() {
+        assert!(is_hook_name("useToolbar"));
+        assert!(is_hook_name("useMyCustomHook"));
+        assert!(is_hook_name("useState"));
+        assert!(!is_hook_name("use")); // no uppercase after "use"
+        assert!(!is_hook_name("used")); // lowercase after "use"
+        assert!(!is_hook_name("notAHook"));
+        assert!(!is_hook_name("User")); // starts with U, not "use"
+        assert!(!is_hook_name(""));
+    }
+
+    #[test]
+    fn test_hook_function_decl_sets_sentinel_parent() {
+        // function useMyHook() { return <ToolbarItem />; }
+        // ToolbarItem should get parentName = "__HookReturn__"
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+function useMyToolbar() {
+    return <ToolbarItem>Action</ToolbarItem>;
+}
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String("__HookReturn__".to_string())),
+            "Hook function decl should set __HookReturn__ sentinel. Got: {:?}",
+            incidents[0].variables
+        );
+    }
+
+    #[test]
+    fn test_hook_arrow_function_sets_sentinel_parent() {
+        // const useMyHook = () => <ToolbarItem />;
+        // ToolbarItem should get parentName = "__HookReturn__"
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+const useMyToolbar = () => {
+    return <ToolbarItem>Action</ToolbarItem>;
+};
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String("__HookReturn__".to_string())),
+            "Hook arrow function should set __HookReturn__ sentinel. Got: {:?}",
+            incidents[0].variables
+        );
+    }
+
+    #[test]
+    fn test_hook_returning_react_fc_sets_sentinel() {
+        // function useMyHook() { return () => <ToolbarItem />; }
+        // The inner arrow function's JSX still inherits __HookReturn__
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+function useMyToolbar() {
+    return () => (
+        <ToolbarItem>Action</ToolbarItem>
+    );
+}
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String("__HookReturn__".to_string())),
+            "Hook returning arrow FC should propagate __HookReturn__ sentinel. Got: {:?}",
+            incidents[0].variables
+        );
+    }
+
+    #[test]
+    fn test_hook_nested_jsx_gets_correct_parent() {
+        // function useMyHook() { return <Toolbar><ToolbarItem /></Toolbar>; }
+        // ToolbarItem should get parentName = "Toolbar", NOT __HookReturn__
+        let source = r#"
+import { Toolbar, ToolbarItem } from '@patternfly/react-core';
+function useMyToolbar() {
+    return (
+        <Toolbar>
+            <ToolbarItem>Action</ToolbarItem>
+        </Toolbar>
+    );
+}
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String("Toolbar".to_string())),
+            "Nested JSX inside hook should get normal component parent. Got: {:?}",
+            incidents[0].variables
+        );
+    }
+
+    #[test]
+    fn test_react_fc_type_annotation_sets_sentinel_parent() {
+        // const MyComponent: React.FC = () => <ToolbarItem />;
+        // ToolbarItem should get parentName = "__ComponentReturn__"
+        let source = r#"
+import React from 'react';
+import { ToolbarItem } from '@patternfly/react-core';
+const MyToolbarActions: React.FC = () => (
+    <ToolbarItem>Action</ToolbarItem>
+);
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String(
+                "__ComponentReturn__".to_string()
+            )),
+            "React.FC typed component should set __ComponentReturn__ sentinel. Got: {:?}",
+            incidents[0].variables
+        );
+    }
+
+    #[test]
+    fn test_react_fc_with_generic_sets_sentinel_parent() {
+        // const Foo: React.FC<Props> = () => <ToolbarItem />;
+        let source = r#"
+import React from 'react';
+import { ToolbarItem } from '@patternfly/react-core';
+const MyToolbar: React.FC<MyProps> = () => (
+    <ToolbarItem>Action</ToolbarItem>
+);
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String(
+                "__ComponentReturn__".to_string()
+            )),
+            "React.FC<Props> typed component should set __ComponentReturn__ sentinel. Got: {:?}",
+            incidents[0].variables
+        );
+    }
+
+    #[test]
+    fn test_regular_component_no_sentinel() {
+        // const App = () => <ToolbarItem />;
+        // No React.FC annotation, not a hook — should have NO parentName (no sentinel)
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+const App = () => (
+    <ToolbarItem>Action</ToolbarItem>
+);
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert!(
+            incidents[0].variables.get("parentName").is_none(),
+            "Regular component without annotation should have no parentName. Got: {:?}",
+            incidents[0].variables
+        );
+    }
+
+    #[test]
+    fn test_wrong_parent_inside_hook_still_tracked() {
+        // function useMyHook() { return <Card><ToolbarItem /></Card>; }
+        // ToolbarItem has parentName = "Card" (a real wrong parent)
+        let source = r#"
+import { Card } from '@patternfly/react-core';
+import { ToolbarItem } from '@patternfly/react-core';
+function useMyHook() {
+    return (
+        <Card>
+            <ToolbarItem>Action</ToolbarItem>
+        </Card>
+    );
+}
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String("Card".to_string())),
+            "Wrong parent inside hook should still track the real component parent. Got: {:?}",
+            incidents[0].variables
+        );
+    }
+
+    #[test]
+    fn test_exported_hook_function_decl_sets_sentinel() {
+        // export function useMyHook() { return <ToolbarItem />; }
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+export function useMyToolbar() {
+    return <ToolbarItem>Action</ToolbarItem>;
+}
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String("__HookReturn__".to_string())),
+            "Exported hook should set __HookReturn__ sentinel. Got: {:?}",
+            incidents[0].variables
         );
     }
 }

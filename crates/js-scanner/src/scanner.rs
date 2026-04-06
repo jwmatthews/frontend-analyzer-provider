@@ -237,11 +237,17 @@ pub fn scan_file_referenced(
         let not_parent_re = Regex::new(not_parent_pattern)?;
         incidents.retain(|inc| {
             if let Some(serde_json::Value::String(name)) = inc.variables.get("parentName") {
-                // React.Fragment is a transparent render boundary — the
-                // component inside it is composed into the correct parent
-                // by the consumer at the call site. Don't fire notParent
-                // rules for these; it's not a real composition violation.
-                if name == "React.Fragment" {
+                // Render boundaries: the component inside these is composed
+                // into the correct parent by the consumer at the call site.
+                // Don't fire notParent rules — it's not a real composition
+                // violation.
+                //
+                // - React.Fragment: transparent wrapper, real parent at call site.
+                // - __ComponentReturn__: JSX inside a React.FC-typed component
+                //   definition; parent determined by the consumer.
+                // - __HookReturn__: JSX inside a React hook (use*) body;
+                //   always composed into a parent at the call site.
+                if name == "React.Fragment" || name.starts_with("__") {
                     return false;
                 }
                 !not_parent_re.is_match(name)
@@ -1194,6 +1200,171 @@ const App = () => (
         assert!(
             !incidents.is_empty(),
             "notParent rule should fire when parent is a real wrong component"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_not_parent_suppressed_for_hook_returning_jsx() {
+        // A hook returning JSX directly: the component has no real parent,
+        // but it's a render boundary — notParent should NOT fire.
+        use frontend_core::capabilities::ReferencedCondition;
+
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_hook_return_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let source = r#"
+import { ToolbarItem } from '@patternfly/react-core';
+
+export function useToolbarActions() {
+    return <ToolbarItem>Action</ToolbarItem>;
+}
+"#;
+        let file_path = src_dir.join("useToolbarActions.tsx");
+        std::fs::write(&file_path, source).unwrap();
+
+        // Conformance rule: ToolbarItem must be inside Toolbar
+        let condition = ReferencedCondition {
+            pattern: "^ToolbarItem$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Toolbar$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-core".to_string()),
+            file_pattern: None,
+            not_child: None,
+        };
+
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+
+        // ToolbarItem inside a hook is a render boundary — should NOT fire
+        assert!(
+            incidents.is_empty(),
+            "notParent should not fire for JSX inside a hook (render boundary). Got {} incidents: {:?}",
+            incidents.len(),
+            incidents.iter().map(|i| &i.variables).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_not_parent_suppressed_for_react_fc_component() {
+        // A React.FC typed component: the real parent is at the call site.
+        use frontend_core::capabilities::ReferencedCondition;
+
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_react_fc_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let source = r#"
+import React from 'react';
+import { ToolbarItem } from '@patternfly/react-core';
+
+export const ToolbarActions: React.FC = () => (
+    <ToolbarItem>Action</ToolbarItem>
+);
+"#;
+        let file_path = src_dir.join("ToolbarActions.tsx");
+        std::fs::write(&file_path, source).unwrap();
+
+        let condition = ReferencedCondition {
+            pattern: "^ToolbarItem$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Toolbar$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-core".to_string()),
+            file_pattern: None,
+            not_child: None,
+        };
+
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+
+        assert!(
+            incidents.is_empty(),
+            "notParent should not fire for JSX inside a React.FC component. Got {} incidents: {:?}",
+            incidents.len(),
+            incidents.iter().map(|i| &i.variables).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_not_parent_still_fires_for_wrong_parent_inside_hook() {
+        // Even inside a hook, if a component has a REAL wrong parent,
+        // the rule should still fire.
+        use frontend_core::capabilities::ReferencedCondition;
+
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_hook_wrong_parent_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let source = r#"
+import { Card } from '@patternfly/react-core';
+import { ToolbarItem } from '@patternfly/react-core';
+
+export function useMyHook() {
+    return (
+        <Card>
+            <ToolbarItem>Action</ToolbarItem>
+        </Card>
+    );
+}
+"#;
+        let file_path = src_dir.join("useMyHook.tsx");
+        std::fs::write(&file_path, source).unwrap();
+
+        let condition = ReferencedCondition {
+            pattern: "^ToolbarItem$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Toolbar$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-core".to_string()),
+            file_pattern: None,
+            not_child: None,
+        };
+
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+
+        // ToolbarItem inside Card (wrong parent) should still fire
+        assert!(
+            !incidents.is_empty(),
+            "notParent should fire when JSX has a real wrong parent inside a hook"
         );
 
         std::fs::remove_dir_all(&dir).ok();
