@@ -150,6 +150,9 @@ struct MergedLlmFixRequest {
     message: String,
     /// Code snippets keyed by line number.
     code_snips: Vec<(u32, String)>,
+    /// Component family (e.g., "Modal", "Select") extracted from labels.
+    /// Used to group related rules in the batch prompt.
+    family: Option<String>,
 }
 
 /// Merge LLM fix requests by rule_id, preserving insertion order.
@@ -175,12 +178,19 @@ fn merge_by_rule_id(requests: &[&LlmFixRequest]) -> Vec<MergedLlmFixRequest> {
                 .as_ref()
                 .map(|s| vec![(req.line, s.clone())])
                 .unwrap_or_default();
+            let family = req
+                .labels
+                .iter()
+                .find(|l| l.starts_with("family="))
+                .and_then(|l| l.strip_prefix("family="))
+                .map(|s| s.to_string());
             merged.push(MergedLlmFixRequest {
                 rule_id: req.rule_id.clone(),
                 file_path: req.file_path.clone(),
                 lines: vec![req.line],
                 message: req.message.clone(),
                 code_snips,
+                family,
             });
         }
     }
@@ -450,8 +460,48 @@ fn process_single_file(
             }
         }
     } else {
-        let chunks: Vec<&[MergedLlmFixRequest]> =
-            file_requests.chunks(max_fixes_per_batch).collect();
+        // Build family-aware chunks. Rules from the same component family
+        // must stay in the same chunk so the LLM sees the full migration
+        // (composition + prop→child + conformance) as one coherent change.
+        // A family group is treated as one logical unit regardless of size.
+        let chunks: Vec<Vec<&MergedLlmFixRequest>> = {
+            let mut result: Vec<Vec<&MergedLlmFixRequest>> = Vec::new();
+            let mut current_chunk: Vec<&MergedLlmFixRequest> = Vec::new();
+            let mut current_families: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            for req in file_requests.iter() {
+                if let Some(ref fam) = req.family {
+                    if current_families.contains(fam) {
+                        // Same family — always add to current chunk
+                        current_chunk.push(req);
+                    } else if current_chunk.len() >= max_fixes_per_batch
+                        && !current_chunk.is_empty()
+                    {
+                        // New family and chunk is full — start new chunk
+                        result.push(std::mem::take(&mut current_chunk));
+                        current_families.clear();
+                        current_families.insert(fam.clone());
+                        current_chunk.push(req);
+                    } else {
+                        // New family, chunk has room
+                        current_families.insert(fam.clone());
+                        current_chunk.push(req);
+                    }
+                } else {
+                    // No family — add to current chunk, respect size limit
+                    if current_chunk.len() >= max_fixes_per_batch {
+                        result.push(std::mem::take(&mut current_chunk));
+                        current_families.clear();
+                    }
+                    current_chunk.push(req);
+                }
+            }
+            if !current_chunk.is_empty() {
+                result.push(current_chunk);
+            }
+            result
+        };
         let chunk_count = chunks.len();
 
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
@@ -465,7 +515,8 @@ fn process_single_file(
                 );
             }
 
-            let chunk_refs: Vec<&MergedLlmFixRequest> = chunk.iter().collect();
+            let chunk_refs: Vec<&MergedLlmFixRequest> = chunk.iter().copied().collect();
+
             let prompt = build_batch_prompt_with_context(
                 file_path,
                 &chunk_refs,
@@ -839,35 +890,23 @@ Before writing, reason through the fix step by step to ensure nothing is missed.
     )
 }
 
-fn build_batch_prompt_with_context(
-    file_path: &std::path::Path,
-    requests: &[&MergedLlmFixRequest],
-    previously_applied: Option<&[String]>,
-    ctx: &dyn FixContext,
-) -> String {
-    // Requests are already merged by rule_id and sorted by priority upstream
-    // (in run_all_goose_fixes). We iterate directly in the provided order
-    // so that hierarchy composition rules (priority 0) appear first in the
-    // prompt, giving them the most LLM attention.
-    let mut fixes = String::new();
-    for (idx, req) in requests.iter().enumerate() {
-        let fix_num = idx + 1;
-        let lines_display = req
-            .lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+/// Format a single fix entry in the batch prompt.
+fn format_fix_entry(fixes: &mut String, fix_num: usize, req: &MergedLlmFixRequest) {
+    let lines_display = req
+        .lines
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
 
-        if req.lines.len() == 1 {
-            // Single incident
-            let code_context = req
-                .code_snips
-                .first()
-                .map(|(_, s)| s.as_str())
-                .unwrap_or("(no snippet)");
-            fixes.push_str(&format!(
-                r#"
+    if req.lines.len() == 1 {
+        let code_context = req
+            .code_snips
+            .first()
+            .map(|(_, s)| s.as_str())
+            .unwrap_or("(no snippet)");
+        fixes.push_str(&format!(
+            r#"
 ### Fix {num}
 Line: {line}
 Rule [{rule_id}]:
@@ -878,20 +917,19 @@ Code context:
 {code_context}
 ```
 "#,
-                num = fix_num,
-                line = lines_display,
-                rule_id = req.rule_id,
-                message = req.message,
-                code_context = code_context,
-            ));
-        } else {
-            // Multiple incidents from the same rule
-            let mut all_snippets = String::new();
-            for (line, snip) in &req.code_snips {
-                all_snippets.push_str(&format!("  (line {}):\n{}\n", line, snip));
-            }
-            fixes.push_str(&format!(
-                r#"
+            num = fix_num,
+            line = lines_display,
+            rule_id = req.rule_id,
+            message = req.message,
+            code_context = code_context,
+        ));
+    } else {
+        let mut all_snippets = String::new();
+        for (line, snip) in &req.code_snips {
+            all_snippets.push_str(&format!("  (line {}):\n{}\n", line, snip));
+        }
+        fixes.push_str(&format!(
+            r#"
 ### Fix {num}
 Lines: {lines}
 Rule [{rule_id}]:
@@ -903,13 +941,63 @@ Code contexts:
 ```
 {all_snippets}```
 "#,
-                num = fix_num,
-                lines = lines_display,
-                rule_id = req.rule_id,
-                message = req.message,
-                all_snippets = all_snippets,
+            num = fix_num,
+            lines = lines_display,
+            rule_id = req.rule_id,
+            message = req.message,
+            all_snippets = all_snippets,
+        ));
+    }
+}
+
+fn build_batch_prompt_with_context(
+    file_path: &std::path::Path,
+    requests: &[&MergedLlmFixRequest],
+    previously_applied: Option<&[String]>,
+    ctx: &dyn FixContext,
+) -> String {
+    // Group requests by component family so the LLM sees related rules
+    // as one coherent migration (e.g., all Modal prop→child + composition
+    // rules together) rather than independent fixes.
+    let mut fixes = String::new();
+    let mut fix_num = 0usize;
+
+    // Partition into family-grouped and ungrouped
+    let mut family_groups: std::collections::BTreeMap<String, Vec<&MergedLlmFixRequest>> =
+        std::collections::BTreeMap::new();
+    let mut ungrouped: Vec<&MergedLlmFixRequest> = Vec::new();
+
+    for req in requests.iter() {
+        if let Some(ref fam) = req.family {
+            family_groups.entry(fam.clone()).or_default().push(req);
+        } else {
+            ungrouped.push(req);
+        }
+    }
+
+    // Emit family-grouped fixes first (they're higher priority structurally)
+    for (family, group) in &family_groups {
+        if group.len() > 1 {
+            fixes.push_str(&format!(
+                "\n## {} Migration (apply as ONE coherent change)\n\
+                 The following {} rules are all part of the {} component family migration.\n\
+                 Apply them together — they describe different aspects of the same restructuring.\n",
+                family,
+                group.len(),
+                family,
             ));
         }
+
+        for req in group {
+            fix_num += 1;
+            format_fix_entry(&mut fixes, fix_num, req);
+        }
+    }
+
+    // Then emit ungrouped fixes
+    for req in &ungrouped {
+        fix_num += 1;
+        format_fix_entry(&mut fixes, fix_num, req);
     }
 
     let revert_warning = ctx.revert_warnings().unwrap_or("");

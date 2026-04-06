@@ -41,6 +41,12 @@ pub struct ReferencedCondition {
     /// When set, only matches components that are direct children of a parent
     /// JSX element whose name matches this pattern.
     pub parent: Option<String>,
+    /// Negative parent filter for JSX_COMPONENT location.
+    /// When set, only matches components whose parent does NOT match this pattern.
+    /// Used for conformance rules like "ModalHeader must be inside Modal" —
+    /// fires when ModalHeader's parent is not Modal.
+    #[serde(rename = "notParent", skip_serializing_if = "Option::is_none")]
+    pub not_parent: Option<String>,
     /// Optional parent import source filter for JSX_COMPONENT location.
     /// When set, only matches when the parent JSX component was imported from
     /// a module whose path matches this pattern. Requires `parent` to be set.
@@ -53,6 +59,13 @@ pub struct ReferencedCondition {
     /// Matches against string literal values (e.g., variant="plain") and
     /// JSX expression text (e.g., variant={SelectVariant.checkbox}).
     pub value: Option<String>,
+    /// Negative child filter for JSX_COMPONENT location.
+    /// When set, matches the component specified by `pattern` and emits an
+    /// incident for each direct JSX child whose name does NOT match this
+    /// pattern. Used for "exclusive wrapper" rules like "all children of
+    /// InputGroup must be InputGroupItem or InputGroupText."
+    #[serde(rename = "notChild", skip_serializing_if = "Option::is_none")]
+    pub not_child: Option<String>,
     /// Optional import source path filter for IMPORT location.
     /// When set, only matches imports from modules whose path matches this pattern.
     /// Example: `from: "@patternfly/react-core/deprecated"` matches

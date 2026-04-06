@@ -87,6 +87,49 @@ fn walk_statement(
                 walk_statement(alt, source, pattern, file_uri, incidents);
             }
         }
+        Statement::ForStatement(f) => {
+            walk_statement(&f.body, source, pattern, file_uri, incidents);
+        }
+        Statement::ForInStatement(f) => {
+            walk_statement(&f.body, source, pattern, file_uri, incidents);
+        }
+        Statement::ForOfStatement(f) => {
+            walk_statement(&f.body, source, pattern, file_uri, incidents);
+        }
+        Statement::WhileStatement(w) => {
+            walk_statement(&w.body, source, pattern, file_uri, incidents);
+        }
+        Statement::DoWhileStatement(d) => {
+            walk_statement(&d.body, source, pattern, file_uri, incidents);
+        }
+        Statement::SwitchStatement(s) => {
+            for case in &s.cases {
+                for stmt in &case.consequent {
+                    walk_statement(stmt, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        Statement::TryStatement(t) => {
+            for s in &t.block.body {
+                walk_statement(s, source, pattern, file_uri, incidents);
+            }
+            if let Some(handler) = &t.handler {
+                for s in &handler.body.body {
+                    walk_statement(s, source, pattern, file_uri, incidents);
+                }
+            }
+            if let Some(finalizer) = &t.finalizer {
+                for s in &finalizer.body {
+                    walk_statement(s, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        Statement::LabeledStatement(l) => {
+            walk_statement(&l.body, source, pattern, file_uri, incidents);
+        }
+        Statement::ThrowStatement(t) => {
+            walk_expr(&t.argument, source, pattern, file_uri, incidents);
+        }
         _ => {}
     }
 }
@@ -181,6 +224,68 @@ fn walk_expr(
         }
         Expression::TSTypeAssertion(ts) => {
             walk_expr(&ts.expression, source, pattern, file_uri, incidents);
+        }
+        // Optional chaining: items?.map((item) => <div className="pf-v5-...">)
+        Expression::ChainExpression(chain) => match &chain.expression {
+            ChainElement::CallExpression(call) => {
+                for arg in &call.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        walk_expr(e, source, pattern, file_uri, incidents);
+                    }
+                }
+            }
+            _ => {}
+        },
+        // Await/yield: const el = await getElement(); may contain JSX
+        Expression::AwaitExpression(a) => {
+            walk_expr(&a.argument, source, pattern, file_uri, incidents);
+        }
+        Expression::YieldExpression(y) => {
+            if let Some(arg) = &y.argument {
+                walk_expr(arg, source, pattern, file_uri, incidents);
+            }
+        }
+        // Sequence: (expr1, expr2) — last expression may be JSX
+        Expression::SequenceExpression(seq) => {
+            for e in &seq.expressions {
+                walk_expr(e, source, pattern, file_uri, incidents);
+            }
+        }
+        // Assignment: variable = <div className="...">
+        Expression::AssignmentExpression(assign) => {
+            walk_expr(&assign.right, source, pattern, file_uri, incidents);
+        }
+        // new Constructor(<div className="...">)
+        Expression::NewExpression(new_expr) => {
+            for arg in &new_expr.arguments {
+                if let Some(e) = arg.as_expression() {
+                    walk_expr(e, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        // Tagged templates: css`...pf-v5-...`
+        Expression::TaggedTemplateExpression(tagged) => {
+            for quasi in &tagged.quasi.quasis {
+                let raw = quasi.value.raw.as_str();
+                if pattern.is_match(raw) {
+                    let span = quasi.span();
+                    let mut incident = make_incident(source, file_uri, span.start, span.end);
+                    incident.variables.insert(
+                        "matchingText".into(),
+                        serde_json::Value::String(raw.to_string()),
+                    );
+                    incidents.push(incident);
+                }
+            }
+        }
+        // Static member expressions: styles.className (walk object in case it's complex)
+        Expression::StaticMemberExpression(member) => {
+            walk_expr(&member.object, source, pattern, file_uri, incidents);
+        }
+        // Computed member: obj[expr] — walk both
+        Expression::ComputedMemberExpression(member) => {
+            walk_expr(&member.object, source, pattern, file_uri, incidents);
+            walk_expr(&member.expression, source, pattern, file_uri, incidents);
         }
         _ => {}
     }
@@ -406,6 +511,86 @@ mod tests {
             1,
             "Should find pf-v5 inside prop value ternary"
         );
+    }
+
+    #[test]
+    fn test_classname_inside_optional_chain_map() {
+        // Bug: items?.map() is a ChainExpression — was not traversed
+        let source = r#"
+            const Table: React.FC = () => {
+                return (
+                    <tbody>{currentPageItems?.map((item) => (
+                        <tr>
+                            <td className="pf-v5-c-tooltip__content">text</td>
+                        </tr>
+                    ))}</tbody>
+                );
+            };
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find pf-v5 inside optional chain .map() callback"
+        );
+    }
+
+    #[test]
+    fn test_classname_inside_optional_chain_filter_map() {
+        // Chained optional: items?.filter(...)?.map(...)
+        let source = r#"
+            const el = <ul>{items?.filter(Boolean)?.map((item) => (
+                <li className="pf-v5-c-tabs__item">text</li>
+            ))}</ul>;
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_classname_inside_for_loop() {
+        let source = r#"
+            function render() {
+                const els = [];
+                for (let i = 0; i < items.length; i++) {
+                    els.push(<div className="pf-v5-c-button">btn</div>);
+                }
+                return els;
+            }
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(incidents.len(), 1, "Should find pf-v5 inside for loop");
+    }
+
+    #[test]
+    fn test_classname_inside_switch() {
+        let source = r#"
+            function render(type: string) {
+                switch (type) {
+                    case "a":
+                        return <div className="pf-v5-c-alert">alert</div>;
+                    default:
+                        return null;
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(incidents.len(), 1, "Should find pf-v5 inside switch");
+    }
+
+    #[test]
+    fn test_classname_inside_try_catch() {
+        let source = r#"
+            function render() {
+                try {
+                    return <div className="pf-v5-c-card">card</div>;
+                } catch (e) {
+                    return <span className="pf-v5-c-alert">error</span>;
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(incidents.len(), 2, "Should find pf-v5 in try and catch");
     }
 
     #[test]

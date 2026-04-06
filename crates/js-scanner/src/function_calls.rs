@@ -108,6 +108,17 @@ fn walk_expr(
                         "functionName".into(),
                         serde_json::Value::String(name.clone()),
                     );
+                    // Extract the first string argument value for matching.
+                    // e.g., getByRole('button') → callArgValue: "button"
+                    //        getByLabelText('Close') → callArgValue: "Close"
+                    if let Some(first_arg) = call.arguments.first() {
+                        if let Some(Expression::StringLiteral(s)) = first_arg.as_expression() {
+                            incident.variables.insert(
+                                "callArgValue".into(),
+                                serde_json::Value::String(s.value.to_string()),
+                            );
+                        }
+                    }
                     incidents.push(incident);
                 }
             }
@@ -212,5 +223,46 @@ mod tests {
     fn test_nested_function_call_in_arguments() {
         let incidents = scan_source("console.log(useToolbar());", r"^useToolbar$");
         assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_function_call_string_arg_extracted() {
+        let incidents = scan_source(
+            "const el = screen.getByRole('button');",
+            r"^screen\.getByRole$",
+        );
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("callArgValue"),
+            Some(&serde_json::Value::String("button".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_function_call_string_arg_getbylabeltext() {
+        let incidents = scan_source("const el = getByLabelText('Close');", r"^getByLabelText$");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("callArgValue"),
+            Some(&serde_json::Value::String("Close".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_function_call_no_string_arg() {
+        let incidents = scan_source("const el = getByRole(someVariable);", r"^getByRole$");
+        assert_eq!(incidents.len(), 1);
+        assert!(
+            incidents[0].variables.get("callArgValue").is_none(),
+            "Non-string argument should not produce callArgValue"
+        );
+    }
+
+    #[test]
+    fn test_function_call_regex_arg() {
+        // getByText with regex arg — should not extract
+        let incidents = scan_source("const el = getByText(/hello/i);", r"^getByText$");
+        assert_eq!(incidents.len(), 1);
+        assert!(incidents[0].variables.get("callArgValue").is_none());
     }
 }

@@ -84,6 +84,10 @@ pub struct LlmFixRequest {
     pub code_snip: Option<String>,
     /// The full source content of the file (for context).
     pub source: Option<String>,
+    /// Labels from the violation (e.g., "family=Modal", "change-type=prop-to-child").
+    /// Used to coalesce related rules into coherent migration groups.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 /// Result of applying a fix plan.
@@ -200,6 +204,13 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
         }
         "PropValueChange" | "PropTypeChange" => FixStrategy::Llm,
         "LlmAssisted" => FixStrategy::Llm,
+        // v2 SD-pipeline strategies — these require structural JSX
+        // transformations that only the LLM can handle.
+        "ChildToProp"
+        | "PropToChild"
+        | "PropToChildren"
+        | "CompositionChange"
+        | "DeprecatedMigration" => FixStrategy::Llm,
         _ => FixStrategy::Manual,
     }
 }

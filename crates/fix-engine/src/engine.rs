@@ -117,6 +117,7 @@ pub fn plan_fixes(
                             message: incident.message.clone(),
                             code_snip: incident.code_snip.clone(),
                             source: None, // filled lazily if LLM is invoked
+                            labels: violation.labels.clone(),
                         });
                     }
                 }

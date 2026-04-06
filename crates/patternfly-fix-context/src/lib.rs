@@ -96,7 +96,12 @@ impl FixContext for PatternFlyV5ToV6Context {
          NEW:<replacement text>\n\
          ```\n\n\
          You may output multiple fix blocks. Do not include any explanation outside \
-         the fix blocks. Only output fixes for lines that need to change."
+         the fix blocks. Only output fixes for lines that need to change.\n\n\
+         IMPORTANT: After applying your fixes, check the import statements at the top \
+         of the file. If any imported names are no longer referenced in the file body, \
+         remove those specifiers from the import. If removing the last specifier from \
+         an import line, remove the entire import line. Output fix blocks for any \
+         import cleanup needed."
             .to_string()
     }
 }
