@@ -875,7 +875,7 @@ Code context:
 Instructions:
 1. Read the file at {file_path}
 2. Apply ONLY the change described by the migration rule at or near line {lines}
-3. Make the minimum edit necessary — do not change unrelated code
+3. Make the minimum edit necessary — do not change unrelated code, but DO clean up any artifacts caused by your change (e.g., remove imports that are no longer referenced, delete dead declarations)
 4. Write the fixed file
 {constraints_section}
 
@@ -1029,6 +1029,11 @@ fn build_batch_prompt_with_context(
         format!("\nIMPORTANT constraints:\n{}", lines.join("\n"))
     };
 
+    let verification_section = ctx
+        .verification_prompt()
+        .map(|v| format!("\n{}\n", v))
+        .unwrap_or_default();
+
     format!(
         r#"You are applying {migration_desc} fixes to a single file.
 
@@ -1039,19 +1044,14 @@ Apply ALL of the following {count} fixes to this file:
 Instructions:
 1. Read the file at {file_path}
 2. Process each fix INDEPENDENTLY in sequence. For each fix:
-   a. Identify the exact code affected (line number, prop, component)
-   b. Determine the specific change needed (add/remove/move import, restructure JSX, migrate prop)
-   c. If a prop is being relocated to a child component, note the child component that must be created
-   d. Track the change for the final write
-3. Make the minimum edits necessary — do not change unrelated code
+   a. Identify the exact code affected (line number and affected element)
+   b. Determine the specific change needed ({change_examples})
+   c. Track all changes for the final write
+3. Make the minimum edits necessary — do not change unrelated code, but DO clean up any artifacts caused by your changes (e.g., remove imports that are no longer referenced, delete dead declarations)
 4. Do NOT revert any changes that were already applied in previous passes
 5. Write the fixed file once with ALL changes from every fix applied
 {constraints_section}
-
-VERIFICATION: After making edits, check that EVERY removed prop listed in the migration rules
-has been migrated to its specified child component. Do NOT declare a migration "already applied"
-unless ALL listed child components are present AND all removed props are accounted for.
-
+{verification_section}
 Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it."#,
         migration_desc = ctx.migration_description(),
         file_path = file_path.display(),
@@ -1059,6 +1059,8 @@ Before writing, reason through each fix step by step to ensure nothing is missed
         count = requests.len(),
         fixes = fixes,
         constraints_section = constraints_section,
+        change_examples = ctx.change_type_examples(),
+        verification_section = verification_section,
     )
 }
 

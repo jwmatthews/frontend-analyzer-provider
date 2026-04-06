@@ -41,6 +41,24 @@ pub trait FixContext: Send + Sync {
         3
     }
 
+    /// Examples of change types for LLM prompt context.
+    ///
+    /// Used in batch prompts to describe the kinds of changes the LLM should
+    /// look for. Should be a parenthetical list of language-specific actions.
+    ///
+    /// Default: generic description suitable for any language.
+    fn change_type_examples(&self) -> &str {
+        "add/remove/rename identifiers, update references"
+    }
+
+    /// Optional verification instructions appended to the LLM batch prompt.
+    ///
+    /// Framework-specific checks the LLM should perform after applying fixes.
+    /// Returns `None` if no verification instructions are needed.
+    fn verification_prompt(&self) -> Option<&str> {
+        None
+    }
+
     /// System prompt for the OpenAI-compatible LLM client.
     ///
     /// Default implementation builds a generic prompt from `migration_description()`.

@@ -86,6 +86,18 @@ impl FixContext for PatternFlyV5ToV6Context {
         }
     }
 
+    fn change_type_examples(&self) -> &str {
+        "add/remove/move import, restructure JSX, migrate prop"
+    }
+
+    fn verification_prompt(&self) -> Option<&str> {
+        Some(
+            "VERIFICATION: After making edits, check that EVERY removed prop listed in the migration rules \
+             has been migrated to its specified child component. Do NOT declare a migration \"already applied\" \
+             unless ALL listed child components are present AND all removed props are accounted for.",
+        )
+    }
+
     fn llm_system_prompt(&self) -> String {
         "You are a PatternFly v5 to v6 migration assistant. \
          Given a code snippet and a migration message, output ONLY the corrected \

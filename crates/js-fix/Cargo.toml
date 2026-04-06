@@ -1,0 +1,18 @@
+[package]
+name = "frontend-js-fix"
+version = "0.0.3"
+edition = "2021"
+description = "JS/TS/JSX/TSX language-specific fix operations for the fix engine"
+license = "Apache-2.0"
+repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
+
+[dependencies]
+frontend-core = { version = "0.0.3", path = "../core" }
+frontend-fix-engine = { version = "0.0.3", path = "../fix-engine" }
+konveyor-core = "0.0.3"
+
+# Serialization (for incident variable inspection)
+serde_json = "1"
+
+# Utilities
+regex = "1"

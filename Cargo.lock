@@ -744,6 +744,7 @@ dependencies = [
  "frontend-core",
  "frontend-fix-engine",
  "frontend-grpc",
+ "frontend-js-fix",
  "konveyor-core",
  "patternfly-fix-context",
  "serde",
@@ -818,6 +819,17 @@ dependencies = [
  "tracing",
  "url",
  "yaml_serde",
+]
+
+[[package]]
+name = "frontend-js-fix"
+version = "0.0.3"
+dependencies = [
+ "frontend-core",
+ "frontend-fix-engine",
+ "konveyor-core",
+ "regex",
+ "serde_json",
 ]
 
 [[package]]

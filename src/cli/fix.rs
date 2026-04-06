@@ -7,6 +7,7 @@ use frontend_fix_engine::engine as fix_engine;
 use frontend_fix_engine::goose_client;
 use frontend_fix_engine::llm_client;
 use frontend_fix_engine::registry::FixContextRegistry;
+use frontend_js_fix::JsFixProvider;
 use patternfly_fix_context::PatternFlyV5ToV6Context;
 
 #[derive(Args)]
@@ -155,9 +156,12 @@ pub async fn run(opts: FixOpts) -> Result<()> {
         eprintln!("  Total merged strategies: {}", merged_strategies.len());
     }
 
+    // Language-specific fix provider for JS/TS/JSX/TSX files
+    let lang = JsFixProvider::new();
+
     // Phase 1: Plan fixes
     eprintln!("Planning fixes...");
-    let mut plan = fix_engine::plan_fixes(&output, &project, &merged_strategies)?;
+    let mut plan = fix_engine::plan_fixes(&output, &project, &merged_strategies, &lang)?;
 
     let pattern_fix_count: usize = plan
         .files
@@ -185,7 +189,7 @@ pub async fn run(opts: FixOpts) -> Result<()> {
     // Phase 1b: Apply pattern-based fixes first (so LLM sees already-renamed code)
     if opts.apply && !plan.files.is_empty() {
         eprintln!("\nApplying pattern-based fixes...");
-        let result = fix_engine::apply_fixes(&plan)?;
+        let result = fix_engine::apply_fixes(&plan, &lang)?;
         eprintln!("  Files modified: {}", result.files_modified);
         eprintln!("  Edits applied:  {}", result.edits_applied);
         eprintln!("  Edits skipped:  {}", result.edits_skipped);
@@ -197,7 +201,7 @@ pub async fn run(opts: FixOpts) -> Result<()> {
         }
     } else if !opts.apply {
         // Preview mode — show diff for pattern-based fixes
-        let diff = fix_engine::preview_fixes(&plan)?;
+        let diff = fix_engine::preview_fixes(&plan, &lang)?;
         if diff.is_empty() {
             eprintln!("\nNo pattern-based auto-fixable changes found.");
         } else {
@@ -336,7 +340,7 @@ pub async fn run(opts: FixOpts) -> Result<()> {
 
                     // Apply LLM-generated edits
                     if opts.apply && !plan.files.is_empty() {
-                        let result = fix_engine::apply_fixes(&plan)?;
+                        let result = fix_engine::apply_fixes(&plan, &lang)?;
                         eprintln!("  Applied {} LLM edits", result.edits_applied);
                     }
                 }

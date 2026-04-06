@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc", "crates/fix-engine", "crates/patternfly-fix-context"]
+members = ["crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc", "crates/fix-engine", "crates/js-fix", "crates/patternfly-fix-context"]
 resolver = "2"
 
 [package]
@@ -15,6 +15,7 @@ konveyor-core = "0.0.3"
 frontend-core = { version = "0.0.3", path = "crates/core" }
 frontend-grpc = { version = "0.0.3", path = "crates/grpc" }
 frontend-fix-engine = { version = "0.0.3", path = "crates/fix-engine" }
+frontend-js-fix = { version = "0.0.3", path = "crates/js-fix" }
 patternfly-fix-context = { version = "0.0.3", path = "crates/patternfly-fix-context" }
 
 # Async runtime
