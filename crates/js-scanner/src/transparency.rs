@@ -153,7 +153,7 @@ fn is_transparent_expression(expr: &Expression<'_>, source: &str) -> bool {
                 && func
                     .body
                     .as_ref()
-                    .map_or(false, |body| function_body_renders_children(body, source))
+                    .is_some_and(|body| function_body_renders_children(body, source))
         }
         // React.forwardRef((props, ref) => ...)
         // React.memo(Component)
@@ -188,7 +188,7 @@ fn is_transparent_function(func: &Function<'_>, source: &str) -> bool {
         && func
             .body
             .as_ref()
-            .map_or(false, |body| function_body_renders_children(body, source))
+            .is_some_and(|body| function_body_renders_children(body, source))
 }
 
 /// Check if a call expression is a React wrapper (forwardRef, memo).
@@ -276,12 +276,12 @@ fn statement_renders_children(stmt: &Statement<'_>, source: &str) -> bool {
                 || if_stmt
                     .alternate
                     .as_ref()
-                    .map_or(false, |alt| statement_renders_children(alt, source))
+                    .is_some_and(|alt| statement_renders_children(alt, source))
         }
         Statement::VariableDeclaration(var_decl) => var_decl.declarations.iter().any(|d| {
             d.init
                 .as_ref()
-                .map_or(false, |init| expression_renders_children(init, source))
+                .is_some_and(|init| expression_renders_children(init, source))
         }),
         _ => false,
     }
@@ -340,7 +340,7 @@ fn expression_renders_children(expr: &Expression<'_>, source: &str) -> bool {
         Expression::SequenceExpression(seq) => seq
             .expressions
             .last()
-            .map_or(false, |e| expression_renders_children(e, source)),
+            .is_some_and(|e| expression_renders_children(e, source)),
 
         _ => false,
     }

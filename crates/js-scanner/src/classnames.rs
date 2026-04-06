@@ -226,16 +226,15 @@ fn walk_expr(
             walk_expr(&ts.expression, source, pattern, file_uri, incidents);
         }
         // Optional chaining: items?.map((item) => <div className="pf-v5-...">)
-        Expression::ChainExpression(chain) => match &chain.expression {
-            ChainElement::CallExpression(call) => {
+        Expression::ChainExpression(chain) => {
+            if let ChainElement::CallExpression(call) = &chain.expression {
                 for arg in &call.arguments {
                     if let Some(e) = arg.as_expression() {
                         walk_expr(e, source, pattern, file_uri, incidents);
                     }
                 }
             }
-            _ => {}
-        },
+        }
         // Await/yield: const el = await getElement(); may contain JSX
         Expression::AwaitExpression(a) => {
             walk_expr(&a.argument, source, pattern, file_uri, incidents);

@@ -99,14 +99,11 @@ pub async fn run(opts: FixOpts) -> Result<()> {
     // Surface provider errors (e.g., files that could not be parsed).
     // These are populated by kantra from the provider's EvaluateResponse.error field.
     if total_errors > 0 {
-        eprintln!(
-            "\n── Provider errors ({} rules affected) ──",
-            total_errors
-        );
+        eprintln!("\n── Provider errors ({} rules affected) ──", total_errors);
         // Deduplicate error messages since many rules may report the same parse errors
         let mut seen_errors = std::collections::HashSet::new();
         for rs in &output {
-            for (_rule_id, error_msg) in &rs.errors {
+            for error_msg in rs.errors.values() {
                 if seen_errors.insert(error_msg.clone()) {
                     eprintln!("  {}", error_msg);
                 }

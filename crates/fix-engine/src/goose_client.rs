@@ -515,7 +515,7 @@ fn process_single_file(
                 );
             }
 
-            let chunk_refs: Vec<&MergedLlmFixRequest> = chunk.iter().copied().collect();
+            let chunk_refs: Vec<&MergedLlmFixRequest> = chunk.to_vec();
 
             let prompt = build_batch_prompt_with_context(
                 file_path,
@@ -1080,6 +1080,7 @@ mod tests {
             message: format!("Migration for {}", rule_id),
             code_snip: code_snip.map(|s| s.to_string()),
             source: None,
+            labels: Vec::new(),
         }
     }
 

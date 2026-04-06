@@ -93,7 +93,10 @@ impl ProviderService for FrontendProvider {
                         tracing::info!("npm install completed successfully");
                     } else {
                         let stderr = String::from_utf8_lossy(&result.stderr);
-                        tracing::warn!("npm install failed (non-fatal): {}", stderr.chars().take(500).collect::<String>());
+                        tracing::warn!(
+                            "npm install failed (non-fatal): {}",
+                            stderr.chars().take(500).collect::<String>()
+                        );
                     }
                 }
                 Err(e) => {
