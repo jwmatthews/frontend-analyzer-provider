@@ -38,6 +38,11 @@ struct ScanContext<'a, 'b> {
     incidents: &'b mut Vec<Incident>,
     import_map: &'b ImportMap,
     local_fns: &'b LocalFnMap<'a>,
+    /// When set, only matches the parent component (via `pattern`) if it has
+    /// at least one direct JSX child whose name matches this regex. The
+    /// incident is emitted on the parent. Used for migration rules to detect
+    /// old-style children that need restructuring.
+    child: Option<&'b Regex>,
     /// When set, matches the parent component (via `pattern`) and emits
     /// incidents for each direct JSX child whose name does NOT match this
     /// regex. Used for "exclusive wrapper" rules.
@@ -218,6 +223,7 @@ pub fn scan_jsx_file<'a>(
     file_uri: &str,
     location: Option<&ReferenceLocation>,
     import_map: &ImportMap,
+    child: Option<&Regex>,
     not_child: Option<&Regex>,
     transparent_components: &HashSet<String>,
 ) -> Vec<Incident> {
@@ -231,6 +237,7 @@ pub fn scan_jsx_file<'a>(
         incidents: &mut incidents,
         import_map,
         local_fns: &local_fns,
+        child,
         not_child,
         transparent_components,
     };
@@ -260,6 +267,7 @@ pub fn scan_jsx(
         incidents: &mut incidents,
         import_map,
         local_fns: &empty_fns,
+        child: None,
         not_child: None,
         transparent_components: &empty_transparent,
     };
@@ -877,7 +885,23 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
                 );
             }
         }
-        if ctx.not_child.is_none() {
+        // child: only emit the parent incident if at least one direct
+        // JSX child matches the `child` pattern. Used for migration rules
+        // to detect old-style children still present.
+        let child_gate_passed = if let Some(child_re) = ctx.child {
+            el.children.iter().any(|c| {
+                if let JSXChild::Element(child_el) = c {
+                    let child_name = jsx_element_name_to_string(&child_el.opening_element.name);
+                    child_re.is_match(&child_name)
+                } else {
+                    false
+                }
+            })
+        } else {
+            true // no child filter — gate is open
+        };
+
+        if child_gate_passed && ctx.not_child.is_none() {
             ctx.incidents.push(incident);
         }
 
@@ -1097,7 +1121,8 @@ mod tests {
             "file:///test.tsx",
             location,
             &import_map,
-            None,
+            None, // child
+            None, // not_child
             &empty_transparent,
         )
     }
@@ -1852,6 +1877,7 @@ const el = <Dropdown>{renderItems()}</Dropdown>;
             "file:///test.tsx",
             Some(&ReferenceLocation::JsxComponent),
             &import_map,
+            None, // child
             Some(&not_child_re),
             &empty_transparent,
         )
@@ -1929,6 +1955,145 @@ const el = (
         assert_eq!(
             incidents[0].variables["componentName"].as_str().unwrap(),
             "TextInput"
+        );
+    }
+
+    // ── child (positive child filter) tests ────────────────────────
+
+    fn scan_source_jsx_child(source: &str, pattern: &str, child: &str) -> Vec<Incident> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(pattern).unwrap();
+        let child_re = Regex::new(child).unwrap();
+        let import_map = build_import_map(&ret.program);
+
+        let empty_transparent = HashSet::new();
+        scan_jsx_file(
+            &ret.program.body,
+            source,
+            &re,
+            "file:///test.tsx",
+            Some(&ReferenceLocation::JsxComponent),
+            &import_map,
+            Some(&child_re), // child
+            None,            // not_child
+            &empty_transparent,
+        )
+    }
+
+    #[test]
+    fn test_child_fires_when_old_child_present() {
+        // Modal has ModalBox (old-style child) — should fire
+        let source = r#"
+            import { Modal } from '@patternfly/react-core';
+            import { ModalBox } from '@patternfly/react-core';
+            const App = () => (
+                <Modal>
+                    <ModalBox>content</ModalBox>
+                </Modal>
+            );
+        "#;
+        let incidents = scan_source_jsx_child(source, r"^Modal$", r"^(ModalBox|ModalBoxBody)$");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should fire on Modal when it has ModalBox as a child"
+        );
+        assert_eq!(
+            incidents[0].variables["componentName"].as_str().unwrap(),
+            "Modal"
+        );
+    }
+
+    #[test]
+    fn test_child_does_not_fire_when_old_child_absent() {
+        // Modal has ModalBody (new-style child), no old children — should NOT fire
+        let source = r#"
+            import { Modal, ModalBody } from '@patternfly/react-core';
+            const App = () => (
+                <Modal>
+                    <ModalBody>content</ModalBody>
+                </Modal>
+            );
+        "#;
+        let incidents = scan_source_jsx_child(source, r"^Modal$", r"^(ModalBox|ModalBoxBody)$");
+        assert!(
+            incidents.is_empty(),
+            "Should NOT fire when Modal has no old-style children"
+        );
+    }
+
+    #[test]
+    fn test_child_fires_on_any_matching_child() {
+        // Modal has both old AND new children (partially migrated)
+        let source = r#"
+            import { Modal, ModalBody, ModalBox } from '@patternfly/react-core';
+            const App = () => (
+                <Modal>
+                    <ModalBody>content</ModalBody>
+                    <ModalBox>old content</ModalBox>
+                </Modal>
+            );
+        "#;
+        let incidents = scan_source_jsx_child(source, r"^Modal$", r"^(ModalBox|ModalBoxBody)$");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should fire — Modal still has old-style ModalBox child"
+        );
+    }
+
+    #[test]
+    fn test_child_no_children_does_not_fire() {
+        // Self-closing Modal with no children at all
+        let source = r#"
+            import { Modal } from '@patternfly/react-core';
+            const App = () => <Modal />;
+        "#;
+        let incidents = scan_source_jsx_child(source, r"^Modal$", r"^(ModalBox|ModalBoxBody)$");
+        assert!(
+            incidents.is_empty(),
+            "Should NOT fire on self-closing Modal with no children"
+        );
+    }
+
+    #[test]
+    fn test_child_non_matching_children_do_not_fire() {
+        // Modal has children but none match the child pattern
+        let source = r#"
+            import { Modal } from '@patternfly/react-core';
+            const App = () => (
+                <Modal>
+                    <div>content</div>
+                    <span>more</span>
+                </Modal>
+            );
+        "#;
+        let incidents = scan_source_jsx_child(source, r"^Modal$", r"^(ModalBox|ModalBoxBody)$");
+        assert!(
+            incidents.is_empty(),
+            "Should NOT fire when no children match the child pattern"
+        );
+    }
+
+    #[test]
+    fn test_child_incident_is_on_parent_not_child() {
+        // Verify the incident is on the parent (Modal), not on the matching child (ModalBox)
+        let source = r#"
+            import { Modal, ModalBox } from '@patternfly/react-core';
+            const App = () => (
+                <Modal id="my-modal">
+                    <ModalBox>content</ModalBox>
+                </Modal>
+            );
+        "#;
+        let incidents = scan_source_jsx_child(source, r"^Modal$", r"^ModalBox$");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables["componentName"].as_str().unwrap(),
+            "Modal",
+            "Incident should be on the parent (Modal), not the child"
         );
     }
 

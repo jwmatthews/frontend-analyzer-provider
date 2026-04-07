@@ -59,6 +59,19 @@ pub struct ReferencedCondition {
     /// Matches against string literal values (e.g., variant="plain") and
     /// JSX expression text (e.g., variant={SelectVariant.checkbox}).
     pub value: Option<String>,
+    /// Positive child filter for JSX_COMPONENT location.
+    /// When set, only matches the component if it has at least one direct
+    /// JSX child whose name matches this pattern. The incident is emitted
+    /// on the parent component (the one matched by `pattern`).
+    ///
+    /// Used for migration rules like "Modal still has old-style children"
+    /// to detect unmigrated component structure:
+    ///   `child: ^(ModalBox|ModalBoxBody|ModalBoxHeader)$`
+    ///
+    /// Symmetric with `parent`: `parent` checks ancestry, `child` checks
+    /// descendants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child: Option<String>,
     /// Negative child filter for JSX_COMPONENT location.
     /// When set, matches the component specified by `pattern` and emits an
     /// incident for each direct JSX child whose name does NOT match this

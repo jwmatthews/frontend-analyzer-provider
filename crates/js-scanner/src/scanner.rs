@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::resolve::ResolverMap;
 use crate::transparency::TransparencyCache;
 
 /// Result of scanning: a list of incidents.
@@ -97,6 +98,10 @@ pub fn collect_files(root: &Path, file_pattern: Option<&str>) -> Result<Vec<Path
 /// recover, `incidents` will be empty and `parse_error` will describe
 /// the failure.
 ///
+/// The `resolver_map` routes each file to the correct `oxc_resolver::Resolver`
+/// based on which `tsconfig.json` covers it. Create it once via
+/// [`crate::resolve::create_resolver_map`] and reuse across all file scans.
+///
 /// The `transparency_cache` enables cross-file component resolution:
 /// when a JSX parent is a locally-imported wrapper component that passes
 /// `{children}` through, the scanner "sees through" it and assigns the
@@ -106,6 +111,7 @@ pub fn scan_file_referenced(
     file_path: &Path,
     root: &Path,
     condition: &ReferencedCondition,
+    resolver_map: &ResolverMap,
     transparency_cache: &mut TransparencyCache,
 ) -> Result<(ScanResult, Option<ParseError>)> {
     let source = std::fs::read_to_string(file_path)?;
@@ -144,10 +150,16 @@ pub fn scan_file_referenced(
     // imported into this file. Uses cross-file resolution to parse
     // locally-imported component source files and determine if they
     // pass {children} through.
-    let transparent_components =
-        build_transparency_set(file_path, &import_map, root, transparency_cache);
+    let transparent_components = build_transparency_set(
+        file_path,
+        &import_map,
+        root,
+        resolver_map,
+        transparency_cache,
+    );
 
-    // Compile optional notChild regex for JSX exclusive-wrapper rules.
+    // Compile optional child/notChild regexes for JSX child-matching rules.
+    let child_re = condition.child.as_deref().map(Regex::new).transpose()?;
     let not_child_re = condition.not_child.as_deref().map(Regex::new).transpose()?;
 
     // JSX scanning at file level — enables resolving local function calls
@@ -161,6 +173,7 @@ pub fn scan_file_referenced(
                 &file_uri,
                 location,
                 &import_map,
+                child_re.as_ref(),
                 not_child_re.as_ref(),
                 &transparent_components,
             ));
@@ -340,35 +353,50 @@ pub fn scan_file_referenced(
 
 /// Build the set of transparent component names for a given file.
 ///
-/// For each import in the file's import map, checks whether it's a relative
-/// import that can be resolved to a local source file. If so, parses that
-/// file (or uses the cache) to determine which exported components are
-/// children-passthrough wrappers. Returns the set of local names that are
-/// transparent.
+/// For each import in the file's import map, resolves the import source to a
+/// local file using the resolver selected from `resolver_map` for this file
+/// (supporting tsconfig path aliases like `@app/*`). Then analyzes that file
+/// (following barrel re-exports) to determine which exported components are
+/// children-passthrough wrappers.
+///
+/// Returns the set of local names that are transparent.
 fn build_transparency_set(
     file_path: &Path,
     import_map: &std::collections::HashMap<String, String>,
     root: &Path,
+    resolver_map: &ResolverMap,
     cache: &mut TransparencyCache,
 ) -> HashSet<String> {
+    let resolver = resolver_map.resolver_for_file(file_path);
     let mut transparent = HashSet::new();
 
     for (local_name, module_source) in import_map {
-        // Try to resolve the import to a local file
-        let resolved = match crate::resolve::resolve_import(file_path, module_source, root) {
+        // Try to resolve the import using oxc_resolver (handles tsconfig paths)
+        let resolved = match crate::resolve::resolve_import_with_resolver(
+            resolver,
+            file_path,
+            module_source,
+        ) {
             Some(path) => path,
-            None => continue, // npm package or unresolvable — skip
+            None => {
+                // Fall back to legacy relative resolver for edge cases
+                match crate::resolve::resolve_import(file_path, module_source, root) {
+                    Some(path) => path,
+                    None => continue, // npm package or unresolvable — skip
+                }
+            }
         };
 
-        // Check cache first, then analyze
-        let file_transparency = if let Some(cached) = cache.get(&resolved) {
-            cached.clone()
-        } else {
-            let result =
-                crate::transparency::analyze_file_transparency(&resolved).unwrap_or_default();
-            cache.insert(resolved.clone(), result.clone());
-            result
-        };
+        // Skip npm packages (resolved to node_modules)
+        if crate::resolve::is_node_modules_path(&resolved) {
+            continue;
+        }
+
+        // Analyze transparency with barrel re-export following
+        let file_transparency = crate::transparency::analyze_file_transparency_with_resolver(
+            &resolved, resolver, cache,
+        )
+        .unwrap_or_default();
 
         // The import map maps local_name → module_source.
         // The transparency analysis returns component names as declared in the source file.
@@ -732,13 +760,15 @@ mod tests {
             from: None,
             parent_from: None,
             file_pattern: None,
+            child: None,
             not_child: None,
             not_parent: None,
         };
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, parse_error) =
-            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+            scan_file_referenced(&file_path, &dir, &condition, &resolver_map, &mut cache).unwrap();
 
         // Should return no incidents (parser couldn't produce an AST)
         assert!(incidents.is_empty());
@@ -780,13 +810,15 @@ mod tests {
             from: None,
             parent_from: None,
             file_pattern: None,
+            child: None,
             not_child: None,
             not_parent: None,
         };
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, parse_error) =
-            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+            scan_file_referenced(&file_path, &dir, &condition, &resolver_map, &mut cache).unwrap();
 
         // Valid file should have no parse error
         assert!(
@@ -831,9 +863,11 @@ mod tests {
         let consumer_path = src_dir.join("App.tsx");
         std::fs::write(&consumer_path, consumer_source).unwrap();
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, _) =
-            scan_file_referenced(&consumer_path, &dir, condition, &mut cache).unwrap();
+            scan_file_referenced(&consumer_path, &dir, condition, &resolver_map, &mut cache)
+                .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
         incidents
@@ -893,6 +927,7 @@ const App = () => (
             value: None,
             from: Some("@patternfly/react-table".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
             not_parent: None,
         };
@@ -961,6 +996,7 @@ const App = () => (
             value: None,
             from: Some("@patternfly/react-table".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
         };
 
@@ -1010,6 +1046,7 @@ const App = () => (
             value: None,
             from: Some("@patternfly/react-table".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
             not_parent: None,
         };
@@ -1052,6 +1089,7 @@ const App = () => (
             value: None,
             from: Some("@patternfly/react-table".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
             not_parent: None,
         };
@@ -1069,9 +1107,11 @@ const App = () => (
         let consumer_path = src_dir.join("App.tsx");
         std::fs::write(&consumer_path, consumer).unwrap();
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, _) =
-            scan_file_referenced(&consumer_path, &dir, &condition, &mut cache).unwrap();
+            scan_file_referenced(&consumer_path, &dir, &condition, &resolver_map, &mut cache)
+                .unwrap();
 
         // Tbody should have parentName="Bullseye" (npm component stays opaque)
         assert!(
@@ -1130,12 +1170,14 @@ export const ConditionalTableBody = ({ isLoading, children }) => (
             value: None,
             from: Some("@patternfly/react-table".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
         };
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, _) =
-            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+            scan_file_referenced(&file_path, &dir, &condition, &resolver_map, &mut cache).unwrap();
 
         // Tbody inside React.Fragment should NOT trigger — it's a render boundary
         assert!(
@@ -1189,12 +1231,14 @@ const App = () => (
             value: None,
             from: Some("@patternfly/react-table".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
         };
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, _) =
-            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+            scan_file_referenced(&file_path, &dir, &condition, &resolver_map, &mut cache).unwrap();
 
         // Tbody inside Card should fire — Card is not Table
         assert!(
@@ -1242,12 +1286,14 @@ export function useToolbarActions() {
             value: None,
             from: Some("@patternfly/react-core".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
         };
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, _) =
-            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+            scan_file_referenced(&file_path, &dir, &condition, &resolver_map, &mut cache).unwrap();
 
         // ToolbarItem inside a hook is a render boundary — should NOT fire
         assert!(
@@ -1296,12 +1342,14 @@ export const ToolbarActions: React.FC = () => (
             value: None,
             from: Some("@patternfly/react-core".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
         };
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, _) =
-            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+            scan_file_referenced(&file_path, &dir, &condition, &resolver_map, &mut cache).unwrap();
 
         assert!(
             incidents.is_empty(),
@@ -1354,12 +1402,14 @@ export function useMyHook() {
             value: None,
             from: Some("@patternfly/react-core".to_string()),
             file_pattern: None,
+            child: None,
             not_child: None,
         };
 
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
         let mut cache = crate::transparency::TransparencyCache::new();
         let (incidents, _) =
-            scan_file_referenced(&file_path, &dir, &condition, &mut cache).unwrap();
+            scan_file_referenced(&file_path, &dir, &condition, &resolver_map, &mut cache).unwrap();
 
         // ToolbarItem inside Card (wrong parent) should still fire
         assert!(
@@ -1368,5 +1418,481 @@ export function useMyHook() {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── tsconfig path alias + barrel re-export integration tests ─────────
+    //
+    // These tests simulate the tackle2-ui patterns that produce false
+    // positives: components imported via tsconfig path aliases (@app/*)
+    // through barrel files (index.ts with `export * from './X'`).
+
+    /// Helper: create a project with tsconfig path aliases, barrel files,
+    /// and multiple component files. Scans the consumer file and returns
+    /// incidents.
+    fn scan_with_tsconfig_project(
+        files: &[(&str, &str)], // (relative path, content)
+        consumer_rel_path: &str,
+        tsconfig_content: &str,
+        condition: &ReferencedCondition,
+    ) -> Vec<frontend_core::incident::Incident> {
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_tsconfig_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Write tsconfig.json
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tsconfig.json"), tsconfig_content).unwrap();
+
+        // Write all files
+        for (rel_path, content) in files {
+            let full_path = dir.join(rel_path);
+            if let Some(parent) = full_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full_path, content).unwrap();
+        }
+
+        let consumer_path = dir.join(consumer_rel_path);
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&consumer_path, &dir, condition, &resolver_map, &mut cache)
+                .unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+        incidents
+    }
+
+    #[test]
+    fn test_tsconfig_path_alias_transparent_wrapper() {
+        // Simulates: TableHeaderContentWithControls imported via @app/ alias
+        // Pattern: <Tr><TableHeaderContentWithControls><Th/></...></Tr>
+        // TableHeaderContentWithControls is a Fragment wrapper — transparent.
+        // Without tsconfig resolution, Th gets parentName="TableHeaderContentWithControls"
+        // and notParent: ^Tr$ fires (false positive).
+        // With tsconfig resolution, Th should get parentName="Tr" (no incident).
+
+        let tsconfig = r#"{
+            "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                    "@app/*": ["src/app/*"]
+                }
+            }
+        }"#;
+
+        let wrapper = r#"
+import * as React from 'react';
+import { Th } from '@patternfly/react-table';
+
+export const TableHeaderContentWithControls = ({
+    numColumnsBeforeData,
+    numColumnsAfterData,
+    children
+}) => (
+    <>
+        {Array(numColumnsBeforeData).fill(null).map((_, i) => (
+            <Th key={i} />
+        ))}
+        {children}
+        {Array(numColumnsAfterData).fill(null).map((_, i) => (
+            <Th key={i} />
+        ))}
+    </>
+);
+"#;
+
+        let consumer = r#"
+import { Table, Thead, Tbody, Tr, Th, Td } from '@patternfly/react-table';
+import { TableHeaderContentWithControls } from '@app/components/TableControls';
+
+const App = () => (
+    <Table>
+        <Thead>
+            <Tr>
+                <TableHeaderContentWithControls numColumnsBeforeData={1} numColumnsAfterData={0}>
+                    <Th>Name</Th>
+                    <Th>Status</Th>
+                </TableHeaderContentWithControls>
+            </Tr>
+        </Thead>
+    </Table>
+);
+"#;
+
+        // Barrel file that re-exports
+        let barrel = r#"export * from './TableHeaderContentWithControls';"#;
+
+        let files = &[
+            (
+                "src/app/components/TableControls/TableHeaderContentWithControls.tsx",
+                wrapper,
+            ),
+            ("src/app/components/TableControls/index.ts", barrel),
+            ("src/app/pages/App.tsx", consumer),
+        ];
+
+        // Rule: Th must be in Tr (fire when NOT in Tr)
+        let condition = ReferencedCondition {
+            pattern: "^Th$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Tr$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+        };
+
+        let incidents =
+            scan_with_tsconfig_project(files, "src/app/pages/App.tsx", tsconfig, &condition);
+
+        // With transparent wrapper resolution via @app/ alias + barrel file,
+        // Th should have parentName="Tr" (wrapper collapsed), so notParent
+        // rule should NOT fire.
+        assert!(
+            incidents.is_empty(),
+            "notParent: ^Tr$ should NOT fire — Th is inside Tr \
+             (TableHeaderContentWithControls is transparent, imported via @app/ alias). \
+             Got {} incidents with parents: {:?}",
+            incidents.len(),
+            incidents
+                .iter()
+                .map(|i| i
+                    .variables
+                    .get("parentName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tsconfig_barrel_file_conditional_table_body() {
+        // Simulates: ConditionalTableBody imported via @app/ through barrel
+        // Pattern: <Table><ConditionalTableBody><Tbody/></...></Table>
+        // ConditionalTableBody is transparent — passes {children} in happy path.
+
+        let tsconfig = r#"{
+            "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                    "@app/*": ["src/app/*"]
+                }
+            }
+        }"#;
+
+        let wrapper = r#"
+import React from 'react';
+import { Tbody, Tr, Td } from '@patternfly/react-table';
+
+export const ConditionalTableBody = ({
+    isLoading,
+    isError,
+    children
+}) => (
+    <React.Fragment>
+        {isLoading ? (
+            <Tbody><Tr><Td>Loading...</Td></Tr></Tbody>
+        ) : isError ? (
+            <Tbody><Tr><Td>Error</Td></Tr></Tbody>
+        ) : (
+            children
+        )}
+    </React.Fragment>
+);
+"#;
+
+        let consumer = r#"
+import { Table, Tbody, Tr, Td } from '@patternfly/react-table';
+import { ConditionalTableBody } from '@app/components/TableControls';
+
+const App = () => (
+    <Table>
+        <ConditionalTableBody isLoading={false} isError={false}>
+            <Tbody>
+                <Tr><Td>Row 1</Td></Tr>
+            </Tbody>
+        </ConditionalTableBody>
+    </Table>
+);
+"#;
+
+        let barrel = r#"
+export * from './TableHeaderContentWithControls';
+export * from './ConditionalTableBody';
+"#;
+
+        // Need the other file too for barrel to parse
+        let dummy_wrapper = r#"
+export const TableHeaderContentWithControls = ({ children }) => <>{children}</>;
+"#;
+
+        let files = &[
+            (
+                "src/app/components/TableControls/ConditionalTableBody.tsx",
+                wrapper,
+            ),
+            (
+                "src/app/components/TableControls/TableHeaderContentWithControls.tsx",
+                dummy_wrapper,
+            ),
+            ("src/app/components/TableControls/index.ts", barrel),
+            ("src/app/pages/App.tsx", consumer),
+        ];
+
+        // Rule: Tbody must be inside Table (fire when NOT inside Table)
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Table$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+        };
+
+        let incidents =
+            scan_with_tsconfig_project(files, "src/app/pages/App.tsx", tsconfig, &condition);
+
+        // ConditionalTableBody is transparent, so Tbody should see Table as parent.
+        // The notParent: ^Table$ rule should NOT fire.
+        assert!(
+            incidents.is_empty(),
+            "notParent: ^Table$ should NOT fire — Tbody is inside Table \
+             (ConditionalTableBody is transparent via @app/ barrel import). \
+             Got {} incidents",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn test_tsconfig_rbac_transparent_wrapper() {
+        // Simulates: RBAC component imported via @app/rbac
+        // RBAC is a pure logic gate: returns children or false (no DOM node).
+        // Pattern: <Toolbar><RBAC><ToolbarItem/></RBAC></Toolbar>
+
+        let tsconfig = r#"{
+            "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                    "@app/*": ["src/app/*"]
+                }
+            }
+        }"#;
+
+        let rbac = r#"
+export const RBAC = ({ allowedPermissions, children }) => {
+    const hasAccess = true;
+    return hasAccess && children;
+};
+"#;
+
+        let consumer = r#"
+import { Toolbar, ToolbarContent, ToolbarItem } from '@patternfly/react-core';
+import { RBAC } from '@app/rbac';
+
+const App = () => (
+    <Toolbar>
+        <ToolbarContent>
+            <RBAC allowedPermissions={['write']}>
+                <ToolbarItem>Action</ToolbarItem>
+            </RBAC>
+        </ToolbarContent>
+    </Toolbar>
+);
+"#;
+
+        let files = &[
+            ("src/app/rbac.ts", rbac),
+            ("src/app/pages/App.tsx", consumer),
+        ];
+
+        // Rule: ToolbarItem must be in Toolbar (fire when NOT in Toolbar)
+        let condition = ReferencedCondition {
+            pattern: "^ToolbarItem$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Toolbar$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-core".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+        };
+
+        let incidents =
+            scan_with_tsconfig_project(files, "src/app/pages/App.tsx", tsconfig, &condition);
+
+        // RBAC is transparent (returns children directly), so ToolbarItem
+        // should see ToolbarContent as parent (not RBAC). ToolbarContent
+        // is from @patternfly (opaque), so ToolbarItem's parent = ToolbarContent.
+        // The notParent: ^Toolbar$ rule should still fire because the direct
+        // PF parent is ToolbarContent, not Toolbar. But critically, it should
+        // NOT report RBAC as the parent — RBAC should be collapsed out.
+        for incident in &incidents {
+            let parent = incident
+                .variables
+                .get("parentName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            assert_ne!(
+                parent, "RBAC",
+                "RBAC should be collapsed as transparent — parent should not be RBAC"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tsconfig_opaque_wrapper_not_collapsed() {
+        // Verify that a non-transparent component imported via @app/ is NOT
+        // collapsed — it should remain as the parent.
+
+        let tsconfig = r#"{
+            "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                    "@app/*": ["src/app/*"]
+                }
+            }
+        }"#;
+
+        // This wrapper renders its OWN content, does not pass children
+        let opaque = r#"
+export const OpaqueWrapper = ({ title }) => (
+    <div>
+        <h1>{title}</h1>
+    </div>
+);
+"#;
+
+        let consumer = r#"
+import { Table, Tbody } from '@patternfly/react-table';
+import { OpaqueWrapper } from '@app/components/OpaqueWrapper';
+
+const App = () => (
+    <Table>
+        <OpaqueWrapper title="hello">
+            <Tbody />
+        </OpaqueWrapper>
+    </Table>
+);
+"#;
+
+        let files = &[
+            ("src/app/components/OpaqueWrapper.tsx", opaque),
+            ("src/app/pages/App.tsx", consumer),
+        ];
+
+        // Rule: Tbody must be in Table (parent filter, not notParent)
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: Some("^Table$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+            not_parent: None,
+        };
+
+        let incidents =
+            scan_with_tsconfig_project(files, "src/app/pages/App.tsx", tsconfig, &condition);
+
+        // OpaqueWrapper is NOT transparent, so Tbody should have
+        // parentName="OpaqueWrapper", not "Table". The parent=Table
+        // filter should NOT match.
+        assert!(
+            incidents.is_empty(),
+            "Tbody inside opaque @app/ wrapper should NOT match parent=Table. \
+             Got {} incidents",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn test_tsconfig_named_reexport_barrel() {
+        // Test that named re-exports (`export { Foo } from './X'`) work
+        // through barrel files.
+
+        let tsconfig = r#"{
+            "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                    "@app/*": ["src/app/*"]
+                }
+            }
+        }"#;
+
+        let wrapper = r#"
+export const MyWrapper = ({ children }) => <>{children}</>;
+export const MyOpaqueComponent = ({ text }) => <div>{text}</div>;
+"#;
+
+        let barrel = r#"
+export { MyWrapper, MyOpaqueComponent } from './MyComponents';
+"#;
+
+        let consumer = r#"
+import { Table, Tbody } from '@patternfly/react-table';
+import { MyWrapper } from '@app/components/wrappers';
+
+const App = () => (
+    <Table>
+        <MyWrapper>
+            <Tbody />
+        </MyWrapper>
+    </Table>
+);
+"#;
+
+        let files = &[
+            ("src/app/components/wrappers/MyComponents.tsx", wrapper),
+            ("src/app/components/wrappers/index.ts", barrel),
+            ("src/app/pages/App.tsx", consumer),
+        ];
+
+        // Rule: Tbody must be inside Table (fire when NOT inside Table)
+        let condition = ReferencedCondition {
+            pattern: "^Tbody$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: Some("^Table$".to_string()),
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-table".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+        };
+
+        let incidents =
+            scan_with_tsconfig_project(files, "src/app/pages/App.tsx", tsconfig, &condition);
+
+        // MyWrapper is transparent, imported via named re-export through barrel.
+        // Tbody should see Table as parent.
+        assert!(
+            incidents.is_empty(),
+            "notParent: ^Table$ should NOT fire — MyWrapper is transparent \
+             (named re-export through barrel). Got {} incidents",
+            incidents.len()
+        );
     }
 }

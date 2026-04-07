@@ -34,6 +34,7 @@ use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
+use oxc_resolver::Resolver;
 use oxc_span::SourceType;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,123 @@ pub type TransparencyCache = HashMap<PathBuf, HashSet<String>>;
 pub fn analyze_file_transparency(file_path: &Path) -> Result<HashSet<String>> {
     let source = std::fs::read_to_string(file_path)?;
     analyze_source_transparency(&source)
+}
+
+/// Analyze a source file and return the set of exported component names that
+/// are transparent, following barrel re-exports (`export * from './X'`).
+///
+/// Uses the provided `oxc_resolver::Resolver` to resolve re-export specifiers.
+/// The `cache` prevents redundant parsing when multiple files re-export from
+/// the same source.
+///
+/// This is the preferred entry point when an `oxc_resolver` is available,
+/// as it handles barrel files (index.ts) that re-export transparent components
+/// from other files.
+pub fn analyze_file_transparency_with_resolver(
+    file_path: &Path,
+    resolver: &Resolver,
+    cache: &mut TransparencyCache,
+) -> Result<HashSet<String>> {
+    // Check cache first
+    if let Some(cached) = cache.get(file_path) {
+        return Ok(cached.clone());
+    }
+
+    // Insert an empty set first to prevent infinite recursion on circular re-exports
+    cache.insert(file_path.to_path_buf(), HashSet::new());
+
+    let source = std::fs::read_to_string(file_path)?;
+    let mut transparent = analyze_source_transparency(&source)?;
+
+    // Now follow re-exports: `export * from './X'` and `export { Foo } from './X'`
+    let reexport_sources = collect_reexport_sources(&source);
+    for (specifier, names) in &reexport_sources {
+        if let Some(resolved) =
+            crate::resolve::resolve_import_with_resolver(resolver, file_path, specifier)
+        {
+            // Skip node_modules
+            if crate::resolve::is_node_modules_path(&resolved) {
+                continue;
+            }
+
+            // Recursively analyze the re-exported file
+            let reexported = analyze_file_transparency_with_resolver(&resolved, resolver, cache)
+                .unwrap_or_default();
+
+            match names {
+                ReexportKind::All => {
+                    // `export * from './X'` — merge all transparent names
+                    transparent.extend(reexported);
+                }
+                ReexportKind::Named(named) => {
+                    // `export { Foo, Bar } from './X'` — only include if re-exported
+                    // name is transparent in the source
+                    for name in named {
+                        if reexported.contains(name) {
+                            transparent.insert(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Update cache with final result
+    cache.insert(file_path.to_path_buf(), transparent.clone());
+    Ok(transparent)
+}
+
+/// Describes what names are re-exported from a module.
+enum ReexportKind {
+    /// `export * from '...'` — all exports
+    All,
+    /// `export { Foo, Bar } from '...'` — specific names
+    Named(Vec<String>),
+}
+
+/// Collect re-export sources from a source file.
+///
+/// Returns a list of (module_specifier, kind) for each re-export statement.
+fn collect_reexport_sources(source: &str) -> Vec<(String, ReexportKind)> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::tsx();
+    let ret = Parser::new(&allocator, source, source_type).parse();
+
+    if ret.panicked {
+        return Vec::new();
+    }
+
+    let mut reexports = Vec::new();
+
+    for stmt in &ret.program.body {
+        match stmt {
+            // export * from './X'
+            Statement::ExportAllDeclaration(decl) => {
+                let specifier = decl.source.value.as_str().to_string();
+                reexports.push((specifier, ReexportKind::All));
+            }
+            // export { Foo, Bar } from './X'
+            Statement::ExportNamedDeclaration(decl) => {
+                if let Some(ref source) = decl.source {
+                    let specifier = source.value.as_str().to_string();
+                    let names: Vec<String> = decl
+                        .specifiers
+                        .iter()
+                        .map(|s| {
+                            // Use the exported name (what consumers see)
+                            s.exported.name().to_string()
+                        })
+                        .collect();
+                    if !names.is_empty() {
+                        reexports.push((specifier, ReexportKind::Named(names)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    reexports
 }
 
 /// Analyze source code string and return the set of component names that are

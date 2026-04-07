@@ -51,6 +51,14 @@ pub fn evaluate_condition(
         ProviderCondition::Referenced(cond) => {
             let files =
                 frontend_js_scanner::scanner::collect_files(root, cond.file_pattern.as_deref())?;
+
+            // Create a resolver map once for the entire rule evaluation.
+            // This discovers all tsconfig.json files in the project tree
+            // (e.g., client/tsconfig.json, common/tsconfig.json) and creates
+            // one resolver per tsconfig. Each file is routed to the correct
+            // resolver based on which tsconfig directory is its ancestor.
+            let resolver_map = frontend_js_scanner::resolve::create_resolver_map(root, 3);
+
             // Transparency cache: shared across all file scans within this
             // rule evaluation. Avoids re-parsing the same imported component
             // files when multiple scan targets import the same wrappers.
@@ -61,6 +69,7 @@ pub fn evaluate_condition(
                     &file,
                     root,
                     &cond,
+                    &resolver_map,
                     &mut transparency_cache,
                 )?;
                 all_incidents.extend(incidents);
