@@ -860,6 +860,215 @@ fn check_typed_object_literal(
     }
 }
 
+// ── Child component name collection ─────────────────────────────────────
+//
+// These functions walk JSX children — including expression containers like
+// `.map()`, conditionals, and render functions — to collect the component
+// names found. Used by the `child`, `requiresChild`, and `notChild`
+// scanners so they can see dynamic children that are invisible when only
+// checking direct `JSXChild::Element` nodes.
+
+/// Collect all component names (with spans) found in JSX children,
+/// walking into expression containers to find components inside `.map()`,
+/// conditionals, arrow functions, etc.
+fn collect_child_components(
+    children: &[JSXChild<'_>],
+    local_fns: &LocalFnMap,
+) -> Vec<(String, oxc_span::Span)> {
+    let mut results = Vec::new();
+    for child in children {
+        match child {
+            JSXChild::Element(el) => {
+                let name = jsx_element_name_to_string(&el.opening_element.name);
+                let span = el.opening_element.name.span();
+                results.push((name, span));
+            }
+            JSXChild::Fragment(frag) => {
+                results.extend(collect_child_components(&frag.children, local_fns));
+            }
+            JSXChild::ExpressionContainer(container) => {
+                collect_names_from_jsx_expression(&container.expression, local_fns, &mut results);
+            }
+            _ => {}
+        }
+    }
+    results
+}
+
+/// Walk a JSXExpression to collect component names. Mirrors `walk_jsx_expression`
+/// but collects names instead of emitting incidents.
+fn collect_names_from_jsx_expression(
+    jsx_expr: &JSXExpression<'_>,
+    local_fns: &LocalFnMap,
+    results: &mut Vec<(String, oxc_span::Span)>,
+) {
+    match jsx_expr {
+        JSXExpression::EmptyExpression(_) => {}
+        JSXExpression::JSXElement(el) => {
+            let name = jsx_element_name_to_string(&el.opening_element.name);
+            let span = el.opening_element.name.span();
+            results.push((name, span));
+        }
+        JSXExpression::JSXFragment(frag) => {
+            results.extend(collect_child_components(&frag.children, local_fns));
+        }
+        JSXExpression::ParenthesizedExpression(paren) => {
+            collect_names_from_expression(&paren.expression, local_fns, results);
+        }
+        JSXExpression::ArrowFunctionExpression(arrow) => {
+            collect_names_from_fn_body(&arrow.body, local_fns, results);
+        }
+        JSXExpression::ConditionalExpression(cond) => {
+            collect_names_from_expression(&cond.consequent, local_fns, results);
+            collect_names_from_expression(&cond.alternate, local_fns, results);
+        }
+        JSXExpression::LogicalExpression(logic) => {
+            collect_names_from_expression(&logic.right, local_fns, results);
+        }
+        JSXExpression::CallExpression(call) => {
+            // Resolve local function calls
+            if let Expression::Identifier(ident) = &call.callee {
+                if let Some(fn_expr) = local_fns.get(ident.name.as_str()) {
+                    match fn_expr {
+                        Expression::ArrowFunctionExpression(arrow) => {
+                            collect_names_from_fn_body(&arrow.body, local_fns, results);
+                        }
+                        Expression::FunctionExpression(func) => {
+                            if let Some(body) = &func.body {
+                                collect_names_from_fn_body(body, local_fns, results);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Walk call arguments
+            for arg in &call.arguments {
+                if let Argument::SpreadElement(spread) = arg {
+                    collect_names_from_expression(&spread.argument, local_fns, results);
+                } else if let Some(expr) = arg.as_expression() {
+                    collect_names_from_expression(expr, local_fns, results);
+                }
+            }
+        }
+        JSXExpression::ChainExpression(chain) => {
+            if let ChainElement::CallExpression(call) = &chain.expression {
+                for arg in &call.arguments {
+                    if let Argument::SpreadElement(spread) = arg {
+                        collect_names_from_expression(&spread.argument, local_fns, results);
+                    } else if let Some(expr) = arg.as_expression() {
+                        collect_names_from_expression(expr, local_fns, results);
+                    }
+                }
+            }
+        }
+        // Array literals: {[<Tab />, items.map(i => <Tab />)]}
+        JSXExpression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                match elem {
+                    ArrayExpressionElement::SpreadElement(spread) => {
+                        collect_names_from_expression(&spread.argument, local_fns, results);
+                    }
+                    _ => {
+                        if let Some(expr) = elem.as_expression() {
+                            collect_names_from_expression(expr, local_fns, results);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk an Expression to collect component names. Mirrors `walk_expression_for_jsx`.
+fn collect_names_from_expression(
+    expr: &Expression<'_>,
+    local_fns: &LocalFnMap,
+    results: &mut Vec<(String, oxc_span::Span)>,
+) {
+    match expr {
+        Expression::JSXElement(el) => {
+            let name = jsx_element_name_to_string(&el.opening_element.name);
+            let span = el.opening_element.name.span();
+            results.push((name, span));
+        }
+        Expression::JSXFragment(frag) => {
+            results.extend(collect_child_components(&frag.children, local_fns));
+        }
+        Expression::ParenthesizedExpression(paren) => {
+            collect_names_from_expression(&paren.expression, local_fns, results);
+        }
+        Expression::ConditionalExpression(cond) => {
+            collect_names_from_expression(&cond.consequent, local_fns, results);
+            collect_names_from_expression(&cond.alternate, local_fns, results);
+        }
+        Expression::LogicalExpression(logic) => {
+            collect_names_from_expression(&logic.right, local_fns, results);
+        }
+        Expression::ArrowFunctionExpression(arrow) => {
+            collect_names_from_fn_body(&arrow.body, local_fns, results);
+        }
+        Expression::CallExpression(call) => {
+            for arg in &call.arguments {
+                if let Argument::SpreadElement(spread) = arg {
+                    collect_names_from_expression(&spread.argument, local_fns, results);
+                } else if let Some(expr) = arg.as_expression() {
+                    collect_names_from_expression(expr, local_fns, results);
+                }
+            }
+        }
+        Expression::ChainExpression(chain) => {
+            if let ChainElement::CallExpression(call) = &chain.expression {
+                for arg in &call.arguments {
+                    if let Argument::SpreadElement(spread) = arg {
+                        collect_names_from_expression(&spread.argument, local_fns, results);
+                    } else if let Some(expr) = arg.as_expression() {
+                        collect_names_from_expression(expr, local_fns, results);
+                    }
+                }
+            }
+        }
+        // Array literals: {[<Tab />, items.map(i => <Tab />)]}
+        Expression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                match elem {
+                    ArrayExpressionElement::SpreadElement(spread) => {
+                        collect_names_from_expression(&spread.argument, local_fns, results);
+                    }
+                    _ => {
+                        if let Some(expr) = elem.as_expression() {
+                            collect_names_from_expression(expr, local_fns, results);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk a FunctionBody to collect component names from return statements.
+fn collect_names_from_fn_body(
+    body: &FunctionBody<'_>,
+    local_fns: &LocalFnMap,
+    results: &mut Vec<(String, oxc_span::Span)>,
+) {
+    for stmt in &body.statements {
+        match stmt {
+            Statement::ReturnStatement(ret) => {
+                if let Some(arg) = &ret.argument {
+                    collect_names_from_expression(arg, local_fns, results);
+                }
+            }
+            Statement::ExpressionStatement(expr) => {
+                collect_names_from_expression(&expr.expression, local_fns, results);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Option<&str>) {
     let opening = &el.opening_element;
     let component_name = jsx_element_name_to_string(&opening.name);
@@ -892,18 +1101,22 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
                 );
             }
         }
-        // child: only emit the parent incident if at least one direct
-        // JSX child matches the `child` pattern. Used for migration rules
-        // to detect old-style children still present.
+        // Collect all child component names (direct JSX elements AND those
+        // nested inside expression containers like .map(), conditionals, etc.).
+        // This is used by all three child-matching scanners below.
+        let all_children =
+            if ctx.child.is_some() || ctx.not_child.is_some() || ctx.requires_child.is_some() {
+                collect_child_components(&el.children, ctx.local_fns)
+            } else {
+                Vec::new()
+            };
+
+        // child: only emit the parent incident if at least one child
+        // matches the `child` pattern. Used for migration rules to detect
+        // old-style children still present. Walks into expression containers
+        // so `.map()` and conditional children are visible.
         let child_gate_passed = if let Some(child_re) = ctx.child {
-            el.children.iter().any(|c| {
-                if let JSXChild::Element(child_el) = c {
-                    let child_name = jsx_element_name_to_string(&child_el.opening_element.name);
-                    child_re.is_match(&child_name)
-                } else {
-                    false
-                }
-            })
+            all_children.iter().any(|(name, _)| child_re.is_match(name))
         } else {
             true // no child filter — gate is open
         };
@@ -912,56 +1125,44 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
             ctx.incidents.push(incident.clone());
         }
 
-        // requiresChild: emit incident if NO direct child matches the required pattern.
-        // This is the inverse of `child` — fires on absence, not presence.
+        // requiresChild: emit incident if NO child matches the required
+        // pattern. Walks into expression containers so `.map()` and
+        // conditional children are visible.
         if let Some(req_re) = ctx.requires_child {
-            let has_required_child = el.children.iter().any(|c| {
-                if let JSXChild::Element(child_el) = c {
-                    let child_name = jsx_element_name_to_string(&child_el.opening_element.name);
-                    req_re.is_match(&child_name)
-                } else {
-                    false
-                }
-            });
+            let has_required_child = all_children.iter().any(|(name, _)| req_re.is_match(name));
             if !has_required_child {
                 ctx.incidents.push(incident);
             }
         }
 
-        // notChild: emit incidents for direct JSX children that don't match
+        // notChild: emit incidents for each child whose name does NOT match
+        // the pattern. Walks into expression containers so `.map()` and
+        // conditional children are visible.
         if let Some(not_child_re) = ctx.not_child {
-            for child in &el.children {
-                if let JSXChild::Element(child_el) = child {
-                    let child_name = jsx_element_name_to_string(&child_el.opening_element.name);
-                    if !not_child_re.is_match(&child_name) {
-                        let child_span = child_el.opening_element.name.span();
-                        let mut child_incident = make_incident(
-                            ctx.source,
-                            ctx.file_uri,
-                            child_span.start,
-                            child_span.end,
-                        );
-                        child_incident.variables.insert(
-                            "componentName".into(),
-                            serde_json::Value::String(child_name.clone()),
-                        );
-                        child_incident.variables.insert(
-                            "parentName".into(),
-                            serde_json::Value::String(component_name.clone()),
-                        );
-                        if let Some(module) = ctx.import_map.get(&child_name) {
-                            child_incident
-                                .variables
-                                .insert("module".into(), serde_json::Value::String(module.clone()));
-                        }
-                        if let Some(parent_module) = ctx.import_map.get(&component_name) {
-                            child_incident.variables.insert(
-                                "parentFrom".into(),
-                                serde_json::Value::String(parent_module.clone()),
-                            );
-                        }
-                        ctx.incidents.push(child_incident);
+            for (child_name, child_span) in &all_children {
+                if !not_child_re.is_match(child_name) {
+                    let mut child_incident =
+                        make_incident(ctx.source, ctx.file_uri, child_span.start, child_span.end);
+                    child_incident.variables.insert(
+                        "componentName".into(),
+                        serde_json::Value::String(child_name.clone()),
+                    );
+                    child_incident.variables.insert(
+                        "parentName".into(),
+                        serde_json::Value::String(component_name.clone()),
+                    );
+                    if let Some(module) = ctx.import_map.get(child_name) {
+                        child_incident
+                            .variables
+                            .insert("module".into(), serde_json::Value::String(module.clone()));
                     }
+                    if let Some(parent_module) = ctx.import_map.get(&component_name) {
+                        child_incident.variables.insert(
+                            "parentFrom".into(),
+                            serde_json::Value::String(parent_module.clone()),
+                        );
+                    }
+                    ctx.incidents.push(child_incident);
                 }
             }
         }
@@ -2511,6 +2712,222 @@ const el = (
             incidents.len(),
             0,
             "When requiresChild is set, no normal incident should be emitted and no requiresChild incident when child is present"
+        );
+    }
+
+    // ── Expression child walking tests ──────────────────────────────
+
+    #[test]
+    fn test_requires_child_sees_map_children() {
+        // List has children rendered via .map() — should NOT fire
+        let source = r#"
+import { List, ListItem } from '@patternfly/react-core';
+const el = (
+    <List>
+        {items.map(item => (
+            <ListItem key={item.id}>{item.name}</ListItem>
+        ))}
+    </List>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^List$", r"^ListItem$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "Should see ListItem inside .map() expression"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_sees_conditional_children() {
+        // AlertGroup has children via conditional expression — should NOT fire
+        let source = r#"
+import { AlertGroup, Alert } from '@patternfly/react-core';
+const el = (
+    <AlertGroup>
+        {hasAlert && <Alert />}
+    </AlertGroup>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^AlertGroup$", r"^Alert$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "Should see Alert inside conditional expression"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_sees_ternary_children() {
+        // ToggleGroup has children via ternary — should NOT fire
+        let source = r#"
+import { ToggleGroup, ToggleGroupItem } from '@patternfly/react-core';
+const el = (
+    <ToggleGroup>
+        {isReady ? <ToggleGroupItem text="A" /> : <ToggleGroupItem text="B" />}
+    </ToggleGroup>
+);
+"#;
+        let incidents =
+            scan_source_jsx_requires_child(source, r"^ToggleGroup$", r"^ToggleGroupItem$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "Should see ToggleGroupItem inside ternary expression"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_still_fires_with_wrong_map_children() {
+        // List has .map() but renders <div> not <ListItem> — SHOULD fire
+        let source = r#"
+import { List } from '@patternfly/react-core';
+const el = (
+    <List>
+        {items.map(item => (
+            <div key={item.id}>{item.name}</div>
+        ))}
+    </List>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^List$", r"^ListItem$");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should still fire when .map() renders wrong component"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_sees_optional_chain_map() {
+        // List has children via optional chaining ?.map() — should NOT fire
+        let source = r#"
+import { List, ListItem } from '@patternfly/react-core';
+const el = (
+    <List>
+        {items?.map(item => (
+            <ListItem key={item.id}>{item.name}</ListItem>
+        ))}
+    </List>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^List$", r"^ListItem$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "Should see ListItem inside ?.map() expression"
+        );
+    }
+
+    #[test]
+    fn test_child_gate_sees_map_children() {
+        // child gate should also see components inside .map()
+        let source = r#"
+import { AlertGroup, Alert } from '@patternfly/react-core';
+const el = (
+    <AlertGroup>
+        {items.map(item => (
+            <Alert key={item.id} />
+        ))}
+    </AlertGroup>
+);
+"#;
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(r"^AlertGroup$").unwrap();
+        let child_re = Regex::new(r"^Alert$").unwrap();
+        let import_map = build_import_map(&ret.program);
+        let empty_transparent = HashSet::new();
+        let incidents = scan_jsx_file(
+            &ret.program.body,
+            source,
+            &re,
+            "file:///test.tsx",
+            Some(&ReferenceLocation::JsxComponent),
+            &import_map,
+            Some(&child_re),
+            None,
+            None,
+            &empty_transparent,
+        );
+        assert_eq!(
+            incidents.len(),
+            1,
+            "child gate should see Alert inside .map() and emit parent incident"
+        );
+    }
+
+    #[test]
+    fn test_not_child_sees_map_children() {
+        // notChild should see components inside .map()
+        let source = r#"
+import { Form, FormGroup } from '@patternfly/react-core';
+const el = (
+    <Form>
+        {items.map(item => (
+            <FormGroup key={item.id}>
+                <input />
+            </FormGroup>
+        ))}
+    </Form>
+);
+"#;
+        let incidents =
+            scan_source_jsx_not_child(source, r"^Form$", r"^(FormGroup|FormSection|ActionGroup)$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "notChild should see FormGroup inside .map() and not emit incident"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_sees_array_literal_children() {
+        // Tabs has children in an array literal: {[<Tab />, ...]}
+        let source = r#"
+import { Tabs, Tab } from '@patternfly/react-core';
+const el = (
+    <Tabs activeKey={0}>
+        {[
+            <Tab key="a" eventKey="a" title="A">content A</Tab>,
+            <Tab key="b" eventKey="b" title="B">content B</Tab>,
+        ]}
+    </Tabs>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^Tabs$", r"^(Tab|TabTitleIcon)$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "Should see Tab inside array literal expression"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_sees_array_with_map() {
+        // Tabs has children in array literal containing .map():
+        // {[staticTab, ...items.map(i => <Tab />)]}
+        let source = r#"
+import { Tabs, Tab } from '@patternfly/react-core';
+const el = (
+    <Tabs activeKey={0}>
+        {[
+            <Tab key="static" eventKey="static" title="Static">static</Tab>,
+            ...items.map(item => (
+                <Tab key={item.id} eventKey={item.id} title={item.name}>
+                    {item.content}
+                </Tab>
+            ))
+        ]}
+    </Tabs>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^Tabs$", r"^(Tab|TabTitleIcon)$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "Should see Tab inside array literal with spread .map()"
         );
     }
 }
