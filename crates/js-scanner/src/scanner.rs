@@ -158,9 +158,14 @@ pub fn scan_file_referenced(
         transparency_cache,
     );
 
-    // Compile optional child/notChild regexes for JSX child-matching rules.
+    // Compile optional child/notChild/requiresChild regexes for JSX child-matching rules.
     let child_re = condition.child.as_deref().map(Regex::new).transpose()?;
     let not_child_re = condition.not_child.as_deref().map(Regex::new).transpose()?;
+    let requires_child_re = condition
+        .requires_child
+        .as_deref()
+        .map(Regex::new)
+        .transpose()?;
 
     // JSX scanning at file level — enables resolving local function calls
     // (e.g., {renderDropdownItems()}) to their bodies for parent context tracing.
@@ -175,6 +180,7 @@ pub fn scan_file_referenced(
                 &import_map,
                 child_re.as_ref(),
                 not_child_re.as_ref(),
+                requires_child_re.as_ref(),
                 &transparent_components,
             ));
         }
@@ -762,6 +768,7 @@ mod tests {
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
             not_parent: None,
         };
 
@@ -812,6 +819,7 @@ mod tests {
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
             not_parent: None,
         };
 
@@ -929,6 +937,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
             not_parent: None,
         };
 
@@ -998,6 +1007,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let incidents = scan_with_wrapper_project(wrapper, consumer, &condition);
@@ -1048,6 +1058,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
             not_parent: None,
         };
 
@@ -1091,6 +1102,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
             not_parent: None,
         };
 
@@ -1172,6 +1184,7 @@ export const ConditionalTableBody = ({ isLoading, children }) => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
@@ -1233,6 +1246,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
@@ -1288,6 +1302,7 @@ export function useToolbarActions() {
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
@@ -1344,6 +1359,7 @@ export const ToolbarActions: React.FC = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
@@ -1404,6 +1420,7 @@ export function useMyHook() {
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
@@ -1549,6 +1566,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let incidents =
@@ -1661,6 +1679,7 @@ export const TableHeaderContentWithControls = ({ children }) => <>{children}</>;
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let incidents =
@@ -1732,6 +1751,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let incidents =
@@ -1809,6 +1829,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
             not_parent: None,
         };
 
@@ -1881,6 +1902,7 @@ const App = () => (
             file_pattern: None,
             child: None,
             not_child: None,
+            requires_child: None,
         };
 
         let incidents =

@@ -79,6 +79,17 @@ pub struct ReferencedCondition {
     /// InputGroup must be InputGroupItem or InputGroupText."
     #[serde(rename = "notChild", skip_serializing_if = "Option::is_none")]
     pub not_child: Option<String>,
+    /// Negative-existence child filter for JSX_COMPONENT location.
+    /// When set, matches the component specified by `pattern` and emits an
+    /// incident if NONE of its direct JSX children match this regex.
+    ///
+    /// Used for conformance rules like "AlertGroup must contain Alert" —
+    /// fires when AlertGroup has no Alert children.
+    ///
+    /// Inverse of `child` (which gates on existence). Complementary to
+    /// `notChild` (which fires per non-matching child).
+    #[serde(rename = "requiresChild", skip_serializing_if = "Option::is_none")]
+    pub requires_child: Option<String>,
     /// Optional import source path filter for IMPORT location.
     /// When set, only matches imports from modules whose path matches this pattern.
     /// Example: `from: "@patternfly/react-core/deprecated"` matches

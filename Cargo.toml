@@ -11,7 +11,7 @@ license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [dependencies]
-konveyor-core = "0.0.3"
+konveyor-core = "0.0.4"
 frontend-core = { version = "0.0.3", path = "crates/core" }
 frontend-grpc = { version = "0.0.3", path = "crates/grpc" }
 frontend-fix-engine = { version = "0.0.3", path = "crates/fix-engine" }
@@ -35,4 +35,7 @@ anyhow = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+konveyor-core = { path = "../konveyor-core" }
 

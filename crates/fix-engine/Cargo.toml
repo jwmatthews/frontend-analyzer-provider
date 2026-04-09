@@ -8,7 +8,7 @@ repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [dependencies]
 frontend-core = { version = "0.0.3", path = "../core" }
-konveyor-core = "0.0.3"
+konveyor-core = "0.0.4"
 
 # Error handling
 anyhow = "1"

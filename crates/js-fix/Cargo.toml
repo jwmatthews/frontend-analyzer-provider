@@ -9,7 +9,7 @@ repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 [dependencies]
 frontend-core = { version = "0.0.3", path = "../core" }
 frontend-fix-engine = { version = "0.0.3", path = "../fix-engine" }
-konveyor-core = "0.0.3"
+konveyor-core = "0.0.4"
 
 # Serialization (for incident variable inspection)
 serde_json = "1"

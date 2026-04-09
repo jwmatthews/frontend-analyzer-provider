@@ -47,6 +47,10 @@ struct ScanContext<'a, 'b> {
     /// incidents for each direct JSX child whose name does NOT match this
     /// regex. Used for "exclusive wrapper" rules.
     not_child: Option<&'b Regex>,
+    /// When set, matches the parent component (via `pattern`) and emits an
+    /// incident if NONE of its direct JSX children match this regex.
+    /// Used for conformance rules like "AlertGroup must contain Alert."
+    requires_child: Option<&'b Regex>,
     /// Components identified as transparent (children-passthrough) wrappers
     /// via cross-file resolution. When a transparent component is encountered
     /// as a JSX parent, its children inherit the parent from above rather than
@@ -225,6 +229,7 @@ pub fn scan_jsx_file<'a>(
     import_map: &ImportMap,
     child: Option<&Regex>,
     not_child: Option<&Regex>,
+    requires_child: Option<&Regex>,
     transparent_components: &HashSet<String>,
 ) -> Vec<Incident> {
     let local_fns = build_local_fn_map(stmts, source);
@@ -239,6 +244,7 @@ pub fn scan_jsx_file<'a>(
         local_fns: &local_fns,
         child,
         not_child,
+        requires_child,
         transparent_components,
     };
     for stmt in stmts {
@@ -269,6 +275,7 @@ pub fn scan_jsx(
         local_fns: &empty_fns,
         child: None,
         not_child: None,
+        requires_child: None,
         transparent_components: &empty_transparent,
     };
     walk_statement_for_jsx(stmt, &mut ctx, None);
@@ -901,8 +908,24 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
             true // no child filter — gate is open
         };
 
-        if child_gate_passed && ctx.not_child.is_none() {
-            ctx.incidents.push(incident);
+        if child_gate_passed && ctx.not_child.is_none() && ctx.requires_child.is_none() {
+            ctx.incidents.push(incident.clone());
+        }
+
+        // requiresChild: emit incident if NO direct child matches the required pattern.
+        // This is the inverse of `child` — fires on absence, not presence.
+        if let Some(req_re) = ctx.requires_child {
+            let has_required_child = el.children.iter().any(|c| {
+                if let JSXChild::Element(child_el) = c {
+                    let child_name = jsx_element_name_to_string(&child_el.opening_element.name);
+                    req_re.is_match(&child_name)
+                } else {
+                    false
+                }
+            });
+            if !has_required_child {
+                ctx.incidents.push(incident);
+            }
         }
 
         // notChild: emit incidents for direct JSX children that don't match
@@ -1123,6 +1146,7 @@ mod tests {
             &import_map,
             None, // child
             None, // not_child
+            None, // requires_child
             &empty_transparent,
         )
     }
@@ -1879,6 +1903,7 @@ const el = <Dropdown>{renderItems()}</Dropdown>;
             &import_map,
             None, // child
             Some(&not_child_re),
+            None, // requires_child
             &empty_transparent,
         )
     }
@@ -1978,6 +2003,7 @@ const el = (
             &import_map,
             Some(&child_re), // child
             None,            // not_child
+            None,            // requires_child
             &empty_transparent,
         )
     }
@@ -2338,6 +2364,153 @@ export function useMyToolbar() {
             Some(&serde_json::Value::String("__HookReturn__".to_string())),
             "Exported hook should set __HookReturn__ sentinel. Got: {:?}",
             incidents[0].variables
+        );
+    }
+
+    // ── requiresChild tests ─────────────────────────────────────────
+
+    fn scan_source_jsx_requires_child(
+        source: &str,
+        pattern: &str,
+        requires_child: &str,
+    ) -> Vec<Incident> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let ret = Parser::new(&allocator, source, source_type).parse();
+        let re = Regex::new(pattern).unwrap();
+        let requires_child_re = Regex::new(requires_child).unwrap();
+        let import_map = build_import_map(&ret.program);
+
+        let empty_transparent = HashSet::new();
+        scan_jsx_file(
+            &ret.program.body,
+            source,
+            &re,
+            "file:///test.tsx",
+            Some(&ReferenceLocation::JsxComponent),
+            &import_map,
+            None, // child
+            None, // not_child
+            Some(&requires_child_re),
+            &empty_transparent,
+        )
+    }
+
+    #[test]
+    fn test_requires_child_fires_when_no_matching_child() {
+        // AlertGroup has <div> but no <Alert> — should fire
+        let source = r#"
+import { AlertGroup } from '@patternfly/react-core';
+const el = (
+    <AlertGroup>
+        <div>not an alert</div>
+    </AlertGroup>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^AlertGroup$", r"^Alert$");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should fire when no direct child matches requiresChild"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_does_not_fire_when_child_present() {
+        // AlertGroup has <Alert> among other children — should NOT fire
+        let source = r#"
+import { AlertGroup, Alert } from '@patternfly/react-core';
+const el = (
+    <AlertGroup>
+        <Alert />
+        <div>wrapper</div>
+    </AlertGroup>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^AlertGroup$", r"^Alert$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "Should NOT fire when at least one child matches requiresChild"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_does_not_fire_when_any_child_matches() {
+        // AlertGroup has both Alert and AlertActionCloseButton — should NOT fire
+        let source = r#"
+import { AlertGroup, Alert, AlertActionCloseButton } from '@patternfly/react-core';
+const el = (
+    <AlertGroup>
+        <Alert />
+        <AlertActionCloseButton />
+    </AlertGroup>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(
+            source,
+            r"^AlertGroup$",
+            r"^(Alert|AlertActionCloseButton)$",
+        );
+        assert_eq!(
+            incidents.len(),
+            0,
+            "Should NOT fire when any child matches the requiresChild pattern"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_fires_on_self_closing() {
+        // Self-closing <AlertGroup /> has no children at all — should fire
+        let source = r#"
+import { AlertGroup } from '@patternfly/react-core';
+const el = <AlertGroup />;
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^AlertGroup$", r"^Alert$");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should fire on self-closing element with no children"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_incident_is_on_parent() {
+        // Verify the incident span points to AlertGroup, not any child
+        let source = r#"
+import { AlertGroup } from '@patternfly/react-core';
+const el = (
+    <AlertGroup>
+        <div>not alert</div>
+    </AlertGroup>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^AlertGroup$", r"^Alert$");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables["componentName"].as_str().unwrap(),
+            "AlertGroup",
+            "Incident should be on the parent (AlertGroup)"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_does_not_emit_normal_incident() {
+        // When requiresChild is set and a matching child IS present,
+        // neither the requiresChild incident nor the normal incident should fire
+        let source = r#"
+import { AlertGroup, Alert } from '@patternfly/react-core';
+const el = (
+    <AlertGroup>
+        <Alert />
+    </AlertGroup>
+);
+"#;
+        let incidents = scan_source_jsx_requires_child(source, r"^AlertGroup$", r"^Alert$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "When requiresChild is set, no normal incident should be emitted and no requiresChild incident when child is present"
         );
     }
 }
