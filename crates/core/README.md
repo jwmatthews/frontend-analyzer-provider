@@ -41,7 +41,7 @@ Types for fix planning, execution, and strategy resolution.
 
 | Type | Purpose |
 |---|---|
-| `FixStrategy` | Runtime fix strategy enum (Rename, RemoveProp, ImportPathChange, CssVariablePrefix, UpdateDependency, Manual, Llm) |
+| `FixStrategy` | Runtime fix strategy enum (Rename, RemoveProp, ImportPathChange, CssVariablePrefix, EnsureDependency, Manual, Llm) |
 | `FixPlan` | Groups `PlannedFix` items by file, plus `manual` and `pending_llm` lists |
 | `PlannedFix` | Collection of `TextEdit` items for a single incident |
 | `TextEdit` | A single line-level text replacement (line, old_text, new_text) |

@@ -79,7 +79,7 @@ impl FixContext for PatternFlyV5ToV6Context {
             || rule_id.contains("render-output")
         {
             4 // informational: DOM/CSS/a11y changes
-        } else if rule_id.starts_with("conformance-") {
+        } else if rule_id.contains("conformance") {
             5 // review-only: conformance checks
         } else {
             3 // default: treat as prop-level
@@ -162,6 +162,16 @@ mod tests {
         assert_eq!(ctx.fix_priority("pfv6-prop-removed-isActive"), 3);
         assert_eq!(ctx.fix_priority("pfv6-dom-structure-change"), 4);
         assert_eq!(ctx.fix_priority("conformance-check"), 5);
+        // sd-conformance-* rules (from structural diff) must also match
+        assert_eq!(ctx.fix_priority("sd-conformance-tbody-must-be-in-table"), 5);
+        assert_eq!(
+            ctx.fix_priority("sd-conformance-toolbaritem-must-be-in-toolbar"),
+            5
+        );
+        assert_eq!(
+            ctx.fix_priority("sd-conformance-pagesection-must-be-in-page"),
+            5
+        );
     }
 
     #[test]

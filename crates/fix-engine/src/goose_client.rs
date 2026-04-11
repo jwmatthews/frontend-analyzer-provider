@@ -247,6 +247,42 @@ fn extract_text_from_goose_json(raw_json: &str) -> String {
     }
 }
 
+/// Extract the "## Changes Applied" section from the LLM's response.
+///
+/// The prompt instructs the LLM to produce this section after writing the file.
+/// We extract it verbatim to pass as continuation context to the next chunk,
+/// so subsequent chunks know what was actually changed (not just what was requested).
+///
+/// Falls back to "## Summary of Changes", "## Summary of changes", or
+/// "## Changes Applied" variants for robustness.
+fn extract_changes_applied(response: &str) -> Option<String> {
+    // Try multiple header patterns the LLM might use
+    let markers = [
+        "## Changes Applied",
+        "## Summary of Changes",
+        "## Summary of changes",
+        "## Summary",
+    ];
+
+    for marker in &markers {
+        if let Some(start) = response.find(marker) {
+            let section = &response[start..];
+            // Trim to just this section — stop at the next top-level heading
+            // or end of response.
+            let end = section[marker.len()..]
+                .find("\n## ")
+                .map(|pos| marker.len() + pos)
+                .unwrap_or(section.len());
+            let trimmed = section[..end].trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 /// Maximum number of files to process concurrently.
 /// Each file spawns a goose process, so this limits system load.
 const MAX_CONCURRENT_FILES: usize = 3;
@@ -279,9 +315,24 @@ pub fn run_all_goose_fixes(
     let mut merged_by_file: Vec<(PathBuf, Vec<MergedLlmFixRequest>)> = Vec::new();
     for (path, file_reqs) in by_file {
         let mut merged = merge_by_rule_id(&file_reqs);
+        // Sort family rules first (they represent coherent migrations that
+        // should be processed as early as possible), grouped by family name
+        // so same-family rules are adjacent for chunking. Within each group,
+        // sort by individual priority. Non-family rules come after.
         merged.sort_by(|a, b| {
-            ctx.fix_priority(&a.rule_id)
-                .cmp(&ctx.fix_priority(&b.rule_id))
+            let a_has_family = a.family.is_some();
+            let b_has_family = b.family.is_some();
+            match (a_has_family, b_has_family) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (true, true) => a.family.cmp(&b.family).then_with(|| {
+                    ctx.fix_priority(&a.rule_id)
+                        .cmp(&ctx.fix_priority(&b.rule_id))
+                }),
+                (false, false) => ctx
+                    .fix_priority(&a.rule_id)
+                    .cmp(&ctx.fix_priority(&b.rule_id)),
+            }
         });
         merged_by_file.push((path, merged));
     }
@@ -645,22 +696,29 @@ fn process_single_file(
                     all_stderrs.push(stderr);
 
                     // Record what was applied for context in next chunk.
-                    // Include the first 3 lines of the message to preserve
-                    // critical details like import path changes that
-                    // subsequent chunks need to avoid reverting.
-                    for req in chunk.iter() {
-                        let lines_display = req
-                            .lines
-                            .iter()
-                            .map(|l| l.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let summary: String =
-                            req.message.lines().take(3).collect::<Vec<_>>().join("\n  ");
-                        applied_summaries.push(format!(
-                            "- {} (line {}): {}",
-                            req.rule_id, lines_display, summary
-                        ));
+                    // Extract the "## Changes Applied" section from the LLM's
+                    // response, which describes what was actually done (or not).
+                    // This is more useful than echoing the fix descriptions,
+                    // because it tells the next chunk what the file looks like
+                    // now, not what was requested.
+                    if let Some(summary) = extract_changes_applied(&output) {
+                        applied_summaries.push(summary);
+                    } else {
+                        // Fallback: use first line of each fix description
+                        for req in chunk.iter() {
+                            let lines_display = req
+                                .lines
+                                .iter()
+                                .map(|l| l.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let first_line =
+                                req.message.lines().next().unwrap_or("(no description)");
+                            applied_summaries.push(format!(
+                                "- {} (line {}): {}",
+                                req.rule_id, lines_display, first_line
+                            ));
+                        }
                     }
                     all_outputs.push(output.clone());
                     result = Ok(GooseFixResult {
@@ -879,7 +937,9 @@ Instructions:
 4. Write the fixed file
 {constraints_section}
 
-Before writing, reason through the fix step by step to ensure nothing is missed. Then read the file, make the edit, and write it."#,
+Before writing, reason through the fix step by step to ensure nothing is missed. Then read the file, make the edit, and write it.
+
+After writing the file, produce a '## Changes Applied' section that lists the change you made, or note if the fix was already applied or could not be applied (with a brief reason)."#,
         migration_desc = ctx.migration_description(),
         file_path = request.file_path.display(),
         lines = lines_display,
@@ -1002,17 +1062,17 @@ fn build_batch_prompt_with_context(
 
     let revert_warning = ctx.revert_warnings().unwrap_or("");
     let context_section = if let Some(applied) = previously_applied {
-        let mut section = "\n## Previously attempted fixes:\n\
-             The following fixes were attempted in a previous pass. Most should already\n\
-             be applied to the file on disk. Do NOT revert changes that are already correct.\n"
+        let mut section = "\n## Changes from previous pass:\n\
+             The following changes were made in a previous pass and are already applied\n\
+             to the file on disk. Do NOT revert these changes.\n"
             .to_string();
         if !revert_warning.is_empty() {
             section.push_str(revert_warning);
             section.push('\n');
         }
         section.push_str(
-            "However, if any of these fixes were NOT actually applied (the old pattern\n\
-             still exists in the file), apply them now along with the new fixes below.\n",
+            "If any listed change was NOT actually applied (the old pattern still exists\n\
+             in the file), apply it now along with the new fixes below.\n\n",
         );
         section.push_str(&applied.join("\n"));
         section.push_str("\n\n");
@@ -1052,7 +1112,9 @@ Instructions:
 5. Write the fixed file once with ALL changes from every fix applied
 {constraints_section}
 {verification_section}
-Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it."#,
+Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it.
+
+After writing the file, produce a '## Changes Applied' section that lists each change you made, each fix that was already applied (no change needed), and each fix you could not apply (with a brief reason). This summary is used by subsequent processing steps."#,
         migration_desc = ctx.migration_description(),
         file_path = file_path.display(),
         context_section = context_section,
@@ -1279,6 +1341,56 @@ mod tests {
         assert_eq!(result, text);
     }
 
+    fn make_req_with_family(rule_id: &str, line: u32, family: &str) -> LlmFixRequest {
+        let mut req = make_req_at_line(rule_id, line, None);
+        req.labels.push(format!("family={}", family));
+        req
+    }
+
+    #[test]
+    fn test_family_first_sort_groups_families_before_non_family() {
+        // Family rules should sort before non-family rules regardless
+        // of individual priority. Within families, same-family rules
+        // cluster together.
+        let reqs = vec![
+            make_req_with_family("sd-composition-alert-requires-close", 10, "Alert"),
+            make_req_at_line("semver-modal-component-import-deprecated", 3, None),
+            make_req_with_family("sd-composition-modal-new-member-body", 20, "Modal"),
+            make_req_with_family("sd-conformance-alert-close-in-group", 15, "Alert"),
+            make_req_at_line("sd-conformance-pagesection-in-page", 40, None),
+            make_req_with_family("sd-composition-modal-new-member-header", 25, "Modal"),
+        ];
+        let refs: Vec<&LlmFixRequest> = reqs.iter().collect();
+
+        let mut merged = merge_by_rule_id(&refs);
+        // Use the family-first sort (same logic as run_all_goose_fixes)
+        let ctx = crate::context::GenericFixContext;
+        merged.sort_by(|a, b| {
+            let a_has_family = a.family.is_some();
+            let b_has_family = b.family.is_some();
+            match (a_has_family, b_has_family) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (true, true) => a.family.cmp(&b.family).then_with(|| {
+                    ctx.fix_priority(&a.rule_id)
+                        .cmp(&ctx.fix_priority(&b.rule_id))
+                }),
+                (false, false) => ctx
+                    .fix_priority(&a.rule_id)
+                    .cmp(&ctx.fix_priority(&b.rule_id)),
+            }
+        });
+
+        // All Alert rules first, then all Modal rules, then non-family
+        assert_eq!(merged.len(), 6);
+        assert_eq!(merged[0].family.as_deref(), Some("Alert"));
+        assert_eq!(merged[1].family.as_deref(), Some("Alert"));
+        assert_eq!(merged[2].family.as_deref(), Some("Modal"));
+        assert_eq!(merged[3].family.as_deref(), Some("Modal"));
+        assert!(merged[4].family.is_none());
+        assert!(merged[5].family.is_none());
+    }
+
     #[test]
     fn test_extract_text_from_goose_json_multiple_text_blocks() {
         let json = r#"{
@@ -1292,5 +1404,52 @@ mod tests {
         }"#;
         let result = extract_text_from_goose_json(json);
         assert_eq!(result, "First part.\nSecond part.");
+    }
+
+    // ── extract_changes_applied tests ────────────────────────────────────
+
+    #[test]
+    fn test_extract_changes_applied_standard_header() {
+        let response = "Some reasoning...\n\n\
+            ## Changes Applied\n\
+            - Moved AlertActionCloseButton from actionClose prop to child of Alert\n\
+            - Added ModalHeader, ModalBody, ModalFooter imports\n";
+        let result = extract_changes_applied(response);
+        assert!(result.is_some());
+        let section = result.unwrap();
+        assert!(section.starts_with("## Changes Applied"));
+        assert!(section.contains("AlertActionCloseButton"));
+        assert!(section.contains("ModalHeader"));
+    }
+
+    #[test]
+    fn test_extract_changes_applied_summary_of_changes_variant() {
+        let response = "Analysis...\n\n\
+            ## Summary of Changes\n\
+            - Removed EmptyStateHeader\n\
+            - Moved props to EmptyState\n";
+        let result = extract_changes_applied(response);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("EmptyStateHeader"));
+    }
+
+    #[test]
+    fn test_extract_changes_applied_no_summary() {
+        let response = "The file already follows the correct pattern. No changes needed.";
+        let result = extract_changes_applied(response);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_changes_applied_stops_at_next_heading() {
+        let response = "## Changes Applied\n\
+            - Fixed Modal composition\n\n\
+            ## Additional Notes\n\
+            Some extra info that should not be included.\n";
+        let result = extract_changes_applied(response);
+        assert!(result.is_some());
+        let section = result.unwrap();
+        assert!(section.contains("Fixed Modal"));
+        assert!(!section.contains("Additional Notes"));
     }
 }

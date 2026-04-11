@@ -93,11 +93,11 @@ pub fn plan_fixes(
                             plan.files.entry(file_path).or_default().push(fix);
                         }
                     }
-                    FixStrategy::UpdateDependency {
+                    FixStrategy::EnsureDependency {
                         ref package,
                         ref new_version,
                     } => {
-                        if let Some(fix) = plan_update_dependency(
+                        if let Some(fix) = plan_ensure_dependency(
                             rule_id,
                             incident,
                             package,
@@ -242,6 +242,12 @@ pub fn consolidate_family_requests(
             message.push_str("\nProps that move to child components:\n");
             for (prop, child) in &entry.prop_to_child {
                 message.push_str(&format!("  {} -> <{} />\n", prop, child));
+            }
+        }
+        if !entry.unmapped_removed_props.is_empty() {
+            message.push_str("\nRemoved props (move to child component as children or remove):\n");
+            for (prop, target) in &entry.unmapped_removed_props {
+                message.push_str(&format!("  {} -> {}\n", prop, target));
             }
         }
         if !entry.child_props_to_parent.is_empty() {
@@ -720,17 +726,43 @@ fn plan_import_path_change(
     })
 }
 
-fn plan_update_dependency(
+/// Walk up the directory tree from `path` to find the nearest `package.json`.
+fn find_nearest_package_json(path: &std::path::Path) -> Option<PathBuf> {
+    let mut dir = if path.is_file() { path.parent()? } else { path };
+    loop {
+        let candidate = dir.join("package.json");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Ensure a dependency exists at the correct version in `package.json`.
+///
+/// 1. If `file_path` is a `package.json`, use it directly (dependency condition leg).
+///    Otherwise walk up from `file_path` to find the nearest `package.json`
+///    (import condition leg — the incident points at a source file).
+/// 2. Try to update: scan for the package name in the file and replace the version.
+/// 3. If not found: insert a new entry into the `"dependencies"` block.
+fn plan_ensure_dependency(
     rule_id: &str,
-    incident: &Incident,
+    _incident: &Incident,
     package: &str,
     new_version: &str,
     file_path: &PathBuf,
 ) -> Option<PlannedFix> {
-    let source = std::fs::read_to_string(file_path).ok()?;
+    // Resolve the target package.json
+    let pkg_json = if file_path.file_name().is_some_and(|f| f == "package.json") {
+        file_path.clone()
+    } else {
+        find_nearest_package_json(file_path)?
+    };
 
-    // Find the line containing this package name, regardless of incident line number.
-    // Kantra may not pass through the provider's line number correctly.
+    let source = std::fs::read_to_string(&pkg_json).ok()?;
+    let pkg_json_uri = format!("file://{}", pkg_json.display());
+
+    // --- Try update: find the package name and replace its version ---
     let package_quoted = format!("\"{}\"", package);
     let version_re = regex::Regex::new(r#"("[\^~><=]*\d+\.\d+\.\d+[^"]*")"#).ok()?;
 
@@ -758,14 +790,127 @@ fn plan_update_dependency(
                 confidence: FixConfidence::Exact,
                 source: FixSource::Pattern,
                 rule_id: rule_id.to_string(),
-                file_uri: incident.file_uri.clone(),
+                file_uri: pkg_json_uri,
                 line,
                 description: format!("Update {} to {}", package, new_version),
             });
         }
     }
 
-    None
+    // --- Insert: package not found, add it to the "dependencies" block ---
+    //
+    // Find the "dependencies" block, locate its closing brace, and insert
+    // the new entry before it. Uses the TextEdit replacement trick:
+    // replace the closing `}` with `  "pkg": "ver"\n  }` to insert a line.
+    let lines: Vec<&str> = source.lines().collect();
+    let mut in_dependencies = false;
+    let mut brace_depth = 0;
+    let mut last_entry_line: Option<usize> = None;
+    let mut closing_brace_line: Option<usize> = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if !in_dependencies {
+            if trimmed.starts_with("\"dependencies\"") {
+                in_dependencies = true;
+                // The opening { may be on this line or the next
+                if trimmed.contains('{') {
+                    brace_depth = 1;
+                }
+            }
+            continue;
+        }
+
+        // Inside dependencies block
+        if brace_depth == 0 && trimmed.starts_with('{') {
+            brace_depth = 1;
+            continue;
+        }
+
+        if brace_depth == 1 {
+            if trimmed == "}" || trimmed == "}," {
+                closing_brace_line = Some(idx);
+                break;
+            }
+            // Track the last non-empty entry line for comma handling
+            if !trimmed.is_empty() {
+                last_entry_line = Some(idx);
+            }
+        }
+
+        // Track nested objects (shouldn't happen in flat deps, but be safe)
+        for ch in trimmed.chars() {
+            if ch == '{' {
+                brace_depth += 1;
+            } else if ch == '}' {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    closing_brace_line = Some(idx);
+                    break;
+                }
+            }
+        }
+        if closing_brace_line.is_some() {
+            break;
+        }
+    }
+
+    let closing_idx = closing_brace_line?;
+    let closing_line_num = (closing_idx + 1) as u32;
+
+    // Detect indentation from existing entries or the closing brace
+    let entry_indent = if let Some(last_idx) = last_entry_line {
+        let last = lines[last_idx];
+        let indent_len = last.len() - last.trim_start().len();
+        &last[..indent_len]
+    } else {
+        "    " // fallback: 4 spaces
+    };
+
+    let mut edits = Vec::new();
+
+    // If there's a previous entry and it doesn't end with a comma, add one
+    if let Some(last_idx) = last_entry_line {
+        let last = lines[last_idx];
+        if !last.trim_end().ends_with(',') {
+            let last_line_num = (last_idx + 1) as u32;
+            let trimmed_last = last.trim_end().to_string();
+            edits.push(TextEdit {
+                line: last_line_num,
+                old_text: trimmed_last.clone(),
+                new_text: format!("{},", trimmed_last),
+                rule_id: rule_id.to_string(),
+                description: format!("Add trailing comma before new dependency {}", package),
+                replace_all: false,
+            });
+        }
+    }
+
+    // Insert the new entry by replacing the closing brace line
+    let closing_line_text = lines[closing_idx].to_string();
+    let new_entry = format!(
+        "{}\"{}\": \"{}\"\n{}",
+        entry_indent, package, new_version, closing_line_text
+    );
+    edits.push(TextEdit {
+        line: closing_line_num,
+        old_text: closing_line_text,
+        new_text: new_entry,
+        rule_id: rule_id.to_string(),
+        description: format!("Add {} {} to dependencies", package, new_version),
+        replace_all: false,
+    });
+
+    Some(PlannedFix {
+        edits,
+        confidence: FixConfidence::Exact,
+        source: FixSource::Pattern,
+        rule_id: rule_id.to_string(),
+        file_uri: pkg_json_uri,
+        line: closing_line_num,
+        description: format!("Add {} {} to dependencies", package, new_version),
+    })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

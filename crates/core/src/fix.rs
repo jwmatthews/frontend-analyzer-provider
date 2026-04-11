@@ -133,8 +133,9 @@ pub enum FixStrategy {
         old_prefix: String,
         new_prefix: String,
     },
-    /// Update a dependency version in package.json.
-    UpdateDependency {
+    /// Ensure a dependency exists at the correct version in package.json
+    /// (add if missing, update version if present).
+    EnsureDependency {
         package: String,
         new_version: String,
     },
@@ -201,9 +202,9 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
                 FixStrategy::Manual
             }
         }
-        "UpdateDependency" => {
+        "EnsureDependency" => {
             if let (Some(package), Some(new_version)) = (&entry.package, &entry.new_version) {
-                FixStrategy::UpdateDependency {
+                FixStrategy::EnsureDependency {
                     package: package.clone(),
                     new_version: new_version.clone(),
                 }
@@ -599,26 +600,26 @@ mod tests {
     }
 
     #[test]
-    fn test_update_dependency() {
-        let mut entry = make_strategy_entry("UpdateDependency");
+    fn test_ensure_dependency() {
+        let mut entry = make_strategy_entry("EnsureDependency");
         entry.package = Some("@patternfly/react-core".to_string());
         entry.new_version = Some("^6.0.0".to_string());
 
         match strategy_entry_to_fix_strategy(&entry) {
-            FixStrategy::UpdateDependency {
+            FixStrategy::EnsureDependency {
                 package,
                 new_version,
             } => {
                 assert_eq!(package, "@patternfly/react-core");
                 assert_eq!(new_version, "^6.0.0");
             }
-            other => panic!("Expected UpdateDependency, got {:?}", other),
+            other => panic!("Expected EnsureDependency, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_update_dependency_missing_fields_falls_to_manual() {
-        let mut entry = make_strategy_entry("UpdateDependency");
+    fn test_ensure_dependency_missing_fields_falls_to_manual() {
+        let mut entry = make_strategy_entry("EnsureDependency");
         entry.package = Some("something".to_string());
         // missing new_version
         match strategy_entry_to_fix_strategy(&entry) {

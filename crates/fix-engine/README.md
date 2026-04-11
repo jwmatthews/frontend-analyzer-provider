@@ -17,7 +17,7 @@ The fix engine operates in two phases:
 | `RemoveProp` | Pattern | JSX prop removal with bracket balancing for multi-line props |
 | `ImportPathChange` | Pattern | Module import path rewriting |
 | `CssVariablePrefix` | Pattern | CSS class/variable prefix swap (e.g., `pf-v5-` -> `pf-v6-`) |
-| `UpdateDependency` | Pattern | package.json dependency version update |
+| `EnsureDependency` | Pattern | package.json dependency add-or-update (adds if missing, updates version if present) |
 | `Llm` | LLM | Delegates to an LLM backend for complex structural changes |
 | `Manual` | Manual | Flags for human review when no automated fix is possible |
 
