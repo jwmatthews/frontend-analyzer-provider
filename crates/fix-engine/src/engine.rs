@@ -41,7 +41,7 @@ pub fn plan_fixes(
                 .get(rule_id.as_str())
                 .cloned()
                 .or_else(|| infer_strategy_from_labels(&violation.labels).cloned())
-                .unwrap_or(FixStrategy::Llm);
+                .unwrap_or(FixStrategy::Llm { context: None });
 
             for incident in &violation.incidents {
                 let file_path = uri_to_path(&incident.file_uri, project_root);
@@ -116,13 +116,33 @@ pub fn plan_fixes(
                             code_snip: incident.code_snip.clone(),
                         });
                     }
-                    FixStrategy::Llm => {
+                    FixStrategy::Llm { ref context } => {
+                        let mut enriched_message = incident.message.clone();
+
+                        // Append incident variables as structured context
+                        // (propName, componentName, propValue, module, etc.)
+                        if !incident.variables.is_empty() {
+                            enriched_message.push_str("\n\nIncident context:");
+                            for (key, value) in &incident.variables {
+                                let val_str = match value {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                enriched_message.push_str(&format!("\n  {}: {}", key, val_str));
+                            }
+                        }
+
+                        // Append strategy context if available (from FixStrategyEntry)
+                        if let Some(ctx) = context {
+                            enriched_message.push_str(&format!("\n\nFix strategy:\n{}", ctx));
+                        }
+
                         plan.pending_llm.push(LlmFixRequest {
                             rule_id: rule_id.clone(),
                             file_uri: incident.file_uri.clone(),
                             file_path: file_path.clone(),
                             line: incident.line_number.unwrap_or(0),
-                            message: incident.message.clone(),
+                            message: enriched_message,
                             code_snip: incident.code_snip.clone(),
                             source: None, // filled lazily if LLM is invoked
                             labels: violation.labels.clone(),
@@ -139,6 +159,223 @@ pub fn plan_fixes(
     }
 
     Ok(plan)
+}
+
+/// Consolidate LLM fix requests by component family when a family-level
+/// strategy exists. Multiple rules targeting the same `(file, family)` are
+/// merged into a single request with a unified message containing the target
+/// component structure and all incident variables.
+///
+/// Requests without a `family=` label, or whose family has no entry in
+/// `family_entries`, are left untouched.
+pub fn consolidate_family_requests(
+    requests: &mut Vec<LlmFixRequest>,
+    family_entries: &BTreeMap<String, FixStrategyEntry>,
+) {
+    use std::collections::BTreeSet;
+
+    if family_entries.is_empty() {
+        return;
+    }
+
+    // Extract family label from request labels (e.g., "family=Modal" → "Modal").
+    fn extract_family(labels: &[String]) -> Option<String> {
+        labels
+            .iter()
+            .find(|l| l.starts_with("family="))
+            .and_then(|l| l.strip_prefix("family="))
+            .map(|s| s.to_string())
+    }
+
+    // Group indices by (file_path, family) where a family strategy exists.
+    let mut groups: BTreeMap<(PathBuf, String), Vec<usize>> = BTreeMap::new();
+    let mut ungrouped_indices: BTreeSet<usize> = BTreeSet::new();
+
+    for (idx, req) in requests.iter().enumerate() {
+        if let Some(family) = extract_family(&req.labels) {
+            let key = format!("family:{}", family);
+            if family_entries.contains_key(&key) {
+                groups
+                    .entry((req.file_path.clone(), family))
+                    .or_default()
+                    .push(idx);
+                continue;
+            }
+        }
+        ungrouped_indices.insert(idx);
+    }
+
+    if groups.is_empty() {
+        return;
+    }
+
+    // Build consolidated requests and collect indices to remove.
+    let mut consolidated: Vec<LlmFixRequest> = Vec::new();
+    let mut consumed_indices: BTreeSet<usize> = BTreeSet::new();
+
+    for ((file_path, family), indices) in &groups {
+        if indices.len() <= 1 {
+            // Single request — leave it as-is with its already-enriched message.
+            continue;
+        }
+
+        let key = format!("family:{}", family);
+        let entry = &family_entries[&key];
+
+        // Build the family migration context header.
+        let mut message = format!("## {} Family Migration\n", family);
+
+        if let Some(ref target) = entry.target_structure {
+            message.push_str(&format!(
+                "\nTarget structure (correct v6 composition):\n```jsx\n{}\n```\n",
+                target
+            ));
+        }
+        if !entry.retained_props.is_empty() {
+            message.push_str(&format!(
+                "\nProps that stay on <{}>: {}\n",
+                family,
+                entry.retained_props.join(", ")
+            ));
+        }
+        if !entry.prop_to_child.is_empty() {
+            message.push_str("\nProps that move to child components:\n");
+            for (prop, child) in &entry.prop_to_child {
+                message.push_str(&format!("  {} -> <{} />\n", prop, child));
+            }
+        }
+        if !entry.child_props_to_parent.is_empty() {
+            message.push_str("\nChild props that move to parent:\n");
+            for (child_prop, parent_prop) in &entry.child_props_to_parent {
+                message.push_str(&format!("  {} -> {}\n", child_prop, parent_prop));
+            }
+        }
+        if !entry.removed_children.is_empty() {
+            message.push_str(&format!(
+                "\nRemoved children (no longer valid JSX): {}\n",
+                entry.removed_children.join(", ")
+            ));
+        }
+        if !entry.new_imports.is_empty() {
+            let src = entry.import_source.as_deref().unwrap_or("(same package)");
+            message.push_str(&format!(
+                "\nAdd imports: {} from '{}'\n",
+                entry.new_imports.join(", "),
+                src
+            ));
+        }
+        if !entry.removed_imports.is_empty() {
+            message.push_str(&format!(
+                "\nRemove imports (if no longer used): {}\n",
+                entry.removed_imports.join(", ")
+            ));
+        }
+
+        // Collect all incident data from the grouped requests.
+        // Filter out zero-action rules that add noise without guidance:
+        // - signature-changed rules (TypeScript base class changes)
+        // - type-changed rules on generic parameters (RefAttributes)
+        // These are subsumed by the family template.
+        let filtered_indices: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                let req = &requests[idx];
+                // Suppress signature-changed and no-op type-changed rules
+                let dominated = req.labels.iter().any(|l| {
+                    l == "change-type=signature-changed" || l == "change-type=type-changed"
+                }) && (req.message.contains("base class changed")
+                    || req.message.contains("RefAttributes"));
+                !dominated
+            })
+            .collect();
+
+        message.push_str("\nIncidents found in this file:\n");
+        let mut all_lines: Vec<u32> = Vec::new();
+        let mut all_snips: Vec<(u32, String)> = Vec::new();
+        let mut all_labels: Vec<String> = Vec::new();
+        let mut seen_rules: BTreeSet<String> = BTreeSet::new();
+
+        for &idx in &filtered_indices {
+            let req = &requests[idx];
+            all_lines.push(req.line);
+
+            // Extract and format the incident-specific info.
+            // The enriched message already has incident context appended.
+            // We extract the original rule message (before our enrichment)
+            // and the incident variables separately.
+            let rule_info = if seen_rules.insert(req.rule_id.clone()) {
+                format!("  Line {}: [{}]\n", req.line, req.rule_id)
+            } else {
+                format!("  Line {}: (same rule {})\n", req.line, req.rule_id)
+            };
+            message.push_str(&rule_info);
+
+            // Include the incident variables section from the enriched message.
+            if let Some(var_start) = req.message.find("\n\nIncident context:") {
+                let var_section =
+                    if let Some(strat_start) = req.message[var_start..].find("\n\nFix strategy:") {
+                        &req.message[var_start..var_start + strat_start]
+                    } else {
+                        &req.message[var_start..]
+                    };
+                // Indent the variables under the line reference.
+                for line in var_section.trim().lines().skip(1) {
+                    // skip the "Incident context:" header on first occurrence
+                    message.push_str(&format!("    {}\n", line.trim()));
+                }
+            }
+
+            if let Some(snip) = &req.code_snip {
+                all_snips.push((req.line, snip.clone()));
+            }
+            for label in &req.labels {
+                if !all_labels.contains(label) {
+                    all_labels.push(label.clone());
+                }
+            }
+        }
+
+        // Use first line as the representative, keep all for reference.
+        let first_line = all_lines.iter().copied().min().unwrap_or(0);
+        let first_uri = requests[indices[0]].file_uri.clone();
+
+        // Build consolidated code snippets section.
+        if !all_snips.is_empty() {
+            message.push_str("\nCode contexts:\n");
+            let mut seen_snips: BTreeSet<String> = BTreeSet::new();
+            for (line, snip) in &all_snips {
+                if seen_snips.insert(snip.clone()) {
+                    message.push_str(&format!("  (line {}):\n{}\n", line, snip));
+                }
+            }
+        }
+
+        consolidated.push(LlmFixRequest {
+            rule_id: format!("family:{}", family),
+            file_uri: first_uri,
+            file_path: file_path.clone(),
+            line: first_line,
+            message,
+            code_snip: None, // snippets are in the message body
+            source: None,
+            labels: all_labels,
+        });
+
+        for &idx in indices {
+            consumed_indices.insert(idx);
+        }
+    }
+
+    // Rebuild the request list: ungrouped first, then consolidated.
+    let mut new_requests: Vec<LlmFixRequest> = Vec::new();
+    for (idx, req) in requests.drain(..).enumerate() {
+        if !consumed_indices.contains(&idx) {
+            new_requests.push(req);
+        }
+    }
+    new_requests.extend(consolidated);
+    *requests = new_requests;
 }
 
 /// Apply a fix plan to disk.

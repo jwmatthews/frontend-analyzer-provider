@@ -8,10 +8,14 @@
 use crate::scanner::make_incident;
 use frontend_core::capabilities::ReferenceLocation;
 use frontend_core::incident::Incident;
+use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
-use oxc_span::GetSpan;
+use oxc_parser::Parser;
+use oxc_resolver::Resolver;
+use oxc_span::{GetSpan, SourceType};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::path::Path;
 
 /// Import map: local identifier name → module source path.
 /// Built from import declarations, passed through JSX scanning so components
@@ -52,10 +56,16 @@ struct ScanContext<'a, 'b> {
     /// Used for conformance rules like "AlertGroup must contain Alert."
     requires_child: Option<&'b Regex>,
     /// Components identified as transparent (children-passthrough) wrappers
-    /// via cross-file resolution. When a transparent component is encountered
-    /// as a JSX parent, its children inherit the parent from above rather than
-    /// seeing the transparent component as their parent.
-    transparent_components: &'b HashSet<String>,
+    /// via cross-file resolution. Maps component name → wrapper info:
+    /// - `None` = pure passthrough (Fragment, div) — collapse to grandparent
+    /// - `Some("Table")` = wraps children in `<Table>` — substitute as parent
+    transparent_components: &'b HashMap<String, crate::transparency::WrapperInfo>,
+    /// Optional resolver for cross-file function reference resolution.
+    /// When a prop value is an imported identifier (e.g., `toggle` from another
+    /// file), the resolver follows the import to find the function's source.
+    resolver: Option<&'b Resolver>,
+    /// Path of the file being scanned (used for import resolution).
+    file_path: Option<&'b Path>,
 }
 
 /// Build a map of all function declarations in the AST, including those
@@ -75,9 +85,7 @@ const HOOK_RETURN_SENTINEL: &str = "__HookReturn__";
 /// with `use` followed by an uppercase letter (e.g., `useToolbar`, `useMyHook`).
 fn is_hook_name(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix("use") {
-        rest.chars()
-            .next()
-            .map_or(false, |c| c.is_ascii_uppercase())
+        rest.chars().next().is_some_and(|c| c.is_ascii_uppercase())
     } else {
         false
     }
@@ -230,7 +238,43 @@ pub fn scan_jsx_file<'a>(
     child: Option<&Regex>,
     not_child: Option<&Regex>,
     requires_child: Option<&Regex>,
-    transparent_components: &HashSet<String>,
+    transparent_components: &HashMap<String, crate::transparency::WrapperInfo>,
+) -> Vec<Incident> {
+    scan_jsx_file_with_resolver(
+        stmts,
+        source,
+        pattern,
+        file_uri,
+        location,
+        import_map,
+        child,
+        not_child,
+        requires_child,
+        transparent_components,
+        None,
+        None,
+    )
+}
+
+/// Like `scan_jsx_file` but with optional cross-file resolution support.
+///
+/// When `resolver` and `file_path` are provided, function references passed
+/// as prop values (e.g., `toggle={toggle}`) that resolve to imports will be
+/// followed cross-file: the imported file is parsed, the exported function
+/// found, and its JSX body walked with the parent context from the call site.
+pub fn scan_jsx_file_with_resolver<'a>(
+    stmts: &'a [Statement<'a>],
+    source: &str,
+    pattern: &Regex,
+    file_uri: &str,
+    location: Option<&ReferenceLocation>,
+    import_map: &ImportMap,
+    child: Option<&Regex>,
+    not_child: Option<&Regex>,
+    requires_child: Option<&Regex>,
+    transparent_components: &HashMap<String, crate::transparency::WrapperInfo>,
+    resolver: Option<&Resolver>,
+    file_path: Option<&Path>,
 ) -> Vec<Incident> {
     let local_fns = build_local_fn_map(stmts, source);
     let mut incidents = Vec::new();
@@ -246,6 +290,8 @@ pub fn scan_jsx_file<'a>(
         not_child,
         requires_child,
         transparent_components,
+        resolver,
+        file_path,
     };
     for stmt in stmts {
         walk_statement_for_jsx(stmt, &mut ctx, None);
@@ -263,7 +309,7 @@ pub fn scan_jsx(
     import_map: &ImportMap,
 ) -> Vec<Incident> {
     let empty_fns = LocalFnMap::new();
-    let empty_transparent = HashSet::new();
+    let empty_transparent = HashMap::new();
     let mut incidents = Vec::new();
     let mut ctx = ScanContext {
         source,
@@ -277,6 +323,8 @@ pub fn scan_jsx(
         not_child: None,
         requires_child: None,
         transparent_components: &empty_transparent,
+        resolver: None,
+        file_path: None,
     };
     walk_statement_for_jsx(stmt, &mut ctx, None);
     incidents
@@ -382,7 +430,7 @@ fn walk_variable_declaration(
             // any JSX in its body is indirect usage composed elsewhere.
             let effective_parent = if has_component_type_annotation(declarator, ctx.source) {
                 Some(COMPONENT_RETURN_SENTINEL)
-            } else if binding_name(&declarator.id, ctx.source).map_or(false, is_hook_name) {
+            } else if binding_name(&declarator.id, ctx.source).is_some_and(is_hook_name) {
                 Some(HOOK_RETURN_SENTINEL)
             } else {
                 parent_name
@@ -424,6 +472,13 @@ fn walk_expression_for_jsx(
         }
         Expression::ArrowFunctionExpression(arrow) => {
             walk_function_body(&arrow.body, ctx, parent_name);
+        }
+        // Identifier reference: e.g., `toggle` in `toggle={toggle}`.
+        // Resolve to a local function and walk its body with the current
+        // parent context, so JSX rendered by that function inherits the
+        // parent element (e.g., <Select>).
+        Expression::Identifier(ident) => {
+            resolve_local_fn_reference(ident.name.as_str(), ctx, parent_name);
         }
         Expression::CallExpression(call) => {
             for arg in &call.arguments {
@@ -505,6 +560,12 @@ fn walk_jsx_expression(
         JSXExpression::LogicalExpression(logic) => {
             walk_expression_for_jsx(&logic.right, ctx, parent_name);
         }
+        // Identifier reference: e.g., `{toggle}` in children or `toggle={toggle}`.
+        // Resolve to a local function and walk its body with the current parent
+        // context, so JSX rendered by that function inherits the parent element.
+        JSXExpression::Identifier(ident) => {
+            resolve_local_fn_reference(ident.name.as_str(), ctx, parent_name);
+        }
         // Function calls: {renderFn(<Component />)} or {fn(arg)}
         JSXExpression::CallExpression(call) => {
             // Resolve local function calls: if the callee is a known local
@@ -549,6 +610,213 @@ fn walk_jsx_expression(
             }
         }
         _ => {}
+    }
+}
+
+/// Check if a JSX expression is a `{children}` or `{props.children}` passthrough.
+///
+/// Used to suppress `requiresChild` and `notChild` conformance checks when the
+/// component passes `{children}` through — the actual children are provided at
+/// the call site, not at the definition site.
+fn is_children_passthrough_expression(expr: &JSXExpression<'_>) -> bool {
+    match expr {
+        JSXExpression::Identifier(id) => id.name == "children",
+        JSXExpression::StaticMemberExpression(member) => {
+            member.property.name == "children"
+                && matches!(&member.object, Expression::Identifier(id) if id.name == "props")
+        }
+        _ => false,
+    }
+}
+
+/// Resolve a function reference by name — same-file or cross-file.
+///
+/// When an identifier like `toggle` is encountered in a JSX expression context
+/// (either as a prop value `toggle={toggle}` or as a child `{toggle}`):
+///
+/// 1. Check the `LocalFnMap` for a same-file function definition.
+/// 2. If not found and the name is an import, resolve the import cross-file
+///    using the `oxc_resolver`, parse the target file, find the exported
+///    function, and walk its JSX body with the current parent context.
+///
+/// This handles the common pattern where render functions are defined as
+/// variables and passed as prop values:
+///
+/// ```tsx
+/// const toggle = (toggleRef) => <MenuToggle ref={toggleRef}>...</MenuToggle>;
+/// return <Select toggle={toggle}>...</Select>;
+/// // → MenuToggle's parentName is "Select"
+/// ```
+fn resolve_local_fn_reference(name: &str, ctx: &mut ScanContext, parent_name: Option<&str>) {
+    // 1. Same-file: check LocalFnMap
+    if let Some(fn_expr) = ctx.local_fns.get(name) {
+        match fn_expr {
+            Expression::ArrowFunctionExpression(arrow) => {
+                walk_function_body(&arrow.body, ctx, parent_name);
+            }
+            Expression::FunctionExpression(func) => {
+                if let Some(body) = &func.body {
+                    walk_function_body(body, ctx, parent_name);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // 2. Cross-file: resolve imported function reference
+    let module_source = match ctx.import_map.get(name) {
+        Some(m) => m.clone(),
+        None => return,
+    };
+    let (resolver, file_path) = match (ctx.resolver, ctx.file_path) {
+        (Some(r), Some(p)) => (r, p),
+        _ => return,
+    };
+
+    // Resolve the import to a file path
+    let resolved_path =
+        match crate::resolve::resolve_import_with_resolver(resolver, file_path, &module_source) {
+            Some(p) => p,
+            None => return,
+        };
+
+    // Skip node_modules — we don't parse library source
+    if crate::resolve::is_node_modules_path(&resolved_path) {
+        return;
+    }
+
+    // Parse the resolved file and find the exported function
+    let source_text = match std::fs::read_to_string(&resolved_path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    resolve_cross_file_fn(
+        name,
+        &source_text,
+        ctx,
+        parent_name,
+        resolver,
+        &resolved_path,
+    );
+}
+
+/// Parse a resolved file and walk the exported function's JSX body with
+/// the given parent context. This is the cross-file resolution workhorse.
+fn resolve_cross_file_fn(
+    name: &str,
+    source_text: &str,
+    ctx: &mut ScanContext,
+    parent_name: Option<&str>,
+    resolver: &Resolver,
+    resolved_path: &Path,
+) {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(resolved_path).unwrap_or_default();
+    let ret = Parser::new(&allocator, source_text, source_type).parse();
+    if ret.panicked {
+        return;
+    }
+
+    // Build the local fn map for the resolved file so we can find the export
+    let remote_fns = build_local_fn_map(&ret.program.body, source_text);
+
+    // Check if the function is in the local fn map (covers `export const toggle = ...`)
+    if let Some(fn_expr) = remote_fns.get(name) {
+        // Walk the function body using OUR context (pattern, incidents, etc.)
+        // but with parent_name from the call site.
+        match fn_expr {
+            Expression::ArrowFunctionExpression(arrow) => {
+                walk_function_body(&arrow.body, ctx, parent_name);
+            }
+            Expression::FunctionExpression(func) => {
+                if let Some(body) = &func.body {
+                    walk_function_body(body, ctx, parent_name);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Check for `export function toggle(...)` declarations
+    for stmt in &ret.program.body {
+        if let Statement::ExportNamedDeclaration(export) = stmt {
+            if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
+                let fn_name = func.id.as_ref().map(|id| id.name.as_str()).unwrap_or("");
+                if fn_name == name {
+                    if let Some(body) = &func.body {
+                        walk_function_body(body, ctx, parent_name);
+                    }
+                    return;
+                }
+            }
+        }
+        // Also check `export default function` when the import is "default"
+        if let Statement::ExportDefaultDeclaration(export) = stmt {
+            if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
+                if let Some(body) = &func.body {
+                    walk_function_body(body, ctx, parent_name);
+                }
+                return;
+            }
+        }
+    }
+
+    // Follow re-exports: `export { toggle } from './otherFile'`
+    for stmt in &ret.program.body {
+        if let Statement::ExportNamedDeclaration(export) = stmt {
+            if let Some(ref source) = export.source {
+                for spec in &export.specifiers {
+                    let exported_name = spec.exported.name();
+                    if exported_name == name {
+                        // Resolve the re-export target
+                        let local_name = spec.local.name().to_string();
+                        if let Some(re_resolved) = crate::resolve::resolve_import_with_resolver(
+                            resolver,
+                            resolved_path,
+                            source.value.as_str(),
+                        ) {
+                            if !crate::resolve::is_node_modules_path(&re_resolved) {
+                                if let Ok(re_source) = std::fs::read_to_string(&re_resolved) {
+                                    resolve_cross_file_fn(
+                                        &local_name,
+                                        &re_source,
+                                        ctx,
+                                        parent_name,
+                                        resolver,
+                                        &re_resolved,
+                                    );
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        // `export * from './otherFile'` — follow and search
+        if let Statement::ExportAllDeclaration(export) = stmt {
+            if let Some(re_resolved) = crate::resolve::resolve_import_with_resolver(
+                resolver,
+                resolved_path,
+                export.source.value.as_str(),
+            ) {
+                if !crate::resolve::is_node_modules_path(&re_resolved) {
+                    if let Ok(re_source) = std::fs::read_to_string(&re_resolved) {
+                        resolve_cross_file_fn(
+                            name,
+                            &re_source,
+                            ctx,
+                            parent_name,
+                            resolver,
+                            &re_resolved,
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1128,9 +1396,21 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
         // requiresChild: emit incident if NO child matches the required
         // pattern. Walks into expression containers so `.map()` and
         // conditional children are visible.
+        //
+        // SKIP when the component passes {children} or {props.children}
+        // through — the actual children come from the call site, not this JSX.
+        // Checking here would be a false positive.
+        let passes_children_through = el.children.iter().any(|child| {
+            if let JSXChild::ExpressionContainer(c) = child {
+                is_children_passthrough_expression(&c.expression)
+            } else {
+                false
+            }
+        });
+
         if let Some(req_re) = ctx.requires_child {
             let has_required_child = all_children.iter().any(|(name, _)| req_re.is_match(name));
-            if !has_required_child {
+            if !has_required_child && !passes_children_through {
                 ctx.incidents.push(incident);
             }
         }
@@ -1138,31 +1418,38 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
         // notChild: emit incidents for each child whose name does NOT match
         // the pattern. Walks into expression containers so `.map()` and
         // conditional children are visible.
+        // Skipped when the component passes {children} through.
         if let Some(not_child_re) = ctx.not_child {
-            for (child_name, child_span) in &all_children {
-                if !not_child_re.is_match(child_name) {
-                    let mut child_incident =
-                        make_incident(ctx.source, ctx.file_uri, child_span.start, child_span.end);
-                    child_incident.variables.insert(
-                        "componentName".into(),
-                        serde_json::Value::String(child_name.clone()),
-                    );
-                    child_incident.variables.insert(
-                        "parentName".into(),
-                        serde_json::Value::String(component_name.clone()),
-                    );
-                    if let Some(module) = ctx.import_map.get(child_name) {
-                        child_incident
-                            .variables
-                            .insert("module".into(), serde_json::Value::String(module.clone()));
-                    }
-                    if let Some(parent_module) = ctx.import_map.get(&component_name) {
-                        child_incident.variables.insert(
-                            "parentFrom".into(),
-                            serde_json::Value::String(parent_module.clone()),
+            if !passes_children_through {
+                for (child_name, child_span) in &all_children {
+                    if !not_child_re.is_match(child_name) {
+                        let mut child_incident = make_incident(
+                            ctx.source,
+                            ctx.file_uri,
+                            child_span.start,
+                            child_span.end,
                         );
+                        child_incident.variables.insert(
+                            "componentName".into(),
+                            serde_json::Value::String(child_name.clone()),
+                        );
+                        child_incident.variables.insert(
+                            "parentName".into(),
+                            serde_json::Value::String(component_name.clone()),
+                        );
+                        if let Some(module) = ctx.import_map.get(child_name) {
+                            child_incident
+                                .variables
+                                .insert("module".into(), serde_json::Value::String(module.clone()));
+                        }
+                        if let Some(parent_module) = ctx.import_map.get(&component_name) {
+                            child_incident.variables.insert(
+                                "parentFrom".into(),
+                                serde_json::Value::String(parent_module.clone()),
+                            );
+                        }
+                        ctx.incidents.push(child_incident);
                     }
-                    ctx.incidents.push(child_incident);
                 }
             }
         }
@@ -1283,15 +1570,21 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
     // Recurse into children.
     //
     // If this component is a transparent wrapper (passes {children} through,
-    // identified via cross-file resolution), its children inherit the parent
-    // from above rather than seeing this component as their parent. This makes
-    // conformance rules like "Tbody must be inside Table" work correctly even
-    // when a non-library wrapper like ConditionalTableBody sits between them.
-    let effective_parent = if ctx.transparent_components.contains(&component_name) {
-        parent_name
-    } else {
-        Some(component_name.as_str())
-    };
+    // identified via cross-file resolution), resolve the effective parent:
+    // - Pure passthrough (Fragment, div): collapse to grandparent
+    // - Wrapper (e.g., wraps in <Table>): substitute the wrapper as parent
+    let effective_parent =
+        if let Some(wrapper_info) = ctx.transparent_components.get(&component_name) {
+            match wrapper_info {
+                // Pure passthrough — children see the grandparent
+                None => parent_name,
+                // Wraps children in a PF component — substitute as parent.
+                // We leak the string here via Box to get a stable &str reference.
+                Some(wrapper_name) => Some(wrapper_name.as_str()),
+            }
+        } else {
+            Some(component_name.as_str())
+        };
     for child in &el.children {
         walk_jsx_child(child, ctx, effective_parent);
     }
@@ -1337,7 +1630,7 @@ mod tests {
         let re = Regex::new(pattern).unwrap();
         let import_map = build_import_map(&ret.program);
 
-        let empty_transparent = HashSet::new();
+        let empty_transparent = HashMap::new();
         scan_jsx_file(
             &ret.program.body,
             source,
@@ -2094,7 +2387,7 @@ const el = <Dropdown>{renderItems()}</Dropdown>;
         let not_child_re = Regex::new(not_child).unwrap();
         let import_map = build_import_map(&ret.program);
 
-        let empty_transparent = HashSet::new();
+        let empty_transparent = HashMap::new();
         scan_jsx_file(
             &ret.program.body,
             source,
@@ -2194,7 +2487,7 @@ const el = (
         let child_re = Regex::new(child).unwrap();
         let import_map = build_import_map(&ret.program);
 
-        let empty_transparent = HashSet::new();
+        let empty_transparent = HashMap::new();
         scan_jsx_file(
             &ret.program.body,
             source,
@@ -2582,7 +2875,7 @@ export function useMyToolbar() {
         let requires_child_re = Regex::new(requires_child).unwrap();
         let import_map = build_import_map(&ret.program);
 
-        let empty_transparent = HashSet::new();
+        let empty_transparent = HashMap::new();
         scan_jsx_file(
             &ret.program.body,
             source,
@@ -2838,7 +3131,7 @@ const el = (
         let re = Regex::new(r"^AlertGroup$").unwrap();
         let child_re = Regex::new(r"^Alert$").unwrap();
         let import_map = build_import_map(&ret.program);
-        let empty_transparent = HashSet::new();
+        let empty_transparent = HashMap::new();
         let incidents = scan_jsx_file(
             &ret.program.body,
             source,
@@ -2928,6 +3221,222 @@ const el = (
             incidents.len(),
             0,
             "Should see Tab inside array literal with spread .map()"
+        );
+    }
+
+    // ── Children passthrough suppression tests ─────────────────────────
+
+    #[test]
+    fn test_requires_child_suppressed_when_passes_children() {
+        // Table passes {children} through — requiresChild should NOT fire
+        // because the actual children come from the call site.
+        let source = r#"
+import { Table } from '@patternfly/react-table';
+
+const TableWrapper = ({ children }) => (
+    <Table>
+        {children}
+    </Table>
+);
+"#;
+        let incidents =
+            scan_source_jsx_requires_child(source, r"^Table$", r"^(Thead|Tbody|Tr|Caption)$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "requiresChild should NOT fire when component passes children through"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_suppressed_when_passes_props_children() {
+        // Table passes {props.children} through — same suppression
+        let source = r#"
+import React from 'react';
+import { Table } from '@patternfly/react-table';
+
+const TableWithBatteries = React.forwardRef((props, ref) => (
+    <Table innerRef={ref} {...props}>
+        {props.children}
+    </Table>
+));
+"#;
+        let incidents =
+            scan_source_jsx_requires_child(source, r"^Table$", r"^(Thead|Tbody|Tr|Caption)$");
+        assert_eq!(
+            incidents.len(),
+            0,
+            "requiresChild should NOT fire when component passes props.children through"
+        );
+    }
+
+    #[test]
+    fn test_requires_child_still_fires_when_no_children_passthrough() {
+        // Table has real children but none matching — should fire
+        let source = r#"
+import { Table } from '@patternfly/react-table';
+
+const el = (
+    <Table>
+        <div>not a valid child</div>
+    </Table>
+);
+"#;
+        let incidents =
+            scan_source_jsx_requires_child(source, r"^Table$", r"^(Thead|Tbody|Tr|Caption)$");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "requiresChild should fire when no children passthrough and no matching child"
+        );
+    }
+
+    // ── Function reference resolution tests ──────────────────────────────
+
+    #[test]
+    fn test_fn_ref_prop_resolves_parent_same_file() {
+        // When toggle={toggle} passes a function reference as a prop,
+        // JSX inside the function should see the parent component (Select).
+        // The scanner finds MenuToggle twice:
+        //   1. In the function definition (parentName=None)
+        //   2. Via reference resolution at <Select toggle={toggle}> (parentName=Select)
+        let source = r#"
+import { Select, MenuToggle } from '@patternfly/react-core';
+
+const toggle = (toggleRef) => (
+    <MenuToggle ref={toggleRef} onClick={onToggle}>
+        Filter
+    </MenuToggle>
+);
+
+const el = (
+    <Select toggle={toggle} isOpen={isOpen}>
+        <div>options</div>
+    </Select>
+);
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^MenuToggle$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert!(incidents.len() >= 1, "Should find MenuToggle at least once");
+        let resolved = incidents.iter().find(|i| {
+            i.variables.get("parentName") == Some(&serde_json::Value::String("Select".to_string()))
+        });
+        assert!(
+            resolved.is_some(),
+            "Should have an incident with parentName=Select (resolved through toggle fn ref)"
+        );
+    }
+
+    #[test]
+    fn test_fn_ref_prop_inline_arrow_still_works() {
+        // Verify that inline arrow functions still work (existing behavior).
+        let source = r#"
+import { Select, MenuToggle } from '@patternfly/react-core';
+
+const el = (
+    <Select toggle={(ref) => <MenuToggle ref={ref}>Filter</MenuToggle>} isOpen={isOpen}>
+        <div>options</div>
+    </Select>
+);
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^MenuToggle$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert_eq!(incidents.len(), 1, "Should find MenuToggle");
+        assert_eq!(
+            incidents[0].variables.get("parentName"),
+            Some(&serde_json::Value::String("Select".to_string())),
+            "MenuToggle's parent should be Select (inline arrow)"
+        );
+    }
+
+    #[test]
+    fn test_fn_ref_as_jsx_child_resolves_parent() {
+        // When a function reference is used as a JSX child: {renderItems}
+        let source = r#"
+import { DropdownList, DropdownItem } from '@patternfly/react-core';
+
+const renderItems = () => (
+    <DropdownItem key="1">Action</DropdownItem>
+);
+
+const el = (
+    <DropdownList>
+        {renderItems}
+    </DropdownList>
+);
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^DropdownItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        assert!(
+            incidents.len() >= 1,
+            "Should find DropdownItem at least once"
+        );
+        let resolved = incidents.iter().find(|i| {
+            i.variables.get("parentName")
+                == Some(&serde_json::Value::String("DropdownList".to_string()))
+        });
+        assert!(
+            resolved.is_some(),
+            "Should have an incident with parentName=DropdownList (resolved through renderItems ref)"
+        );
+    }
+
+    #[test]
+    fn test_fn_ref_nested_jsx_in_function() {
+        // Function reference with multiple levels of JSX nesting.
+        let source = r#"
+import { Toolbar, ToolbarContent, ToolbarItem, Button } from '@patternfly/react-core';
+
+const renderToolbarContent = () => (
+    <ToolbarContent>
+        <ToolbarItem>
+            <Button>Click</Button>
+        </ToolbarItem>
+    </ToolbarContent>
+);
+
+const el = (
+    <Toolbar>
+        {renderToolbarContent}
+    </Toolbar>
+);
+"#;
+        // Check that ToolbarContent sees Toolbar as parent via fn ref resolution
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarContent$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        let resolved = incidents.iter().find(|i| {
+            i.variables.get("parentName") == Some(&serde_json::Value::String("Toolbar".to_string()))
+        });
+        assert!(
+            resolved.is_some(),
+            "Should have ToolbarContent with parentName=Toolbar"
+        );
+
+        // Check that ToolbarItem sees ToolbarContent as parent (nested inside the function)
+        let incidents = scan_source_jsx(
+            source,
+            r"^ToolbarItem$",
+            Some(&ReferenceLocation::JsxComponent),
+        );
+        let resolved = incidents.iter().find(|i| {
+            i.variables.get("parentName")
+                == Some(&serde_json::Value::String("ToolbarContent".to_string()))
+        });
+        assert!(
+            resolved.is_some(),
+            "Should have ToolbarItem with parentName=ToolbarContent"
         );
     }
 }

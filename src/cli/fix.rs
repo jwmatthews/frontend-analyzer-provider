@@ -115,7 +115,10 @@ pub async fn run(opts: FixOpts) -> Result<()> {
 
     // Load and merge fix strategies from all sources.
     // Order: rules-adjacent strategies first, then external strategies override.
+    // Family-level entries (keyed `family:*`) are collected separately for
+    // post-plan consolidation.
     let mut merged_strategies = std::collections::BTreeMap::new();
+    let mut family_entries = std::collections::BTreeMap::new();
 
     // 1. Load rule-adjacent strategies (bundled with rules)
     if let Some(ref rules_strategies_path) = opts.rules_strategies {
@@ -123,10 +126,14 @@ pub async fn run(opts: FixOpts) -> Result<()> {
             "Loading rule strategies from {}",
             rules_strategies_path.display()
         );
-        match frontend_core::fix::load_strategies_from_json(rules_strategies_path) {
-            Ok(strats) => {
+        match frontend_core::fix::load_strategies_and_families(rules_strategies_path) {
+            Ok((strats, families)) => {
                 eprintln!("  Loaded {} rule strategies", strats.len());
+                if !families.is_empty() {
+                    eprintln!("  Loaded {} family strategies", families.len());
+                }
                 merged_strategies.extend(strats);
+                family_entries.extend(families);
             }
             Err(e) => {
                 eprintln!("  WARNING: Failed to load rule strategies: {}", e);
@@ -141,10 +148,14 @@ pub async fn run(opts: FixOpts) -> Result<()> {
             "Loading external strategies from {}",
             strategies_path.display()
         );
-        match frontend_core::fix::load_strategies_from_json(strategies_path) {
-            Ok(strats) => {
+        match frontend_core::fix::load_strategies_and_families(strategies_path) {
+            Ok((strats, families)) => {
                 eprintln!("  Loaded {} external strategies", strats.len());
+                if !families.is_empty() {
+                    eprintln!("  Loaded {} family strategies", families.len());
+                }
                 merged_strategies.extend(strats);
+                family_entries.extend(families);
             }
             Err(e) => {
                 eprintln!("  WARNING: Failed to load external strategies: {}", e);
@@ -155,6 +166,9 @@ pub async fn run(opts: FixOpts) -> Result<()> {
     if !merged_strategies.is_empty() {
         eprintln!("  Total merged strategies: {}", merged_strategies.len());
     }
+    if !family_entries.is_empty() {
+        eprintln!("  Total family strategies: {}", family_entries.len());
+    }
 
     // Language-specific fix provider for JS/TS/JSX/TSX files
     let lang = JsFixProvider::new();
@@ -162,6 +176,23 @@ pub async fn run(opts: FixOpts) -> Result<()> {
     // Phase 1: Plan fixes
     eprintln!("Planning fixes...");
     let mut plan = fix_engine::plan_fixes(&output, &project, &merged_strategies, &lang)?;
+
+    // Phase 1b: Consolidate family-grouped LLM requests.
+    // Multiple rules targeting the same (file, family) are merged into a single
+    // request with the family's target structure + all incident variables.
+    if !family_entries.is_empty() {
+        let before_count = plan.pending_llm.len();
+        fix_engine::consolidate_family_requests(&mut plan.pending_llm, &family_entries);
+        let after_count = plan.pending_llm.len();
+        if before_count != after_count {
+            eprintln!(
+                "  Family consolidation: {} LLM requests -> {} ({} consolidated)",
+                before_count,
+                after_count,
+                before_count - after_count
+            );
+        }
+    }
 
     let pattern_fix_count: usize = plan
         .files

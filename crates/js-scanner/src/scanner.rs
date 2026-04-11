@@ -10,7 +10,6 @@ use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 use regex::Regex;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -169,9 +168,13 @@ pub fn scan_file_referenced(
 
     // JSX scanning at file level — enables resolving local function calls
     // (e.g., {renderDropdownItems()}) to their bodies for parent context tracing.
+    // Uses the resolver for cross-file function reference resolution:
+    // when toggle={toggle} passes an imported function as a prop, the scanner
+    // follows the import to find the function's JSX body and resolves the parent.
+    let resolver = resolver_map.resolver_for_file(file_path);
     match location {
         Some(ReferenceLocation::JsxComponent) | Some(ReferenceLocation::JsxProp) | None => {
-            incidents.extend(crate::jsx::scan_jsx_file(
+            incidents.extend(crate::jsx::scan_jsx_file_with_resolver(
                 &ret.program.body,
                 &source,
                 &pattern_re,
@@ -182,6 +185,8 @@ pub fn scan_file_referenced(
                 not_child_re.as_ref(),
                 requires_child_re.as_ref(),
                 &transparent_components,
+                Some(resolver),
+                Some(file_path),
             ));
         }
         _ => {}
@@ -357,7 +362,8 @@ pub fn scan_file_referenced(
     Ok((incidents, None))
 }
 
-/// Build the set of transparent component names for a given file.
+/// Build the set of transparent component names for a given file, along with
+/// what component each transparent wrapper wraps `{children}` in.
 ///
 /// For each import in the file's import map, resolves the import source to a
 /// local file using the resolver selected from `resolver_map` for this file
@@ -365,16 +371,18 @@ pub fn scan_file_referenced(
 /// (following barrel re-exports) to determine which exported components are
 /// children-passthrough wrappers.
 ///
-/// Returns the set of local names that are transparent.
+/// Returns a map of local_name → WrapperInfo:
+/// - `None` = pure passthrough (Fragment, div) — collapse to grandparent
+/// - `Some("Table")` = wraps children in `<Table>` — substitute as parent
 fn build_transparency_set(
     file_path: &Path,
     import_map: &std::collections::HashMap<String, String>,
     root: &Path,
     resolver_map: &ResolverMap,
     cache: &mut TransparencyCache,
-) -> HashSet<String> {
+) -> std::collections::HashMap<String, crate::transparency::WrapperInfo> {
     let resolver = resolver_map.resolver_for_file(file_path);
-    let mut transparent = HashSet::new();
+    let mut transparent = std::collections::HashMap::new();
 
     for (local_name, module_source) in import_map {
         // Try to resolve the import using oxc_resolver (handles tsconfig paths)
@@ -409,11 +417,8 @@ fn build_transparency_set(
         // For named imports (`import { Foo } from './Foo'`), the local name and
         // exported name may differ (aliasing). We check both the local name and
         // whether the local name matches any transparent export.
-        //
-        // For the common case (`import { ConditionalTableBody } from './ConditionalTableBody'`),
-        // the local name matches the export name directly.
-        if file_transparency.contains(local_name) {
-            transparent.insert(local_name.clone());
+        if let Some(wrapper_info) = file_transparency.get(local_name) {
+            transparent.insert(local_name.clone(), wrapper_info.clone());
         }
     }
 
@@ -1915,6 +1920,168 @@ const App = () => (
             "notParent: ^Table$ should NOT fire — MyWrapper is transparent \
              (named re-export through barrel). Got {} incidents",
             incidents.len()
+        );
+    }
+
+    // ── Cross-file function reference resolution tests ───────────────────
+
+    #[test]
+    fn test_cross_file_fn_ref_prop_resolves_parent() {
+        // toggle function is defined in a separate file and imported.
+        // When used as <Select toggle={toggle}>, MenuToggle inside toggle's
+        // body should see parentName=Select.
+        let toggle_file = r#"
+import { MenuToggle } from '@patternfly/react-core';
+
+export const toggle = (toggleRef) => (
+    <MenuToggle ref={toggleRef} onClick={onToggle}>
+        Filter
+    </MenuToggle>
+);
+"#;
+
+        let consumer = r#"
+import { Select } from '@patternfly/react-core';
+import { toggle } from './components/toggle';
+
+const App = () => (
+    <Select toggle={toggle} isOpen={isOpen}>
+        <div>options</div>
+    </Select>
+);
+"#;
+
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_fn_ref_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        let components_dir = src_dir.join("components");
+        std::fs::create_dir_all(&components_dir).unwrap();
+
+        std::fs::write(components_dir.join("toggle.tsx"), toggle_file).unwrap();
+        let consumer_path = src_dir.join("App.tsx");
+        std::fs::write(&consumer_path, consumer).unwrap();
+
+        let condition = ReferencedCondition {
+            pattern: "^MenuToggle$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: None,
+            parent_from: None,
+            value: None,
+            from: None,
+            file_pattern: None,
+            child: None,
+            not_child: None,
+            requires_child: None,
+        };
+
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&consumer_path, &dir, &condition, &resolver_map, &mut cache)
+                .unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Should find MenuToggle with parentName=Select via cross-file resolution
+        let resolved = incidents.iter().find(|i| {
+            i.variables.get("parentName") == Some(&serde_json::Value::String("Select".to_string()))
+        });
+        assert!(
+            resolved.is_some(),
+            "Should have MenuToggle with parentName=Select (cross-file fn ref resolution). \
+             Got {} incidents: {:?}",
+            incidents.len(),
+            incidents
+                .iter()
+                .map(|i| i.variables.get("parentName"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_cross_file_fn_ref_through_barrel() {
+        // toggle function exported through a barrel file (index.ts)
+        let toggle_file = r#"
+import { MenuToggle } from '@patternfly/react-core';
+
+export const toggle = (toggleRef) => (
+    <MenuToggle ref={toggleRef}>Filter</MenuToggle>
+);
+"#;
+
+        let barrel = r#"
+export { toggle } from './toggle';
+"#;
+
+        let consumer = r#"
+import { Select } from '@patternfly/react-core';
+import { toggle } from './components';
+
+const App = () => (
+    <Select toggle={toggle} isOpen={isOpen}>
+        <div>options</div>
+    </Select>
+);
+"#;
+
+        let dir = std::env::temp_dir().join(format!(
+            "scanner_fn_ref_barrel_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        let components_dir = src_dir.join("components");
+        std::fs::create_dir_all(&components_dir).unwrap();
+
+        std::fs::write(components_dir.join("toggle.tsx"), toggle_file).unwrap();
+        std::fs::write(components_dir.join("index.ts"), barrel).unwrap();
+        let consumer_path = src_dir.join("App.tsx");
+        std::fs::write(&consumer_path, consumer).unwrap();
+
+        let condition = ReferencedCondition {
+            pattern: "^MenuToggle$".to_string(),
+            location: Some(ReferenceLocation::JsxComponent),
+            component: None,
+            parent: None,
+            not_parent: None,
+            parent_from: None,
+            value: None,
+            from: None,
+            file_pattern: None,
+            child: None,
+            not_child: None,
+            requires_child: None,
+        };
+
+        let resolver_map = crate::resolve::create_resolver_map(&dir, 3);
+        let mut cache = crate::transparency::TransparencyCache::new();
+        let (incidents, _) =
+            scan_file_referenced(&consumer_path, &dir, &condition, &resolver_map, &mut cache)
+                .unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let resolved = incidents.iter().find(|i| {
+            i.variables.get("parentName") == Some(&serde_json::Value::String("Select".to_string()))
+        });
+        assert!(
+            resolved.is_some(),
+            "Should resolve MenuToggle parentName=Select through barrel re-export. \
+             Got {} incidents: {:?}",
+            incidents.len(),
+            incidents
+                .iter()
+                .map(|i| i.variables.get("parentName"))
+                .collect::<Vec<_>>()
         );
     }
 }

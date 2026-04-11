@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Return type for [`load_strategies_and_families`]: `(strategies, family_entries)`.
+pub type StrategiesAndFamilies = (
+    BTreeMap<String, FixStrategy>,
+    BTreeMap<String, FixStrategyEntry>,
+);
+
 // Re-export shared types from konveyor-core so existing code continues to compile.
 pub use konveyor_core::fix::{
     FixConfidence, FixSource, FixStrategyEntry, MappingEntry as StrategyMappingEntry,
@@ -135,7 +141,10 @@ pub enum FixStrategy {
     /// No auto-fix available — flag for manual review.
     Manual,
     /// Send to LLM for fix generation.
-    Llm,
+    /// `context` carries pre-formatted strategy data (strategy type, from/to,
+    /// mappings, target structure, etc.) from the `FixStrategyEntry`.
+    /// `None` when the rule fell through to Llm via label inference or default.
+    Llm { context: Option<String> },
 }
 
 /// Convert a `FixStrategyEntry` (from the shared `konveyor-core` crate) to
@@ -202,17 +211,248 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
                 FixStrategy::Manual
             }
         }
-        "PropValueChange" | "PropTypeChange" => FixStrategy::Llm,
-        "LlmAssisted" => FixStrategy::Llm,
+        "PropValueChange" | "PropTypeChange" => FixStrategy::Llm {
+            context: Some(format_strategy_context(entry)),
+        },
+        "LlmAssisted" => FixStrategy::Llm {
+            context: Some(format_strategy_context(entry)),
+        },
         // v2 SD-pipeline strategies — these require structural JSX
         // transformations that only the LLM can handle.
         "ChildToProp"
         | "PropToChild"
         | "PropToChildren"
         | "CompositionChange"
-        | "DeprecatedMigration" => FixStrategy::Llm,
+        | "DeprecatedMigration" => FixStrategy::Llm {
+            context: Some(format_strategy_context(entry)),
+        },
+        // Family-level migration: the entry carries the complete target
+        // component structure. Format it as a rich context block.
+        "FamilyMigration" => FixStrategy::Llm {
+            context: Some(format_family_migration_context(entry)),
+        },
         _ => FixStrategy::Manual,
     }
+}
+
+/// Format a per-rule `FixStrategyEntry` into a human-readable context block
+/// for the LLM prompt. Includes the strategy type, from/to mappings,
+/// component/prop targets, member mappings, etc.
+fn format_strategy_context(entry: &FixStrategyEntry) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("Strategy: {}", entry.strategy));
+    if let Some(ref c) = entry.component {
+        parts.push(format!("Component: {}", c));
+    }
+    if let Some(ref p) = entry.prop {
+        parts.push(format!("Prop: {}", p));
+    }
+    if let Some(ref from) = entry.from {
+        parts.push(format!("From: {}", from));
+    }
+    if let Some(ref to) = entry.to {
+        parts.push(format!("To: {}", to));
+    }
+    if let Some(ref repl) = entry.replacement {
+        parts.push(format!("Replacement: {}", repl));
+    }
+    if !entry.mappings.is_empty() {
+        let maps: Vec<String> = entry
+            .mappings
+            .iter()
+            .filter_map(|m| match (&m.from, &m.to) {
+                (Some(f), Some(t)) => Some(format!("  {} -> {}", f, t)),
+                _ => None,
+            })
+            .collect();
+        if !maps.is_empty() {
+            parts.push(format!("Mappings:\n{}", maps.join("\n")));
+        }
+    }
+    if !entry.member_mappings.is_empty() {
+        let maps: Vec<String> = entry
+            .member_mappings
+            .iter()
+            .map(|m| format!("  {} -> {}", m.old_name, m.new_name))
+            .collect();
+        parts.push(format!("Member mappings:\n{}", maps.join("\n")));
+    }
+    if !entry.removed_members.is_empty() {
+        parts.push(format!(
+            "Removed members: {}",
+            entry.removed_members.join(", ")
+        ));
+    }
+    parts.join("\n")
+}
+
+/// Format a family-level `FixStrategyEntry` (keyed `family:<Name>`) into a
+/// rich context block for the LLM prompt. Includes the complete target JSX
+/// structure, prop assignments, import changes, etc.
+fn format_family_migration_context(entry: &FixStrategyEntry) -> String {
+    let mut parts = Vec::new();
+    parts.push("Strategy: FamilyMigration".to_string());
+
+    if let Some(ref target) = entry.target_structure {
+        parts.push(format!(
+            "\nTarget structure (correct v6 composition):\n```jsx\n{}\n```",
+            target
+        ));
+    }
+    if let Some(ref comp) = entry.component {
+        parts.push(format!("Component: {}", comp));
+    }
+    if !entry.retained_props.is_empty() {
+        parts.push(format!(
+            "Props that stay on root: {}",
+            entry.retained_props.join(", ")
+        ));
+    }
+    if !entry.prop_to_child.is_empty() {
+        let maps: Vec<String> = entry
+            .prop_to_child
+            .iter()
+            .map(|(prop, child)| format!("  {} -> <{} />", prop, child))
+            .collect();
+        parts.push(format!(
+            "Props that move to child components:\n{}",
+            maps.join("\n")
+        ));
+    }
+    if !entry.child_props_to_parent.is_empty() {
+        let maps: Vec<String> = entry
+            .child_props_to_parent
+            .iter()
+            .map(|(child_prop, parent_prop)| format!("  {} -> {}", child_prop, parent_prop))
+            .collect();
+        parts.push(format!(
+            "Child props that move to parent:\n{}",
+            maps.join("\n")
+        ));
+    }
+    if !entry.removed_children.is_empty() {
+        parts.push(format!(
+            "Removed children: {}",
+            entry.removed_children.join(", ")
+        ));
+    }
+    if !entry.new_imports.is_empty() {
+        let src = entry.import_source.as_deref().unwrap_or("(same package)");
+        parts.push(format!(
+            "Add imports: {} from '{}'",
+            entry.new_imports.join(", "),
+            src
+        ));
+    }
+    if !entry.removed_imports.is_empty() {
+        parts.push(format!(
+            "Remove imports: {}",
+            entry.removed_imports.join(", ")
+        ));
+    }
+    if !entry.prop_value_changes.is_empty() {
+        let mut lines = Vec::new();
+        for (prop, mappings) in &entry.prop_value_changes {
+            for m in mappings {
+                if let (Some(from), Some(to)) = (&m.from, &m.to) {
+                    lines.push(format!("  {}: {} -> {}", prop, from, to));
+                }
+            }
+        }
+        if !lines.is_empty() {
+            parts.push(format!("Prop value changes:\n{}", lines.join("\n")));
+        }
+    }
+
+    // Deprecated → v6 migration context: complete prop mapping with types.
+    if let Some(ref dm) = entry.deprecated_migration {
+        parts.push(format!(
+            "\nDeprecated -> v6 migration:\n  Old import: {}\n  New import: {}",
+            dm.old_package, dm.new_package
+        ));
+
+        // Matching props (survived the migration, may have type changes)
+        if !dm.matching_props.is_empty() {
+            let mut lines = Vec::new();
+            for p in &dm.matching_props {
+                if p.type_changed {
+                    lines.push(format!(
+                        "  {} -> {} (TYPE CHANGED):\n    old: {}\n    new: {}",
+                        p.old_name,
+                        p.new_name,
+                        p.old_type.as_deref().unwrap_or("?"),
+                        p.new_type.as_deref().unwrap_or("?")
+                    ));
+                } else {
+                    let typ = p.new_type.as_deref().unwrap_or("?");
+                    if p.old_name == p.new_name {
+                        lines.push(format!("  {}: {} (unchanged)", p.new_name, typ));
+                    } else {
+                        lines.push(format!(
+                            "  {} -> {}: {} (renamed, type unchanged)",
+                            p.old_name, p.new_name, typ
+                        ));
+                    }
+                }
+            }
+            parts.push(format!("Matching props:\n{}", lines.join("\n")));
+        }
+
+        // New props (only on v6, not on deprecated)
+        if !dm.new_props.is_empty() {
+            let mut lines = Vec::new();
+            for (name, typ) in &dm.new_props {
+                let mut line = format!("  {}: {}", name, typ);
+                // Auto-detect render-prop patterns: if the type returns
+                // ReactNode via a function, warn about function reference.
+                if (typ.contains("=> React.ReactNode")
+                    || typ.contains("=> ReactNode")
+                    || typ.contains("=> React.ReactElement"))
+                    && typ.contains("=>")
+                {
+                    line.push_str(
+                        "\n    NOTE: This is a render function. Pass a function REFERENCE, \
+                         not a function call.",
+                    );
+                }
+                lines.push(line);
+            }
+            parts.push(format!(
+                "New props on v6 (not on deprecated version):\n{}",
+                lines.join("\n")
+            ));
+        }
+
+        // Removed props (only on deprecated, no v6 equivalent)
+        if !dm.removed_props.is_empty() {
+            parts.push(format!(
+                "Removed props (no v6 equivalent): {}",
+                dm.removed_props.join(", ")
+            ));
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// Load fix strategies from a JSON file and also extract raw family-level
+/// `FixStrategyEntry` entries (keyed `family:*`) for use in family consolidation.
+///
+/// Returns `(strategies, family_entries)`.
+pub fn load_strategies_and_families(
+    path: &Path,
+) -> Result<StrategiesAndFamilies, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let entries: BTreeMap<String, FixStrategyEntry> = serde_json::from_str(&content)?;
+    let strategies = entries
+        .iter()
+        .map(|(rule_id, entry)| (rule_id.clone(), strategy_entry_to_fix_strategy(entry)))
+        .collect();
+    let families = entries
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("family:"))
+        .collect();
+    Ok((strategies, families))
 }
 
 /// Load fix strategies from a JSON file.
@@ -391,7 +631,7 @@ mod tests {
     fn test_prop_value_change_maps_to_llm() {
         let entry = make_strategy_entry("PropValueChange");
         match strategy_entry_to_fix_strategy(&entry) {
-            FixStrategy::Llm => {}
+            FixStrategy::Llm { .. } => {}
             other => panic!("Expected Llm, got {:?}", other),
         }
     }
@@ -400,7 +640,7 @@ mod tests {
     fn test_prop_type_change_maps_to_llm() {
         let entry = make_strategy_entry("PropTypeChange");
         match strategy_entry_to_fix_strategy(&entry) {
-            FixStrategy::Llm => {}
+            FixStrategy::Llm { .. } => {}
             other => panic!("Expected Llm, got {:?}", other),
         }
     }
@@ -409,8 +649,47 @@ mod tests {
     fn test_llm_assisted_maps_to_llm() {
         let entry = make_strategy_entry("LlmAssisted");
         match strategy_entry_to_fix_strategy(&entry) {
-            FixStrategy::Llm => {}
+            FixStrategy::Llm { .. } => {}
             other => panic!("Expected Llm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_llm_context_contains_strategy_type() {
+        let mut entry = make_strategy_entry("PropToChild");
+        entry.from = Some("title".to_string());
+        entry.component = Some("Modal".to_string());
+        entry.replacement = Some("ModalHeader".to_string());
+        match strategy_entry_to_fix_strategy(&entry) {
+            FixStrategy::Llm { context: Some(ctx) } => {
+                assert!(ctx.contains("Strategy: PropToChild"), "context: {}", ctx);
+                assert!(ctx.contains("Component: Modal"), "context: {}", ctx);
+                assert!(ctx.contains("From: title"), "context: {}", ctx);
+                assert!(ctx.contains("Replacement: ModalHeader"), "context: {}", ctx);
+            }
+            other => panic!("Expected Llm with context, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_family_migration_maps_to_llm_with_target_structure() {
+        let mut entry = make_strategy_entry("FamilyMigration");
+        entry.target_structure = Some("<Modal>\n  <ModalHeader />\n</Modal>".to_string());
+        entry.retained_props = vec!["variant".to_string(), "isOpen".to_string()];
+        entry.prop_to_child =
+            std::collections::BTreeMap::from([("title".to_string(), "ModalHeader".to_string())]);
+        entry.new_imports = vec!["ModalHeader".to_string(), "ModalBody".to_string()];
+        entry.import_source = Some("@patternfly/react-core".to_string());
+        match strategy_entry_to_fix_strategy(&entry) {
+            FixStrategy::Llm { context: Some(ctx) } => {
+                assert!(ctx.contains("FamilyMigration"), "context: {}", ctx);
+                assert!(ctx.contains("<Modal>"), "context: {}", ctx);
+                assert!(ctx.contains("variant, isOpen"), "context: {}", ctx);
+                assert!(ctx.contains("title -> <ModalHeader />"), "context: {}", ctx);
+                assert!(ctx.contains("ModalHeader, ModalBody"), "context: {}", ctx);
+                assert!(ctx.contains("@patternfly/react-core"), "context: {}", ctx);
+            }
+            other => panic!("Expected Llm with family context, got {:?}", other),
         }
     }
 
