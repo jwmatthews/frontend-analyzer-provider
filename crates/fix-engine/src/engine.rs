@@ -214,11 +214,6 @@ pub fn consolidate_family_requests(
     let mut consumed_indices: BTreeSet<usize> = BTreeSet::new();
 
     for ((file_path, family), indices) in &groups {
-        if indices.len() <= 1 {
-            // Single request — leave it as-is with its already-enriched message.
-            continue;
-        }
-
         let key = format!("family:{}", family);
         let entry = &family_entries[&key];
 
@@ -282,19 +277,28 @@ pub fn consolidate_family_requests(
         // - signature-changed rules (TypeScript base class changes)
         // - type-changed rules on generic parameters (RefAttributes)
         // These are subsumed by the family template.
-        let filtered_indices: Vec<usize> = indices
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                let req = &requests[idx];
-                // Suppress signature-changed and no-op type-changed rules
-                let dominated = req.labels.iter().any(|l| {
-                    l == "change-type=signature-changed" || l == "change-type=type-changed"
-                }) && (req.message.contains("base class changed")
-                    || req.message.contains("RefAttributes"));
-                !dominated
-            })
-            .collect();
+        // Guard: never filter out ALL incidents — if filtering would leave
+        // zero incidents, keep them all so the LLM has context to work with.
+        let filtered_indices: Vec<usize> = {
+            let filtered: Vec<usize> = indices
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    let req = &requests[idx];
+                    // Suppress signature-changed and no-op type-changed rules
+                    let dominated = req.labels.iter().any(|l| {
+                        l == "change-type=signature-changed" || l == "change-type=type-changed"
+                    }) && (req.message.contains("base class changed")
+                        || req.message.contains("RefAttributes"));
+                    !dominated
+                })
+                .collect();
+            if filtered.is_empty() {
+                indices.clone()
+            } else {
+                filtered
+            }
+        };
 
         message.push_str("\nIncidents found in this file:\n");
         let mut all_lines: Vec<u32> = Vec::new();
@@ -1046,5 +1050,152 @@ mod tests {
         ];
         let strategy = infer_strategy_from_labels(&labels);
         assert!(matches!(strategy, Some(&FixStrategy::RemoveProp)));
+    }
+
+    // ── consolidate_family_requests tests ────────────────────────────────
+
+    fn make_llm_request(rule_id: &str, file: &str, line: u32, labels: Vec<&str>) -> LlmFixRequest {
+        LlmFixRequest {
+            rule_id: rule_id.to_string(),
+            file_uri: format!("file://{}", file),
+            file_path: PathBuf::from(file),
+            line,
+            message: format!("Rule {} triggered", rule_id),
+            code_snip: Some(format!("// line {}", line)),
+            source: None,
+            labels: labels.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn make_family_entry(target_structure: &str, new_imports: Vec<&str>) -> FixStrategyEntry {
+        FixStrategyEntry {
+            strategy: "FamilyMigration".to_string(),
+            target_structure: Some(target_structure.to_string()),
+            new_imports: new_imports.into_iter().map(|s| s.to_string()).collect(),
+            import_source: Some("@patternfly/react-core".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_consolidate_single_family_request() {
+        // A single rule with family=Masthead should still get consolidated
+        // with the family migration header.
+        let mut requests = vec![make_llm_request(
+            "mastheadbrand-signature-changed",
+            "/src/viewLayout.tsx",
+            16,
+            vec!["family=Masthead", "change-type=prop-type-changed"],
+        )];
+
+        let mut families = BTreeMap::new();
+        families.insert(
+            "family:Masthead".to_string(),
+            make_family_entry(
+                "<Masthead>\n  <MastheadMain>\n    <MastheadBrand>\n      <MastheadLogo />\n    </MastheadBrand>\n  </MastheadMain>\n</Masthead>",
+                vec!["MastheadLogo", "MastheadMain"],
+            ),
+        );
+
+        consolidate_family_requests(&mut requests, &families);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].rule_id, "family:Masthead");
+        assert!(
+            requests[0].message.contains("Masthead Family Migration"),
+            "Should contain family migration header"
+        );
+        assert!(
+            requests[0].message.contains("MastheadLogo"),
+            "Should contain MastheadLogo in the target structure"
+        );
+        assert!(
+            requests[0].message.contains("Add imports"),
+            "Should include new imports guidance"
+        );
+    }
+
+    #[test]
+    fn test_consolidate_does_not_drop_all_incidents() {
+        // When the only incident is a dominated signature-changed rule,
+        // it should be preserved rather than filtered out entirely.
+        let mut requests = vec![{
+            let mut req = make_llm_request(
+                "mastheadbrand-signature-changed",
+                "/src/viewLayout.tsx",
+                16,
+                vec!["family=Masthead", "change-type=signature-changed"],
+            );
+            req.message =
+                "Interface 'MastheadBrandProps' base class changed from anchor to div".to_string();
+            req
+        }];
+
+        let mut families = BTreeMap::new();
+        families.insert(
+            "family:Masthead".to_string(),
+            make_family_entry("<Masthead>\n  <MastheadBrand>\n    <MastheadLogo />\n  </MastheadBrand>\n</Masthead>", vec![]),
+        );
+
+        consolidate_family_requests(&mut requests, &families);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].rule_id, "family:Masthead");
+        // The incident should still appear even though it's "dominated"
+        assert!(
+            requests[0]
+                .message
+                .contains("mastheadbrand-signature-changed"),
+            "Dominated incident should be preserved when it's the only one"
+        );
+    }
+
+    #[test]
+    fn test_consolidate_filters_dominated_when_others_exist() {
+        // When there are multiple incidents and one is dominated,
+        // the dominated one should be filtered out.
+        let mut requests = vec![
+            {
+                let mut req = make_llm_request(
+                    "mastheadbrand-signature-changed",
+                    "/src/viewLayout.tsx",
+                    16,
+                    vec!["family=Masthead", "change-type=signature-changed"],
+                );
+                req.message = "base class changed from anchor to div".to_string();
+                req
+            },
+            make_llm_request(
+                "mastheadbrand-component-removed",
+                "/src/viewLayout.tsx",
+                60,
+                vec!["family=Masthead", "change-type=prop-removal"],
+            ),
+        ];
+
+        let mut families = BTreeMap::new();
+        families.insert(
+            "family:Masthead".to_string(),
+            make_family_entry("<Masthead />", vec![]),
+        );
+
+        consolidate_family_requests(&mut requests, &families);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].rule_id, "family:Masthead");
+        // The dominated rule should be filtered out
+        assert!(
+            !requests[0]
+                .message
+                .contains("mastheadbrand-signature-changed"),
+            "Dominated rule should be filtered when other incidents exist"
+        );
+        // The non-dominated rule should remain
+        assert!(
+            requests[0]
+                .message
+                .contains("mastheadbrand-component-removed"),
+            "Non-dominated rule should be preserved"
+        );
     }
 }
