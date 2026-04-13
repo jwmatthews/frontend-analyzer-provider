@@ -408,7 +408,7 @@ fn build_transparency_set(
 
         // Analyze transparency with barrel re-export following
         let file_transparency = crate::transparency::analyze_file_transparency_with_resolver(
-            &resolved, resolver, cache,
+            &resolved, resolver, cache, 0,
         )
         .unwrap_or_default();
 

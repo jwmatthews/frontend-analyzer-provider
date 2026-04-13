@@ -14,8 +14,12 @@ use oxc_parser::Parser;
 use oxc_resolver::Resolver;
 use oxc_span::{GetSpan, SourceType};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Maximum depth for following re-export chains across files.
+/// Prevents stack overflow on deeply chained barrel files.
+const MAX_REEXPORT_DEPTH: usize = 20;
 
 /// Import map: local identifier name → module source path.
 /// Built from import declarations, passed through JSX scanning so components
@@ -66,6 +70,11 @@ struct ScanContext<'a, 'b> {
     resolver: Option<&'b Resolver>,
     /// Path of the file being scanned (used for import resolution).
     file_path: Option<&'b Path>,
+    /// Guard against infinite recursion when resolving local function references.
+    /// Tracks function names currently being walked so that cycles
+    /// (e.g., `renderA` → JSX → `renderB` → JSX → `renderA`) are detected
+    /// and broken instead of causing a stack overflow.
+    resolving_fns: HashSet<String>,
 }
 
 /// Build a map of all function declarations in the AST, including those
@@ -292,6 +301,7 @@ pub fn scan_jsx_file_with_resolver<'a>(
         transparent_components,
         resolver,
         file_path,
+        resolving_fns: HashSet::new(),
     };
     for stmt in stmts {
         walk_statement_for_jsx(stmt, &mut ctx, None);
@@ -325,6 +335,7 @@ pub fn scan_jsx(
         transparent_components: &empty_transparent,
         resolver: None,
         file_path: None,
+        resolving_fns: HashSet::new(),
     };
     walk_statement_for_jsx(stmt, &mut ctx, None);
     incidents
@@ -478,7 +489,7 @@ fn walk_expression_for_jsx(
         // parent context, so JSX rendered by that function inherits the
         // parent element (e.g., <Select>).
         Expression::Identifier(ident) => {
-            resolve_local_fn_reference(ident.name.as_str(), ctx, parent_name);
+            resolve_local_fn_reference(ident.name.as_str(), ctx, parent_name, 0);
         }
         Expression::CallExpression(call) => {
             for arg in &call.arguments {
@@ -564,7 +575,7 @@ fn walk_jsx_expression(
         // Resolve to a local function and walk its body with the current parent
         // context, so JSX rendered by that function inherits the parent element.
         JSXExpression::Identifier(ident) => {
-            resolve_local_fn_reference(ident.name.as_str(), ctx, parent_name);
+            resolve_local_fn_reference(ident.name.as_str(), ctx, parent_name, 0);
         }
         // Function calls: {renderFn(<Component />)} or {fn(arg)}
         JSXExpression::CallExpression(call) => {
@@ -573,17 +584,29 @@ fn walk_jsx_expression(
             // current parent context so JSX returned by that function inherits
             // the parent element (e.g., <Dropdown>).
             if let Expression::Identifier(ident) = &call.callee {
-                if let Some(fn_expr) = ctx.local_fns.get(ident.name.as_str()) {
-                    match fn_expr {
-                        Expression::ArrowFunctionExpression(arrow) => {
-                            walk_function_body(&arrow.body, ctx, parent_name);
-                        }
-                        Expression::FunctionExpression(func) => {
-                            if let Some(body) = &func.body {
-                                walk_function_body(body, ctx, parent_name);
+                let callee_name = ident.name.as_str();
+                if let Some(fn_expr) = ctx.local_fns.get(callee_name) {
+                    // Guard against cycles (same logic as resolve_local_fn_reference)
+                    if ctx.resolving_fns.contains(callee_name) {
+                        tracing::debug!(
+                            fn_name = callee_name,
+                            file = ctx.file_uri,
+                            "skipping cyclic local function call in JSX child",
+                        );
+                    } else {
+                        ctx.resolving_fns.insert(callee_name.to_string());
+                        match fn_expr {
+                            Expression::ArrowFunctionExpression(arrow) => {
+                                walk_function_body(&arrow.body, ctx, parent_name);
                             }
+                            Expression::FunctionExpression(func) => {
+                                if let Some(body) = &func.body {
+                                    walk_function_body(body, ctx, parent_name);
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                        ctx.resolving_fns.remove(callee_name);
                     }
                 }
             }
@@ -647,9 +670,25 @@ fn is_children_passthrough_expression(expr: &JSXExpression<'_>) -> bool {
 /// return <Select toggle={toggle}>...</Select>;
 /// // → MenuToggle's parentName is "Select"
 /// ```
-fn resolve_local_fn_reference(name: &str, ctx: &mut ScanContext, parent_name: Option<&str>) {
+fn resolve_local_fn_reference(
+    name: &str,
+    ctx: &mut ScanContext,
+    parent_name: Option<&str>,
+    depth: usize,
+) {
     // 1. Same-file: check LocalFnMap
     if let Some(fn_expr) = ctx.local_fns.get(name) {
+        // Guard against cycles: if we're already resolving this function,
+        // we've hit a recursive reference (e.g., renderA → renderB → renderA).
+        if ctx.resolving_fns.contains(name) {
+            tracing::debug!(
+                fn_name = name,
+                file = ctx.file_uri,
+                "skipping cyclic local function reference",
+            );
+            return;
+        }
+        ctx.resolving_fns.insert(name.to_string());
         match fn_expr {
             Expression::ArrowFunctionExpression(arrow) => {
                 walk_function_body(&arrow.body, ctx, parent_name);
@@ -661,6 +700,7 @@ fn resolve_local_fn_reference(name: &str, ctx: &mut ScanContext, parent_name: Op
             }
             _ => {}
         }
+        ctx.resolving_fns.remove(name);
         return;
     }
 
@@ -699,6 +739,7 @@ fn resolve_local_fn_reference(name: &str, ctx: &mut ScanContext, parent_name: Op
         parent_name,
         resolver,
         &resolved_path,
+        depth,
     );
 }
 
@@ -711,7 +752,18 @@ fn resolve_cross_file_fn(
     parent_name: Option<&str>,
     resolver: &Resolver,
     resolved_path: &Path,
+    depth: usize,
 ) {
+    if depth > MAX_REEXPORT_DEPTH {
+        tracing::warn!(
+            "re-export chain depth exceeded {} for '{}' at {}",
+            MAX_REEXPORT_DEPTH,
+            name,
+            resolved_path.display(),
+        );
+        return;
+    }
+
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(resolved_path).unwrap_or_default();
     let ret = Parser::new(&allocator, source_text, source_type).parse();
@@ -787,6 +839,7 @@ fn resolve_cross_file_fn(
                                         parent_name,
                                         resolver,
                                         &re_resolved,
+                                        depth + 1,
                                     );
                                 }
                             }
@@ -812,6 +865,7 @@ fn resolve_cross_file_fn(
                             parent_name,
                             resolver,
                             &re_resolved,
+                            depth + 1,
                         );
                     }
                 }

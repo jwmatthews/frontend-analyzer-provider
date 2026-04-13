@@ -48,6 +48,10 @@ pub type WrapperInfo = Option<String>;
 /// Cache of file path → map of transparent component name → wrapper info.
 pub type TransparencyCache = HashMap<PathBuf, HashMap<String, WrapperInfo>>;
 
+/// Maximum depth for following re-export chains across files.
+/// Prevents stack overflow on deeply chained barrel files.
+const MAX_REEXPORT_DEPTH: usize = 20;
+
 /// Analyze a source file and return the set of exported component names that
 /// are transparent (pass `{children}` through in at least one code path).
 ///
@@ -72,10 +76,21 @@ pub fn analyze_file_transparency_with_resolver(
     file_path: &Path,
     resolver: &Resolver,
     cache: &mut TransparencyCache,
+    depth: usize,
 ) -> Result<HashMap<String, WrapperInfo>> {
     // Check cache first
     if let Some(cached) = cache.get(file_path) {
         return Ok(cached.clone());
+    }
+
+    // Guard against excessively deep re-export chains
+    if depth > MAX_REEXPORT_DEPTH {
+        tracing::warn!(
+            "re-export chain depth exceeded {} at {}",
+            MAX_REEXPORT_DEPTH,
+            file_path.display(),
+        );
+        return Ok(HashMap::new());
     }
 
     // Insert an empty map first to prevent infinite recursion on circular re-exports
@@ -96,8 +111,9 @@ pub fn analyze_file_transparency_with_resolver(
             }
 
             // Recursively analyze the re-exported file
-            let reexported = analyze_file_transparency_with_resolver(&resolved, resolver, cache)
-                .unwrap_or_default();
+            let reexported =
+                analyze_file_transparency_with_resolver(&resolved, resolver, cache, depth + 1)
+                    .unwrap_or_default();
 
             match names {
                 ReexportKind::All => {
