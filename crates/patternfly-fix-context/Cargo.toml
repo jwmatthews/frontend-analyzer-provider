@@ -7,4 +7,4 @@ license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [dependencies]
-frontend-fix-engine = { version = "0.0.3", path = "../fix-engine" }
+fix-engine = { version = "0.0.1", path = "../../../fix-engine/crates/engine" }

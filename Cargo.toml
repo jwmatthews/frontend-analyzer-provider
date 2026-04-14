@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc", "crates/fix-engine", "crates/js-fix", "crates/patternfly-fix-context"]
+members = ["crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc", "crates/js-fix", "crates/patternfly-fix-context"]
 resolver = "2"
 
 [package]
@@ -11,23 +11,14 @@ license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [dependencies]
-konveyor-core = "0.0.4"
 frontend-core = { version = "0.0.3", path = "crates/core" }
 frontend-grpc = { version = "0.0.3", path = "crates/grpc" }
-frontend-fix-engine = { version = "0.0.3", path = "crates/fix-engine" }
-frontend-js-fix = { version = "0.0.3", path = "crates/js-fix" }
-patternfly-fix-context = { version = "0.0.3", path = "crates/patternfly-fix-context" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-yaml_serde = "0.10"
 
 # Error handling
 anyhow = "1"
@@ -38,4 +29,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [patch.crates-io]
 konveyor-core = { path = "../konveyor-core" }
-

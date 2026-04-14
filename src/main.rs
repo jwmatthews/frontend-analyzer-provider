@@ -22,7 +22,6 @@ async fn async_main() -> Result<()> {
     let args = cli::Cli::parse();
 
     match args.command {
-        cli::Command::Fix(opts) => cli::fix::run(opts).await,
         cli::Command::Serve(opts) => cli::serve::run(opts).await,
     }
 }

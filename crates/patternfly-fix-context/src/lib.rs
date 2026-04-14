@@ -3,7 +3,7 @@
 //! Provides framework-specific LLM prompt constraints, priority ordering,
 //! and system prompts for the PatternFly component library migration.
 
-use frontend_fix_engine::context::FixContext;
+use fix_engine::context::FixContext;
 
 /// The ruleset name used by the PatternFly v5→v6 Konveyor rules.
 pub const PATTERNFLY_RULESET_NAME: &str = "konveyor-patternfly-v5-to-v6";

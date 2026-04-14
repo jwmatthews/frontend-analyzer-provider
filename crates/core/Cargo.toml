@@ -2,12 +2,13 @@
 name = "frontend-core"
 version = "0.0.3"
 edition = "2021"
-description = "Provider-specific types and fix engine domain types for frontend-analyzer-provider"
+description = "Provider-specific types for frontend-analyzer-provider"
 license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [dependencies]
 konveyor-core = "0.0.4"
+fix-engine-core = { version = "0.0.1", path = "../../../fix-engine/crates/core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 yaml_serde = "0.10"

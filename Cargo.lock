@@ -699,6 +699,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "fix-engine"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "fix-engine-core",
+ "konveyor-core",
+ "libc",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "fix-engine-core"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "konveyor-core",
+ "serde",
+ "serde_json",
+ "yaml_serde",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -772,17 +798,10 @@ dependencies = [
  "anyhow",
  "clap",
  "frontend-core",
- "frontend-fix-engine",
  "frontend-grpc",
- "frontend-js-fix",
- "konveyor-core",
- "patternfly-fix-context",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "yaml_serde",
 ]
 
 [[package]]
@@ -790,6 +809,7 @@ name = "frontend-core"
 version = "0.0.3"
 dependencies = [
  "anyhow",
+ "fix-engine-core",
  "konveyor-core",
  "serde",
  "serde_json",
@@ -808,21 +828,6 @@ dependencies = [
  "serde_json",
  "tracing",
  "walkdir",
-]
-
-[[package]]
-name = "frontend-fix-engine"
-version = "0.0.3"
-dependencies = [
- "anyhow",
- "frontend-core",
- "konveyor-core",
- "libc",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tracing",
 ]
 
 [[package]]
@@ -855,8 +860,8 @@ dependencies = [
 name = "frontend-js-fix"
 version = "0.0.3"
 dependencies = [
- "frontend-core",
- "frontend-fix-engine",
+ "fix-engine",
+ "fix-engine-core",
  "konveyor-core",
  "regex",
  "serde_json",
@@ -2059,7 +2064,7 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 name = "patternfly-fix-context"
 version = "0.0.3"
 dependencies = [
- "frontend-fix-engine",
+ "fix-engine",
 ]
 
 [[package]]

@@ -7,8 +7,8 @@ license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [dependencies]
-frontend-core = { version = "0.0.3", path = "../core" }
-frontend-fix-engine = { version = "0.0.3", path = "../fix-engine" }
+fix-engine-core = { version = "0.0.1", path = "../../../fix-engine/crates/core" }
+fix-engine = { version = "0.0.1", path = "../../../fix-engine/crates/engine" }
 konveyor-core = "0.0.4"
 
 # Serialization (for incident variable inspection)

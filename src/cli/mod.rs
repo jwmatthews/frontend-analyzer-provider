@@ -1,4 +1,3 @@
-pub mod fix;
 pub mod serve;
 
 use clap::{Parser, Subcommand};
@@ -16,9 +15,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Apply fixes based on Konveyor analysis output.
-    Fix(fix::FixOpts),
-
     /// Start as a Konveyor gRPC external provider.
     Serve(serve::ServeOpts),
 }

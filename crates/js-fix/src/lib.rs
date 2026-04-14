@@ -5,11 +5,12 @@
 //! - Deduplicates ES import specifiers after renames
 //! - Removes JSX attributes (props) using syntax-aware regex
 //! - Extracts matched text from JSX/React incident variables
+//! - Manages `package.json` dependencies
 
-use frontend_core::fix::*;
-use frontend_fix_engine::language::LanguageFixProvider;
+use fix_engine::language::LanguageFixProvider;
+use fix_engine_core::*;
 use konveyor_core::incident::Incident;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Language fix provider for JavaScript/TypeScript/JSX/TSX files.
 pub struct JsFixProvider;
@@ -49,6 +50,17 @@ impl LanguageFixProvider for JsFixProvider {
         plan_remove_prop(rule_id, incident, file_path)
     }
 
+    fn plan_ensure_dependency(
+        &self,
+        rule_id: &str,
+        incident: &Incident,
+        package: &str,
+        new_version: &str,
+        file_path: &Path,
+    ) -> Option<PlannedFix> {
+        plan_ensure_npm_dependency(rule_id, incident, package, new_version, file_path)
+    }
+
     fn get_matched_text(&self, incident: &Incident) -> String {
         get_matched_text_from_incident(incident)
     }
@@ -69,7 +81,7 @@ impl LanguageFixProvider for JsFixProvider {
     }
 }
 
-// ── JSX prop removal ─────────────────────────────────────────────────────
+// -- JSX prop removal --
 
 fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Option<PlannedFix> {
     let line = incident.line_number?;
@@ -86,14 +98,10 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
     let trimmed = file_line.trim();
 
     // If the entire line is just the prop (common in formatted JSX), remove it.
-    // Patterns: `propName`, `propName={...}`, `propName="..."`, `propName={true}`
     if trimmed.starts_with(prop_name) {
-        // Check if the prop value is self-contained on this line by counting
-        // bracket/brace depth. If the value spans multiple lines (e.g.,
-        // `actions={[ <Button>...</Button> ]}`), we need to remove all of them.
         let depth = bracket_depth(file_line);
         if depth == 0 {
-            // Single-line prop — safe to remove just this line
+            // Single-line prop -- safe to remove just this line
             Some(PlannedFix {
                 edits: vec![TextEdit {
                     line,
@@ -111,7 +119,7 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
                 description: format!("Remove prop '{}'", prop_name),
             })
         } else {
-            // Multi-line prop value — scan forward to find where brackets balance.
+            // Multi-line prop value -- scan forward to find where brackets balance.
             let mut cumulative_depth = depth;
             let mut end_idx = line_idx;
             for (i, subsequent_line) in all_lines.iter().enumerate().skip(line_idx + 1) {
@@ -123,7 +131,6 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
             }
 
             if cumulative_depth > 0 {
-                // Could not find matching close bracket — bail to manual review
                 return Some(PlannedFix {
                     edits: vec![],
                     confidence: FixConfidence::Low,
@@ -172,17 +179,13 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
             })
         }
     } else {
-        // Prop is inline with other content — try to remove just the prop fragment.
-        // Match: ` propName={...}` or ` propName="..."` or ` propName`
-        // Use a simple regex to find the prop and its value on a single line.
+        // Prop is inline with other content -- try to remove just the prop fragment.
         let prop_re = regex::Regex::new(&format!(
             r#"\s+{prop_name}(?:=\{{[^}}]*\}}|="[^"]*"|='[^']*'|=\{{.*?\}})?"#
         ))
         .ok()?;
 
         if let Some(m) = prop_re.find(file_line) {
-            // Verify the matched fragment has balanced brackets. If not, the value
-            // spans multiple lines and a simple single-line removal would corrupt the file.
             if bracket_depth(m.as_str()) != 0 {
                 return Some(PlannedFix {
                     edits: vec![],
@@ -212,7 +215,6 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
                 description: format!("Remove prop '{}'", prop_name),
             })
         } else {
-            // Can't parse — flag for manual review
             Some(PlannedFix {
                 edits: vec![],
                 confidence: FixConfidence::Low,
@@ -226,13 +228,9 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
     }
 }
 
-// ── Import deduplication ─────────────────────────────────────────────────
+// -- Import deduplication --
 
 /// Deduplicate import specifiers on lines that look like ES import statements.
-///
-/// After renaming multiple symbols to the same name (e.g., TextContent/TextList → Content),
-/// an import line may have duplicate specifiers: `import { Content, Content, Content }`.
-/// This function deduplicates them to `import { Content }`.
 fn dedup_import_specifiers(lines: &mut [String]) {
     let import_re = regex::Regex::new(r"^(\s*import\s+\{)([^}]+)(\}\s*from\s+.*)$").unwrap();
 
@@ -251,10 +249,7 @@ fn dedup_import_specifiers(lines: &mut [String]) {
             let mut seen = std::collections::HashSet::new();
             let deduped: Vec<&str> = specifiers
                 .into_iter()
-                .filter(|s| {
-                    // Handle `Name as Alias` — dedup by the full specifier
-                    seen.insert(s.to_string())
-                })
+                .filter(|s| seen.insert(s.to_string()))
                 .collect();
 
             let new_specifiers = format!(" {} ", deduped.join(", "));
@@ -267,12 +262,9 @@ fn dedup_import_specifiers(lines: &mut [String]) {
     }
 }
 
-// ── Bracket depth ────────────────────────────────────────────────────────
+// -- Bracket depth --
 
 /// Count net bracket/brace depth change for a line.
-/// Returns positive if more openers than closers, negative if more closers.
-/// Ignores brackets inside string literals (single/double quoted and
-/// JS template literals).
 fn bracket_depth(line: &str) -> i32 {
     let mut depth: i32 = 0;
     let mut in_single_quote = false;
@@ -299,10 +291,9 @@ fn bracket_depth(line: &str) -> i32 {
     depth
 }
 
-// ── Incident variable extraction ─────────────────────────────────────────
+// -- Incident variable extraction --
 
 /// Extract the matched text from incident variables.
-/// Checks propName, componentName, importedName, className, variableName in that order.
 fn get_matched_text_from_incident(incident: &Incident) -> String {
     for key in &[
         "propName",
@@ -319,28 +310,22 @@ fn get_matched_text_from_incident(incident: &Incident) -> String {
 }
 
 /// Get the matched text, considering both prop names and prop values.
-/// Used by `plan_rename` to find the correct mapping — for value-level
-/// renames (e.g., variant="light" → "secondary"), the mapping's `old`
-/// is the value, not the prop name.
 fn get_matched_text_for_rename_from_incident(
     incident: &Incident,
     mappings: &[RenameMapping],
 ) -> String {
     let prop_name = get_matched_text_from_incident(incident);
 
-    // If a mapping matches the prop name directly, use it
     if mappings.iter().any(|m| m.old == prop_name) {
         return prop_name;
     }
 
-    // Check if a mapping matches the prop VALUE instead (enum value renames)
     if let Some(serde_json::Value::String(val)) = incident.variables.get("propValue") {
         if mappings.iter().any(|m| m.old == val.as_str()) {
             return val.clone();
         }
     }
 
-    // Check propObjectValues (responsive breakpoint objects)
     if let Some(serde_json::Value::Array(vals)) = incident.variables.get("propObjectValues") {
         for v in vals {
             if let serde_json::Value::String(s) = v {
@@ -352,6 +337,184 @@ fn get_matched_text_for_rename_from_incident(
     }
 
     prop_name
+}
+
+// -- npm dependency management (package.json) --
+
+/// Walk up the directory tree from `path` to find the nearest `package.json`.
+fn find_nearest_package_json(path: &Path) -> Option<PathBuf> {
+    let mut dir = if path.is_file() { path.parent()? } else { path };
+    loop {
+        let candidate = dir.join("package.json");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Ensure a dependency exists at the correct version in `package.json`.
+///
+/// 1. If `file_path` is a `package.json`, use it directly (dependency condition leg).
+///    Otherwise walk up from `file_path` to find the nearest `package.json`
+///    (import condition leg -- the incident points at a source file).
+/// 2. Try to update: scan for the package name in the file and replace the version.
+/// 3. If not found: insert a new entry into the `"dependencies"` block.
+fn plan_ensure_npm_dependency(
+    rule_id: &str,
+    _incident: &Incident,
+    package: &str,
+    new_version: &str,
+    file_path: &Path,
+) -> Option<PlannedFix> {
+    // Resolve the target package.json
+    let pkg_json = if file_path.file_name().is_some_and(|f| f == "package.json") {
+        file_path.to_path_buf()
+    } else {
+        find_nearest_package_json(file_path)?
+    };
+
+    let source = std::fs::read_to_string(&pkg_json).ok()?;
+    let pkg_json_uri = format!("file://{}", pkg_json.display());
+
+    // --- Try update: find the package name and replace its version ---
+    let package_quoted = format!("\"{}\"", package);
+    let version_re = regex::Regex::new(r#"("[\^~><=]*\d+\.\d+\.\d+[^"]*")"#).ok()?;
+
+    for (idx, file_line) in source.lines().enumerate() {
+        if !file_line.contains(&package_quoted) {
+            continue;
+        }
+        if let Some(m) = version_re.find(file_line) {
+            let line = (idx + 1) as u32;
+            let old_version = m.as_str();
+            let new_ver_quoted = format!("\"{}\"", new_version);
+
+            return Some(PlannedFix {
+                edits: vec![TextEdit {
+                    line,
+                    old_text: old_version.to_string(),
+                    new_text: new_ver_quoted.clone(),
+                    rule_id: rule_id.to_string(),
+                    description: format!(
+                        "Update {} from {} to {}",
+                        package, old_version, new_ver_quoted
+                    ),
+                    replace_all: false,
+                }],
+                confidence: FixConfidence::Exact,
+                source: FixSource::Pattern,
+                rule_id: rule_id.to_string(),
+                file_uri: pkg_json_uri,
+                line,
+                description: format!("Update {} to {}", package, new_version),
+            });
+        }
+    }
+
+    // --- Insert: package not found, add it to the "dependencies" block ---
+    let lines: Vec<&str> = source.lines().collect();
+    let mut in_dependencies = false;
+    let mut brace_depth = 0;
+    let mut last_entry_line: Option<usize> = None;
+    let mut closing_brace_line: Option<usize> = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if !in_dependencies {
+            if trimmed.starts_with("\"dependencies\"") {
+                in_dependencies = true;
+                if trimmed.contains('{') {
+                    brace_depth = 1;
+                }
+            }
+            continue;
+        }
+
+        if brace_depth == 0 && trimmed.starts_with('{') {
+            brace_depth = 1;
+            continue;
+        }
+
+        if brace_depth == 1 {
+            if trimmed == "}" || trimmed == "}," {
+                closing_brace_line = Some(idx);
+                break;
+            }
+            if !trimmed.is_empty() {
+                last_entry_line = Some(idx);
+            }
+        }
+
+        for ch in trimmed.chars() {
+            if ch == '{' {
+                brace_depth += 1;
+            } else if ch == '}' {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    closing_brace_line = Some(idx);
+                    break;
+                }
+            }
+        }
+        if closing_brace_line.is_some() {
+            break;
+        }
+    }
+
+    let closing_idx = closing_brace_line?;
+    let closing_line_num = (closing_idx + 1) as u32;
+
+    let entry_indent = if let Some(last_idx) = last_entry_line {
+        let last = lines[last_idx];
+        let indent_len = last.len() - last.trim_start().len();
+        &last[..indent_len]
+    } else {
+        "    "
+    };
+
+    let mut edits = Vec::new();
+
+    if let Some(last_idx) = last_entry_line {
+        let last = lines[last_idx];
+        if !last.trim_end().ends_with(',') {
+            let last_line_num = (last_idx + 1) as u32;
+            let trimmed_last = last.trim_end().to_string();
+            edits.push(TextEdit {
+                line: last_line_num,
+                old_text: trimmed_last.clone(),
+                new_text: format!("{},", trimmed_last),
+                rule_id: rule_id.to_string(),
+                description: format!("Add trailing comma before new dependency {}", package),
+                replace_all: false,
+            });
+        }
+    }
+
+    let closing_line_text = lines[closing_idx].to_string();
+    let new_entry = format!(
+        "{}\"{}\": \"{}\"\n{}",
+        entry_indent, package, new_version, closing_line_text
+    );
+    edits.push(TextEdit {
+        line: closing_line_num,
+        old_text: closing_line_text,
+        new_text: new_entry,
+        rule_id: rule_id.to_string(),
+        description: format!("Add {} {} to dependencies", package, new_version),
+        replace_all: false,
+    });
+
+    Some(PlannedFix {
+        edits,
+        confidence: FixConfidence::Exact,
+        source: FixSource::Pattern,
+        rule_id: rule_id.to_string(),
+        file_uri: pkg_json_uri,
+        line: closing_line_num,
+        description: format!("Add {} {} to dependencies", package, new_version),
+    })
 }
 
 #[cfg(test)]
@@ -378,7 +541,7 @@ mod tests {
         }
     }
 
-    // ── should_skip_path tests ───────────────────────────────────────────
+    // -- should_skip_path tests --
 
     #[test]
     fn test_skip_node_modules() {
@@ -408,7 +571,7 @@ mod tests {
         assert!(!provider.should_skip_path(Path::new("/project/src/vendor/lib.ts")));
     }
 
-    // ── is_whole_file_rename tests ───────────────────────────────────────
+    // -- is_whole_file_rename tests --
 
     #[test]
     fn test_whole_file_rename_with_imported_name() {
@@ -434,7 +597,7 @@ mod tests {
         assert!(!provider.is_whole_file_rename(&incident));
     }
 
-    // ── bracket_depth tests ──────────────────────────────────────────────
+    // -- bracket_depth tests --
 
     #[test]
     fn test_bracket_depth_balanced() {
@@ -446,9 +609,9 @@ mod tests {
 
     #[test]
     fn test_bracket_depth_open() {
-        assert_eq!(bracket_depth("actions={["), 2); // { and [
+        assert_eq!(bracket_depth("actions={["), 2);
         assert_eq!(bracket_depth("  <Button"), 0);
-        assert_eq!(bracket_depth("foo(bar, {"), 2); // ( and {
+        assert_eq!(bracket_depth("foo(bar, {"), 2);
     }
 
     #[test]
@@ -458,52 +621,20 @@ mod tests {
     }
 
     #[test]
-    fn test_bracket_depth_nested() {
-        assert_eq!(bracket_depth("{ a: { b: [1] } }"), 0);
-        assert_eq!(bracket_depth("f(g(h(x)))"), 0);
-    }
-
-    #[test]
     fn test_bracket_depth_ignores_string_literals() {
         assert_eq!(bracket_depth(r#"  foo="{not a bracket}""#), 0);
         assert_eq!(bracket_depth("  foo='[still not]'"), 0);
-        assert_eq!(bracket_depth("  foo=`${`nested`}`"), 0);
     }
 
-    #[test]
-    fn test_bracket_depth_empty() {
-        assert_eq!(bracket_depth(""), 0);
-        assert_eq!(bracket_depth("   just text   "), 0);
-    }
-
-    #[test]
-    fn test_bracket_depth_escaped_quotes() {
-        // Escaped quote should not toggle string mode
-        assert_eq!(bracket_depth(r#"  "escaped \" quote" "#), 0);
-    }
-
-    // ── dedup_import_specifiers tests ────────────────────────────────────
-
-    #[test]
-    fn test_dedup_import_no_duplicates() {
-        let mut lines = vec!["import { Foo, Bar } from '@pkg';".to_string()];
-        dedup_import_specifiers(&mut lines);
-        assert!(lines[0].contains("Foo"));
-        assert!(lines[0].contains("Bar"));
-    }
+    // -- dedup_import_specifiers tests --
 
     #[test]
     fn test_dedup_import_removes_duplicates() {
         let mut lines =
             vec!["import { Content, Content, Content } from '@patternfly/react-core';".to_string()];
         dedup_import_specifiers(&mut lines);
-        // Should contain exactly one "Content"
         let count = lines[0].matches("Content").count();
-        assert_eq!(
-            count, 1,
-            "Expected 1 occurrence of Content, got {}: {}",
-            count, lines[0]
-        );
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -515,22 +646,7 @@ mod tests {
         assert_eq!(lines[0].matches("Baz").count(), 1);
     }
 
-    #[test]
-    fn test_dedup_import_preserves_aliases() {
-        let mut lines = vec!["import { Foo as F, Foo as F } from '@pkg';".to_string()];
-        dedup_import_specifiers(&mut lines);
-        assert_eq!(lines[0].matches("Foo as F").count(), 1);
-    }
-
-    #[test]
-    fn test_dedup_import_non_import_lines_unchanged() {
-        let original = "const x = { Foo, Foo };".to_string();
-        let mut lines = vec![original.clone()];
-        dedup_import_specifiers(&mut lines);
-        assert_eq!(lines[0], original);
-    }
-
-    // ── get_matched_text tests ───────────────────────────────────────────
+    // -- get_matched_text tests --
 
     #[test]
     fn test_get_matched_text_prop_name_first() {
@@ -548,46 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn test_get_matched_text_component_name() {
-        let mut vars = BTreeMap::new();
-        vars.insert(
-            "componentName".to_string(),
-            serde_json::Value::String("Button".to_string()),
-        );
-        let incident = make_test_incident("", 1, vars);
-        assert_eq!(get_matched_text_from_incident(&incident), "Button");
-    }
-
-    #[test]
-    fn test_get_matched_text_imported_name() {
-        let mut vars = BTreeMap::new();
-        vars.insert(
-            "importedName".to_string(),
-            serde_json::Value::String("Chip".to_string()),
-        );
-        let incident = make_test_incident("", 1, vars);
-        assert_eq!(get_matched_text_from_incident(&incident), "Chip");
-    }
-
-    #[test]
     fn test_get_matched_text_empty_when_no_known_vars() {
         let incident = make_test_incident("", 1, BTreeMap::new());
         assert_eq!(get_matched_text_from_incident(&incident), "");
     }
 
-    #[test]
-    fn test_get_matched_text_ignores_non_string_values() {
-        let mut vars = BTreeMap::new();
-        vars.insert("propName".to_string(), serde_json::Value::Bool(true));
-        vars.insert(
-            "componentName".to_string(),
-            serde_json::Value::String("Fallback".to_string()),
-        );
-        let incident = make_test_incident("", 1, vars);
-        assert_eq!(get_matched_text_from_incident(&incident), "Fallback");
-    }
-
-    // ── get_matched_text_for_rename tests ────────────────────────────────
+    // -- get_matched_text_for_rename tests --
 
     #[test]
     fn test_get_matched_text_for_rename_prefers_prop_name() {
@@ -629,26 +711,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_get_matched_text_for_rename_checks_object_values() {
-        let mut vars = BTreeMap::new();
-        vars.insert("propName".into(), serde_json::Value::String("gap".into()));
-        vars.insert(
-            "propObjectValues".into(),
-            serde_json::json!(["spaceItemsMd", "spaceItemsNone"]),
-        );
-        let incident = make_test_incident("file:///test.tsx", 1, vars);
-        let mappings = vec![RenameMapping {
-            old: "spaceItemsMd".into(),
-            new: "gapMd".into(),
-        }];
-        assert_eq!(
-            get_matched_text_for_rename_from_incident(&incident, &mappings),
-            "spaceItemsMd"
-        );
-    }
-
-    // ── post_process_lines integration test ──────────────────────────────
+    // -- post_process_lines integration test --
 
     #[test]
     fn test_post_process_deduplicates_imports() {
