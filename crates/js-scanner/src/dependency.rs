@@ -2,7 +2,15 @@
 //!
 //! Checks if a project has specific dependencies at specific version ranges.
 //! Supports npm workspaces by walking workspace package.json files.
+//!
+//! Also scans the lockfile (yarn.lock / package-lock.json) to find packages
+//! whose transitive dependencies conflict with the condition. For example,
+//! if the condition matches `@patternfly/react-core <= 5.99.99`, and the
+//! lockfile shows that `@patternfly/react-topology@5.2.1` depends on
+//! `@patternfly/react-core@^5.1.1`, an additional incident is emitted
+//! for `react-topology` to flag the version conflict.
 
+use crate::lockfile;
 use anyhow::Result;
 use frontend_core::capabilities::DependencyCondition;
 use frontend_core::incident::{Incident, Location, Position};
@@ -21,6 +29,10 @@ pub struct PackageDependency {
 /// Check package.json files for dependencies matching the condition.
 ///
 /// Walks the root package.json and any workspace package.json files.
+/// Also scans the lockfile for transitive dependency conflicts: if a
+/// direct dependency of the project depends on the matched package at
+/// a version within the condition's bounds, an additional incident is
+/// emitted for the dependent package.
 pub fn check_dependencies(root: &Path, condition: &DependencyCondition) -> Result<Vec<Incident>> {
     let mut incidents = Vec::new();
 
@@ -32,7 +44,156 @@ pub fn check_dependencies(root: &Path, condition: &DependencyCondition) -> Resul
         incidents.extend(results);
     }
 
+    // Lockfile scan: find direct dependencies that transitively depend on
+    // the matched package at a version within the condition's bounds.
+    if let Some(ref target_name) = condition.name {
+        let lockfile_incidents =
+            check_lockfile_dependents(root, target_name, condition, &pkg_paths);
+        incidents.extend(lockfile_incidents);
+    }
+
     Ok(incidents)
+}
+
+/// Scan the lockfile for packages that depend on `target_name` at a version
+/// within the condition's bounds. For each such package that is also a direct
+/// dependency of the project (in a package.json), emit an incident.
+fn check_lockfile_dependents(
+    root: &Path,
+    target_name: &str,
+    condition: &DependencyCondition,
+    pkg_paths: &[PathBuf],
+) -> Vec<Incident> {
+    let lockfile_entries = match lockfile::parse_lockfile(root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "Lockfile parsing failed, skipping dependent scan"
+            );
+            return Vec::new();
+        }
+    };
+
+    if lockfile_entries.is_empty() {
+        return Vec::new();
+    }
+
+    let dependents = lockfile::find_dependents(
+        &lockfile_entries,
+        target_name,
+        condition.upperbound.as_deref(),
+    );
+
+    if dependents.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect all direct dependencies from all package.json files so we
+    // only emit incidents for packages the user can actually update.
+    let direct_deps = collect_direct_deps(pkg_paths);
+
+    let mut incidents = Vec::new();
+    for dep in &dependents {
+        // Only flag dependents that are declared in a package.json
+        if let Some((pkg_path, dep_type, line_number)) = direct_deps.get(&dep.name) {
+            let file_uri = format!("file://{}", pkg_path.display());
+            let content = match std::fs::read_to_string(pkg_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let mut incident = Incident::new(
+                file_uri,
+                *line_number,
+                Location {
+                    start: Position {
+                        line: line_number.saturating_sub(1),
+                        character: 0,
+                    },
+                    end: Position {
+                        line: line_number.saturating_sub(1),
+                        character: 0,
+                    },
+                },
+            );
+
+            incident.variables.insert(
+                "dependencyName".into(),
+                serde_json::Value::String(dep.name.clone()),
+            );
+            incident.variables.insert(
+                "dependencyVersion".into(),
+                serde_json::Value::String(dep.version.clone()),
+            );
+            incident.variables.insert(
+                "dependencyType".into(),
+                serde_json::Value::String(dep_type.clone()),
+            );
+            incident.variables.insert(
+                "isDependentOf".into(),
+                serde_json::Value::String(target_name.to_string()),
+            );
+
+            // The constraint the dependent has on the target package
+            if let Some(constraint) = dep.dependencies.get(target_name) {
+                incident.variables.insert(
+                    "dependentConstraint".into(),
+                    serde_json::Value::String(constraint.clone()),
+                );
+            }
+
+            incident.code_snip = Some(frontend_core::incident::extract_code_snip(
+                &content,
+                *line_number,
+                3,
+            ));
+
+            tracing::info!(
+                dependent = %dep.name,
+                dependent_version = %dep.version,
+                depends_on = %target_name,
+                constraint = ?dep.dependencies.get(target_name),
+                "Lockfile conflict: dependent requires old version"
+            );
+
+            incidents.push(incident);
+        }
+    }
+
+    incidents
+}
+
+/// Collect all direct dependencies from all package.json files.
+/// Returns a map: package_name → (pkg_path, dep_type, line_number).
+fn collect_direct_deps(
+    pkg_paths: &[PathBuf],
+) -> std::collections::HashMap<String, (PathBuf, String, u32)> {
+    let mut deps = std::collections::HashMap::new();
+    let dep_sections = ["dependencies", "devDependencies", "peerDependencies"];
+
+    for pkg_path in pkg_paths {
+        let content = match std::fs::read_to_string(pkg_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let pkg: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        for section in &dep_sections {
+            if let Some(section_deps) = pkg.get(section).and_then(|v| v.as_object()) {
+                for (name, _) in section_deps {
+                    let line = find_key_line(&content, name);
+                    deps.entry(name.clone())
+                        .or_insert_with(|| (pkg_path.clone(), section.to_string(), line));
+                }
+            }
+        }
+    }
+
+    deps
 }
 
 /// Find all package.json files to check: root + workspace members.
@@ -301,5 +462,273 @@ mod tests {
         // v6 should NOT match (>5.99.99)
         assert!(!version_in_bounds("^6.4.1", &cond));
         assert!(!version_in_bounds("6.0.0", &cond));
+    }
+
+    // ── Lockfile dependent detection integration tests ───────────────
+
+    #[test]
+    fn test_check_dependencies_finds_lockfile_dependents_npm() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // package.json: react-core already at v6, but react-topology at v5
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "name": "test-project",
+  "devDependencies": {
+    "@patternfly/react-core": "^6.4.1",
+    "@patternfly/react-topology": "5.2.1",
+    "@patternfly/react-table": "^6.4.1"
+  }
+}"#,
+        )
+        .unwrap();
+
+        // package-lock.json: topology depends on react-core ^5.1.1
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test-project" },
+    "node_modules/@patternfly/react-core": {
+      "version": "6.4.1",
+      "dependencies": {}
+    },
+    "node_modules/@patternfly/react-topology": {
+      "version": "5.2.1",
+      "dependencies": {
+        "@patternfly/react-core": "^5.1.1",
+        "@patternfly/react-icons": "^5.1.1"
+      }
+    },
+    "node_modules/@patternfly/react-table": {
+      "version": "6.4.1",
+      "dependencies": {
+        "@patternfly/react-core": "^6.0.0"
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let condition = DependencyCondition {
+            name: Some("@patternfly/react-core".into()),
+            nameregex: None,
+            upperbound: Some("5.99.99".into()),
+            lowerbound: None,
+        };
+
+        let incidents = check_dependencies(dir.path(), &condition).unwrap();
+
+        // react-core itself is at v6 — no primary match.
+        // But react-topology depends on react-core ^5.1.1 — lockfile dependent match.
+        // react-table depends on react-core ^6.0.0 — NOT a match (above upperbound).
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Expected 1 dependent incident, got {}",
+            incidents.len()
+        );
+
+        let incident = &incidents[0];
+        assert_eq!(
+            incident
+                .variables
+                .get("dependencyName")
+                .and_then(|v| v.as_str()),
+            Some("@patternfly/react-topology")
+        );
+        assert_eq!(
+            incident
+                .variables
+                .get("dependencyVersion")
+                .and_then(|v| v.as_str()),
+            Some("5.2.1")
+        );
+        assert_eq!(
+            incident
+                .variables
+                .get("isDependentOf")
+                .and_then(|v| v.as_str()),
+            Some("@patternfly/react-core")
+        );
+        assert_eq!(
+            incident
+                .variables
+                .get("dependentConstraint")
+                .and_then(|v| v.as_str()),
+            Some("^5.1.1")
+        );
+    }
+
+    #[test]
+    fn test_check_dependencies_finds_lockfile_dependents_yarn() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "name": "test-project",
+  "devDependencies": {
+    "@patternfly/react-core": "^6.4.1",
+    "@patternfly/react-log-viewer": "5.3.0"
+  }
+}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join("yarn.lock"),
+            r#"# yarn lockfile v1
+
+__metadata:
+  version: 8
+
+"@patternfly/react-core@npm:^6.4.1":
+  version: 6.4.1
+  resolution: "@patternfly/react-core@npm:6.4.1"
+  languageName: node
+  linkType: hard
+
+"@patternfly/react-log-viewer@npm:5.3.0":
+  version: 5.3.0
+  resolution: "@patternfly/react-log-viewer@npm:5.3.0"
+  dependencies:
+    "@patternfly/react-core": "npm:^5.0.0"
+    "@patternfly/react-styles": "npm:^5.0.0"
+  languageName: node
+  linkType: hard
+"#,
+        )
+        .unwrap();
+
+        let condition = DependencyCondition {
+            name: Some("@patternfly/react-core".into()),
+            nameregex: None,
+            upperbound: Some("5.99.99".into()),
+            lowerbound: None,
+        };
+
+        let incidents = check_dependencies(dir.path(), &condition).unwrap();
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0]
+                .variables
+                .get("dependencyName")
+                .and_then(|v| v.as_str()),
+            Some("@patternfly/react-log-viewer")
+        );
+        assert_eq!(
+            incidents[0]
+                .variables
+                .get("isDependentOf")
+                .and_then(|v| v.as_str()),
+            Some("@patternfly/react-core")
+        );
+    }
+
+    #[test]
+    fn test_check_dependencies_no_false_positives_for_v6_dependents() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // All packages at v6 — no conflicts
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "devDependencies": {
+    "@patternfly/react-core": "^6.4.1",
+    "@patternfly/react-table": "^6.4.1"
+  }
+}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {},
+    "node_modules/@patternfly/react-core": {
+      "version": "6.4.1"
+    },
+    "node_modules/@patternfly/react-table": {
+      "version": "6.4.1",
+      "dependencies": {
+        "@patternfly/react-core": "^6.0.0"
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let condition = DependencyCondition {
+            name: Some("@patternfly/react-core".into()),
+            nameregex: None,
+            upperbound: Some("5.99.99".into()),
+            lowerbound: None,
+        };
+
+        let incidents = check_dependencies(dir.path(), &condition).unwrap();
+        assert!(
+            incidents.is_empty(),
+            "Expected 0 incidents (all deps at v6), got {}",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn test_check_dependencies_skips_non_direct_deps() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // package.json does NOT include react-topology as a direct dep
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "devDependencies": {
+    "@patternfly/react-core": "^6.4.1"
+  }
+}"#,
+        )
+        .unwrap();
+
+        // But lockfile shows react-topology (transitive only, not in package.json)
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {},
+    "node_modules/@patternfly/react-core": {
+      "version": "6.4.1"
+    },
+    "node_modules/@patternfly/react-topology": {
+      "version": "5.2.1",
+      "dependencies": {
+        "@patternfly/react-core": "^5.1.1"
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let condition = DependencyCondition {
+            name: Some("@patternfly/react-core".into()),
+            nameregex: None,
+            upperbound: Some("5.99.99".into()),
+            lowerbound: None,
+        };
+
+        let incidents = check_dependencies(dir.path(), &condition).unwrap();
+        assert!(
+            incidents.is_empty(),
+            "Should not emit incidents for non-direct deps, got {}",
+            incidents.len()
+        );
     }
 }
