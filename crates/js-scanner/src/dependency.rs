@@ -197,7 +197,7 @@ fn collect_direct_deps(
 }
 
 /// Find all package.json files to check: root + workspace members.
-fn find_package_jsons(root: &Path) -> Vec<PathBuf> {
+pub fn find_package_jsons(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let root_pkg = root.join("package.json");
 
@@ -375,7 +375,7 @@ fn version_in_bounds(version_str: &str, condition: &DependencyCondition) -> bool
 }
 
 /// Strip npm version range prefixes: ^, ~, >=, <=, >, <, =
-fn strip_npm_prefix(version: &str) -> &str {
+pub fn strip_npm_prefix(version: &str) -> &str {
     let v = version.trim();
     if let Some(rest) = v.strip_prefix(">=") {
         rest.trim()

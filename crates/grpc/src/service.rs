@@ -187,67 +187,102 @@ impl ProviderService for FrontendProvider {
             .clone()
             .ok_or_else(|| Status::failed_precondition("Provider not initialized"))?;
 
-        let file_uri = format!("file://{}", root.join("package.json").display());
+        // Parse declared dependencies from package.json files directly,
+        // rather than using `npm ls` which returns resolved versions from
+        // node_modules. Declared versions are what dependency rules should
+        // match against — they're what the user controls and what needs
+        // updating during a migration.
+        //
+        // Benefits over `npm ls`:
+        //  - Returns declared versions, not resolved (correct for rule matching)
+        //  - Correctly tags dependencies vs devDependencies vs peerDependencies
+        //  - Supports npm workspaces
+        //  - Works regardless of package manager (npm/yarn/pnpm)
+        //  - Does not require npm install to have succeeded
+        let pkg_paths = frontend_js_scanner::dependency::find_package_jsons(&root);
 
-        // Use `npm ls --json --depth=0` to get resolved dependency versions.
-        // This requires `npm install` to have run first (done in init).
-        let output = std::process::Command::new("npm")
-            .args(["ls", "--json", "--depth=0", "--long=false"])
-            .current_dir(&root)
-            .output();
+        let mut file_deps = Vec::new();
+        let dep_sections = ["dependencies", "devDependencies", "peerDependencies"];
 
-        let deps = match output {
-            Ok(result) => {
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                match serde_json::from_str::<serde_json::Value>(&stdout) {
-                    Ok(tree) => {
-                        let mut deps = Vec::new();
-                        if let Some(dep_map) = tree.get("dependencies").and_then(|d| d.as_object())
-                        {
-                            for (name, info) in dep_map {
-                                let version = info
-                                    .get("version")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("0.0.0")
-                                    .to_string();
-                                deps.push(Dependency {
-                                    name: name.clone(),
-                                    version,
-                                    classifier: String::new(),
-                                    r#type: "dependencies".to_string(),
-                                    resolved_identifier: String::new(),
-                                    file_uri_prefix: String::new(),
-                                    indirect: false,
-                                    extras: None,
-                                    labels: vec![],
-                                });
-                            }
+        for pkg_path in &pkg_paths {
+            let file_uri = format!("file://{}", pkg_path.display());
+
+            let content = match std::fs::read_to_string(pkg_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %pkg_path.display(),
+                        error = %e,
+                        "Failed to read package.json, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let pkg: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %pkg_path.display(),
+                        error = %e,
+                        "Failed to parse package.json, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let mut deps = Vec::new();
+
+            for section in &dep_sections {
+                if let Some(dep_map) = pkg.get(*section).and_then(|v| v.as_object()) {
+                    for (name, version_val) in dep_map {
+                        let raw_version = version_val.as_str().unwrap_or("0.0.0");
+
+                        // Skip workspace protocol entries (e.g., "workspace:*")
+                        if raw_version.starts_with("workspace:") {
+                            continue;
                         }
-                        deps
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse npm ls output: {}", e);
-                        vec![]
+
+                        // Strip range prefixes (^, ~, >=, etc.) to get the
+                        // base semver for kantra's version comparison.
+                        let version =
+                            frontend_js_scanner::dependency::strip_npm_prefix(raw_version)
+                                .to_string();
+
+                        deps.push(Dependency {
+                            name: name.clone(),
+                            version,
+                            classifier: String::new(),
+                            r#type: section.to_string(),
+                            resolved_identifier: String::new(),
+                            file_uri_prefix: String::new(),
+                            indirect: false,
+                            extras: None,
+                            labels: vec![],
+                        });
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!("npm ls failed: {}", e);
-                vec![]
-            }
-        };
 
-        tracing::info!("Returning {} resolved dependencies", deps.len());
+            tracing::info!(
+                path = %pkg_path.display(),
+                count = deps.len(),
+                "Parsed declared dependencies from package.json"
+            );
 
-        let file_dep = vec![FileDep {
-            file_uri,
-            list: Some(DependencyList { deps }),
-        }];
+            file_deps.push(FileDep {
+                file_uri,
+                list: Some(DependencyList { deps }),
+            });
+        }
+
+        let total: usize = file_deps.iter().filter_map(|fd| fd.list.as_ref()).map(|l| l.deps.len()).sum();
+        tracing::info!("Returning {} declared dependencies from {} package.json file(s)", total, file_deps.len());
 
         Ok(Response::new(DependencyResponse {
             successful: true,
             error: String::new(),
-            file_dep,
+            file_dep: file_deps,
         }))
     }
 
