@@ -16,6 +16,7 @@ async fn main() -> Result<()> {
 
     match args.command {
         cli::Command::Fix(opts) => cli::fix::run(opts).await,
+        cli::Command::Plan(opts) => cli::plan::run(opts).await,
         cli::Command::Serve(opts) => cli::serve::run(opts).await,
     }
 }

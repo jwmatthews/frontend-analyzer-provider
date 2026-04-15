@@ -14,3 +14,4 @@ pub mod goose_client;
 pub mod language;
 pub mod llm_client;
 pub mod registry;
+pub mod report;

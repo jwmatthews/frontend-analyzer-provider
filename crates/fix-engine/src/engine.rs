@@ -17,6 +17,14 @@ use std::path::PathBuf;
 
 use crate::language::LanguageFixProvider;
 
+/// Result of planning a single incident against a resolved fix strategy.
+#[derive(Debug, Clone)]
+pub enum PlannedIncidentAction {
+    Pattern(PlannedFix),
+    Manual(ManualFixItem),
+    Llm(LlmFixRequest),
+}
+
 /// Build a fix plan from analysis output.
 ///
 /// `strategies` is a merged map of rule ID → fix strategy, loaded from one or
@@ -52,81 +60,24 @@ pub fn plan_fixes(
                     continue;
                 }
 
-                match &strategy {
-                    FixStrategy::Rename(mappings) => {
-                        if let Some(fix) =
-                            plan_rename(rule_id, incident, mappings, &file_path, lang)
-                        {
+                if let Some(action) = plan_incident_action(
+                    rule_id,
+                    incident,
+                    &strategy,
+                    &file_path,
+                    lang,
+                    &violation.labels,
+                ) {
+                    match action {
+                        PlannedIncidentAction::Pattern(fix) => {
                             plan.files.entry(file_path).or_default().push(fix);
                         }
-                    }
-                    FixStrategy::RemoveProp => {
-                        if let Some(fix) = lang.plan_remove_attribute(rule_id, incident, &file_path)
-                        {
-                            plan.files.entry(file_path).or_default().push(fix);
+                        PlannedIncidentAction::Manual(item) => {
+                            plan.manual.push(item);
                         }
-                    }
-                    FixStrategy::ImportPathChange { old_path, new_path } => {
-                        if let Some(fix) = plan_import_path_change(
-                            rule_id, incident, old_path, new_path, &file_path,
-                        ) {
-                            plan.files.entry(file_path).or_default().push(fix);
+                        PlannedIncidentAction::Llm(request) => {
+                            plan.pending_llm.push(request);
                         }
-                    }
-                    FixStrategy::CssVariablePrefix {
-                        old_prefix,
-                        new_prefix,
-                    } => {
-                        // Treat CSS prefix changes as renames
-                        let mappings = vec![RenameMapping {
-                            old: old_prefix.clone(),
-                            new: new_prefix.clone(),
-                        }];
-                        if let Some(mut fix) =
-                            plan_rename(rule_id, incident, &mappings, &file_path, lang)
-                        {
-                            // CSS prefix edits should replace ALL occurrences on a line,
-                            // e.g. className="pf-v5-u-color-200 pf-v5-u-font-weight-light"
-                            for edit in &mut fix.edits {
-                                edit.replace_all = true;
-                            }
-                            plan.files.entry(file_path).or_default().push(fix);
-                        }
-                    }
-                    FixStrategy::UpdateDependency {
-                        ref package,
-                        ref new_version,
-                    } => {
-                        if let Some(fix) = plan_update_dependency(
-                            rule_id,
-                            incident,
-                            package,
-                            new_version,
-                            &file_path,
-                        ) {
-                            plan.files.entry(file_path).or_default().push(fix);
-                        }
-                    }
-                    FixStrategy::Manual => {
-                        plan.manual.push(ManualFixItem {
-                            rule_id: rule_id.clone(),
-                            file_uri: incident.file_uri.clone(),
-                            line: incident.line_number.unwrap_or(0),
-                            message: incident.message.clone(),
-                            code_snip: incident.code_snip.clone(),
-                        });
-                    }
-                    FixStrategy::Llm => {
-                        plan.pending_llm.push(LlmFixRequest {
-                            rule_id: rule_id.clone(),
-                            file_uri: incident.file_uri.clone(),
-                            file_path: file_path.clone(),
-                            line: incident.line_number.unwrap_or(0),
-                            message: incident.message.clone(),
-                            code_snip: incident.code_snip.clone(),
-                            source: None, // filled lazily if LLM is invoked
-                            labels: violation.labels.clone(),
-                        });
                     }
                 }
             }
@@ -298,6 +249,64 @@ pub fn preview_fixes(plan: &FixPlan, lang: &dyn LanguageFixProvider) -> Result<S
 }
 
 // ── Pattern-based fix generators ──────────────────────────────────────────
+
+/// Plan a single incident for a resolved fix strategy.
+pub fn plan_incident_action(
+    rule_id: &str,
+    incident: &Incident,
+    strategy: &FixStrategy,
+    file_path: &PathBuf,
+    lang: &dyn LanguageFixProvider,
+    labels: &[String],
+) -> Option<PlannedIncidentAction> {
+    match strategy {
+        FixStrategy::Rename(mappings) => plan_rename(rule_id, incident, mappings, file_path, lang)
+            .map(PlannedIncidentAction::Pattern),
+        FixStrategy::RemoveProp => lang
+            .plan_remove_attribute(rule_id, incident, file_path)
+            .map(PlannedIncidentAction::Pattern),
+        FixStrategy::ImportPathChange { old_path, new_path } => {
+            plan_import_path_change(rule_id, incident, old_path, new_path, file_path)
+                .map(PlannedIncidentAction::Pattern)
+        }
+        FixStrategy::CssVariablePrefix {
+            old_prefix,
+            new_prefix,
+        } => {
+            let mappings = vec![RenameMapping {
+                old: old_prefix.clone(),
+                new: new_prefix.clone(),
+            }];
+            let mut fix = plan_rename(rule_id, incident, &mappings, file_path, lang)?;
+            for edit in &mut fix.edits {
+                edit.replace_all = true;
+            }
+            Some(PlannedIncidentAction::Pattern(fix))
+        }
+        FixStrategy::UpdateDependency {
+            package,
+            new_version,
+        } => plan_update_dependency(rule_id, incident, package, new_version, file_path)
+            .map(PlannedIncidentAction::Pattern),
+        FixStrategy::Manual => Some(PlannedIncidentAction::Manual(ManualFixItem {
+            rule_id: rule_id.to_string(),
+            file_uri: incident.file_uri.clone(),
+            line: incident.line_number.unwrap_or(0),
+            message: incident.message.clone(),
+            code_snip: incident.code_snip.clone(),
+        })),
+        FixStrategy::Llm => Some(PlannedIncidentAction::Llm(LlmFixRequest {
+            rule_id: rule_id.to_string(),
+            file_uri: incident.file_uri.clone(),
+            file_path: file_path.clone(),
+            line: incident.line_number.unwrap_or(0),
+            message: incident.message.clone(),
+            code_snip: incident.code_snip.clone(),
+            source: None,
+            labels: labels.to_vec(),
+        })),
+    }
+}
 
 fn plan_rename(
     rule_id: &str,
@@ -534,7 +543,7 @@ fn plan_update_dependency(
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Convert a file:// URI to a filesystem path, relative to project root.
-fn uri_to_path(uri: &str, project_root: &std::path::Path) -> PathBuf {
+pub fn uri_to_path(uri: &str, project_root: &std::path::Path) -> PathBuf {
     let path_str = uri.strip_prefix("file://").unwrap_or(uri);
 
     let path = PathBuf::from(path_str);
@@ -547,7 +556,7 @@ fn uri_to_path(uri: &str, project_root: &std::path::Path) -> PathBuf {
 
 /// Try to infer a fix strategy from rule labels when no explicit mapping exists.
 /// This is a fallback for rules not covered by any strategy file.
-fn infer_strategy_from_labels(labels: &[String]) -> Option<&'static FixStrategy> {
+pub fn infer_strategy_from_labels(labels: &[String]) -> Option<&'static FixStrategy> {
     for label in labels {
         match label.as_str() {
             "change-type=prop-removal" => return Some(&FixStrategy::RemoveProp),
@@ -561,6 +570,19 @@ fn infer_strategy_from_labels(labels: &[String]) -> Option<&'static FixStrategy>
         }
     }
     None
+}
+
+/// Display name for a runtime fix strategy.
+pub fn fix_strategy_name(strategy: &FixStrategy) -> &'static str {
+    match strategy {
+        FixStrategy::Rename(_) => "Rename",
+        FixStrategy::RemoveProp => "RemoveProp",
+        FixStrategy::ImportPathChange { .. } => "ImportPathChange",
+        FixStrategy::CssVariablePrefix { .. } => "CssVariablePrefix",
+        FixStrategy::UpdateDependency { .. } => "UpdateDependency",
+        FixStrategy::Manual => "Manual",
+        FixStrategy::Llm => "Llm",
+    }
 }
 
 #[cfg(test)]

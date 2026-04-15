@@ -1,4 +1,6 @@
 pub mod fix;
+pub mod plan;
+pub mod plan_common;
 pub mod serve;
 
 use clap::{Parser, Subcommand};
@@ -18,6 +20,9 @@ pub struct Cli {
 pub enum Command {
     /// Apply fixes based on Konveyor analysis output.
     Fix(fix::FixOpts),
+
+    /// Generate a structured remediation plan without editing files.
+    Plan(plan::PlanOpts),
 
     /// Start as a Konveyor gRPC external provider.
     Serve(serve::ServeOpts),

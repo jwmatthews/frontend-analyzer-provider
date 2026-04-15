@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use frontend_fix_engine::engine as fix_engine;
 use frontend_fix_engine::goose_client;
 use frontend_fix_engine::llm_client;
-use frontend_fix_engine::registry::FixContextRegistry;
 use frontend_js_fix::JsFixProvider;
-use patternfly_fix_context::PatternFlyV5ToV6Context;
+
+use super::plan_common::{build_fix_context_registry, prepare_plan_context};
 
 #[derive(Args)]
 pub struct FixOpts {
@@ -61,36 +61,18 @@ pub struct FixOpts {
 }
 
 pub async fn run(opts: FixOpts) -> Result<()> {
-    let project = opts.project.canonicalize()?;
-    let input_content = std::fs::read_to_string(&opts.input)?;
-
-    // Parse the Konveyor output (try JSON first, then YAML)
-    let output: Vec<konveyor_core::report::RuleSet> = {
-        let trimmed = input_content.trim_start();
-        if trimmed.starts_with('[') || trimmed.starts_with('{') {
-            serde_json::from_str(&input_content)?
-        } else {
-            // Parse YAML using yaml_serde (pure-Rust yaml-rust2 backend).
-            yaml_serde::from_str::<Vec<konveyor_core::report::RuleSet>>(&input_content)?
-        }
-    };
-
-    // Build fix context registry with framework-specific LLM guidance
-    let mut context_registry = FixContextRegistry::new();
-    context_registry.register(Box::new(PatternFlyV5ToV6Context::new()));
-
-    // Resolve the fix context from the first ruleset name in the analysis output.
-    // All rulesets in a single analysis run typically share the same framework.
-    let ruleset_name = output.first().map(|rs| rs.name.as_str()).unwrap_or("");
-    let fix_context = context_registry.get(ruleset_name);
-
-    let total_violations: usize = output.iter().map(|rs| rs.violations.len()).sum();
-    let total_incidents: usize = output
-        .iter()
-        .flat_map(|rs| rs.violations.values())
-        .map(|v| v.incidents.len())
-        .sum();
-    let total_errors: usize = output.iter().map(|rs| rs.errors.len()).sum();
+    let prepared = prepare_plan_context(
+        &opts.project,
+        &opts.input,
+        opts.rules.as_deref(),
+        opts.strategies.as_deref(),
+        opts.rules_strategies.as_deref(),
+    )?;
+    let output = prepared.analysis.clone();
+    let total_violations = prepared.total_violations;
+    let total_incidents = prepared.total_incidents;
+    let total_errors = prepared.total_errors;
+    let mut plan = prepared.plan;
 
     eprintln!(
         "Loaded {} violations with {} incidents",
@@ -113,55 +95,16 @@ pub async fn run(opts: FixOpts) -> Result<()> {
         eprintln!();
     }
 
-    // Load and merge fix strategies from all sources.
-    // Order: rules-adjacent strategies first, then external strategies override.
-    let mut merged_strategies = std::collections::BTreeMap::new();
-
-    // 1. Load rule-adjacent strategies (bundled with rules)
-    if let Some(ref rules_strategies_path) = opts.rules_strategies {
+    if !prepared.merged_strategies.is_empty() {
         eprintln!(
-            "Loading rule strategies from {}",
-            rules_strategies_path.display()
+            "  Total merged strategies: {}",
+            prepared.merged_strategies.len()
         );
-        match frontend_core::fix::load_strategies_from_json(rules_strategies_path) {
-            Ok(strats) => {
-                eprintln!("  Loaded {} rule strategies", strats.len());
-                merged_strategies.extend(strats);
-            }
-            Err(e) => {
-                eprintln!("  WARNING: Failed to load rule strategies: {}", e);
-            }
-        }
     }
 
-    // 2. Load external strategies (--strategies flag, from semver-analyzer)
-    //    These override rule-adjacent strategies for the same rule ID.
-    if let Some(ref strategies_path) = opts.strategies {
-        eprintln!(
-            "Loading external strategies from {}",
-            strategies_path.display()
-        );
-        match frontend_core::fix::load_strategies_from_json(strategies_path) {
-            Ok(strats) => {
-                eprintln!("  Loaded {} external strategies", strats.len());
-                merged_strategies.extend(strats);
-            }
-            Err(e) => {
-                eprintln!("  WARNING: Failed to load external strategies: {}", e);
-            }
-        }
-    }
-
-    if !merged_strategies.is_empty() {
-        eprintln!("  Total merged strategies: {}", merged_strategies.len());
-    }
-
-    // Language-specific fix provider for JS/TS/JSX/TSX files
     let lang = JsFixProvider::new();
-
-    // Phase 1: Plan fixes
-    eprintln!("Planning fixes...");
-    let mut plan = fix_engine::plan_fixes(&output, &project, &merged_strategies, &lang)?;
+    let context_registry = build_fix_context_registry();
+    let fix_context = context_registry.get(&prepared.selected_ruleset_name);
 
     let pattern_fix_count: usize = plan
         .files

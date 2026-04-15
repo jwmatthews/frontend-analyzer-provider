@@ -4,10 +4,14 @@
 //! the response into text edits.
 
 use anyhow::Result;
-use frontend_core::fix::{FixConfidence, FixSource, LlmFixRequest, PlannedFix, TextEdit};
+use frontend_core::fix::{
+    FixConfidence, FixSource, LlmFixRequest, PlannedFix, PlannedOpenAiRequest, TextEdit,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::context::FixContext;
+
+const DEFAULT_OPENAI_MODEL: &str = "gpt-4";
 
 /// An OpenAI-compatible chat completion request.
 #[derive(Serialize)]
@@ -39,39 +43,66 @@ struct ChatChoiceMessage {
     content: String,
 }
 
+/// Build a non-mutating preview of the OpenAI-compatible request for one fix.
+pub fn build_openai_plan_request(
+    request: &LlmFixRequest,
+    ctx: &dyn FixContext,
+) -> Result<PlannedOpenAiRequest> {
+    let source = match &request.source {
+        Some(source) => source.clone(),
+        None => std::fs::read_to_string(&request.file_path)?,
+    };
+    let system_prompt = ctx.llm_system_prompt();
+    let user_prompt = build_user_prompt(request, &source);
+
+    let chat_request = ChatRequest {
+        model: DEFAULT_OPENAI_MODEL.to_string(),
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: system_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: user_prompt.clone(),
+            },
+        ],
+        temperature: 0.0,
+    };
+
+    Ok(PlannedOpenAiRequest {
+        rule_id: request.rule_id.clone(),
+        file_path: request.file_path.clone(),
+        line: request.line,
+        model: DEFAULT_OPENAI_MODEL.to_string(),
+        temperature: 0.0,
+        system_prompt,
+        user_prompt,
+        request_json: serde_json::to_value(&chat_request)?,
+    })
+}
+
 /// Send an LLM fix request and return planned fixes.
 pub async fn request_llm_fix(
     endpoint: &str,
     request: &LlmFixRequest,
     ctx: &dyn FixContext,
 ) -> Result<Vec<PlannedFix>> {
-    // Read the source file for full context
-    let source = std::fs::read_to_string(&request.file_path)?;
-
-    let system_prompt = ctx.llm_system_prompt();
-
-    let user_prompt = format!(
-        "File: {}\nLine: {}\n\nMigration rule: {}\n\nMessage: {}\n\nFull file source:\n```\n{}\n```",
-        request.file_path.display(),
-        request.line,
-        request.rule_id,
-        request.message,
-        source,
-    );
+    let preview = build_openai_plan_request(request, ctx)?;
 
     let chat_request = ChatRequest {
-        model: "gpt-4".to_string(),
+        model: preview.model.clone(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: system_prompt,
+                content: preview.system_prompt,
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: user_prompt,
+                content: preview.user_prompt,
             },
         ],
-        temperature: 0.0,
+        temperature: preview.temperature,
     };
 
     let client = reqwest::Client::new();
@@ -104,6 +135,17 @@ pub async fn request_llm_fix(
         line: request.line,
         description: format!("LLM-generated fix for {}", request.rule_id),
     }])
+}
+
+fn build_user_prompt(request: &LlmFixRequest, source: &str) -> String {
+    format!(
+        "File: {}\nLine: {}\n\nMigration rule: {}\n\nMessage: {}\n\nFull file source:\n```\n{}\n```",
+        request.file_path.display(),
+        request.line,
+        request.rule_id,
+        request.message,
+        source,
+    )
 }
 
 /// Parse the LLM response format into text edits.
@@ -154,6 +196,8 @@ fn parse_llm_fix_response(content: &str, rule_id: &str) -> Vec<TextEdit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::GenericFixContext;
+    use std::fs;
 
     #[test]
     fn test_parse_llm_response() {
@@ -286,5 +330,31 @@ NEW:
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].old_text, "  isHidden={true}");
         assert_eq!(edits[0].new_text, "");
+    }
+
+    #[test]
+    fn test_build_openai_plan_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("App.tsx");
+        fs::write(&file_path, "const x = <Modal />;\n").unwrap();
+
+        let request = LlmFixRequest {
+            rule_id: "rule-1".to_string(),
+            file_uri: format!("file://{}", file_path.display()),
+            file_path: file_path.clone(),
+            line: 1,
+            message: "Restructure Modal".to_string(),
+            code_snip: None,
+            source: None,
+            labels: vec!["family=Modal".to_string()],
+        };
+
+        let preview = build_openai_plan_request(&request, &GenericFixContext).unwrap();
+        assert_eq!(preview.rule_id, "rule-1");
+        assert_eq!(preview.file_path, file_path);
+        assert_eq!(preview.model, "gpt-4");
+        assert!(preview.system_prompt.contains("code migration"));
+        assert!(preview.user_prompt.contains("Restructure Modal"));
+        assert!(preview.request_json.get("messages").is_some());
     }
 }

@@ -4,7 +4,7 @@
 //! complex migration fixes that can't be handled by pattern matching.
 
 use anyhow::{Context, Result};
-use frontend_core::fix::LlmFixRequest;
+use frontend_core::fix::{LlmFixRequest, PlannedGooseBatch};
 
 use crate::context::FixContext;
 use std::collections::BTreeMap;
@@ -251,6 +251,141 @@ fn extract_text_from_goose_json(raw_json: &str) -> String {
 /// Each file spawns a goose process, so this limits system load.
 const MAX_CONCURRENT_FILES: usize = 3;
 
+/// Build a non-mutating preview of the Goose prompts/chunks for the given requests.
+pub fn build_goose_plan_batches(
+    requests: &[LlmFixRequest],
+    ctx: &dyn FixContext,
+) -> Vec<PlannedGooseBatch> {
+    let mut by_file: BTreeMap<PathBuf, Vec<&LlmFixRequest>> = BTreeMap::new();
+    for req in requests {
+        by_file.entry(req.file_path.clone()).or_default().push(req);
+    }
+
+    let mut merged_by_file: Vec<(PathBuf, Vec<MergedLlmFixRequest>)> = Vec::new();
+    for (path, file_reqs) in by_file {
+        let mut merged = merge_by_rule_id(&file_reqs);
+        merged.sort_by(|a, b| {
+            ctx.fix_priority(&a.rule_id)
+                .cmp(&ctx.fix_priority(&b.rule_id))
+        });
+        merged_by_file.push((path, merged));
+    }
+
+    let mut batches = Vec::new();
+    for (file_path, file_requests) in merged_by_file {
+        if file_requests.is_empty() {
+            continue;
+        }
+
+        if file_requests.len() == 1 {
+            let req = &file_requests[0];
+            batches.push(PlannedGooseBatch {
+                file_path: file_path.clone(),
+                chunk_index: 1,
+                chunk_count: 1,
+                max_turns: 5,
+                rule_ids: vec![req.rule_id.clone()],
+                lines: req.lines.clone(),
+                families: req.family.clone().into_iter().collect(),
+                prompt: build_merged_prompt(req, ctx),
+            });
+            continue;
+        }
+
+        let chunks = chunk_merged_requests(&file_requests, 8);
+        let chunk_count = chunks.len();
+        let mut applied_summaries: Vec<String> = Vec::new();
+
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let chunk_refs: Vec<&MergedLlmFixRequest> = chunk.to_vec();
+            let prompt = build_batch_prompt_with_context(
+                &file_path,
+                &chunk_refs,
+                if applied_summaries.is_empty() {
+                    None
+                } else {
+                    Some(&applied_summaries)
+                },
+                ctx,
+            );
+            let mut lines = Vec::new();
+            let mut rule_ids = Vec::new();
+            let mut families = std::collections::BTreeSet::new();
+
+            for req in chunk.iter() {
+                rule_ids.push(req.rule_id.clone());
+                lines.extend(req.lines.iter().copied());
+                if let Some(ref family) = req.family {
+                    families.insert(family.clone());
+                }
+                let lines_display = req
+                    .lines
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let summary = req.message.lines().take(3).collect::<Vec<_>>().join("\n  ");
+                applied_summaries.push(format!(
+                    "- {} (line {}): {}",
+                    req.rule_id, lines_display, summary
+                ));
+            }
+            lines.sort_unstable();
+            lines.dedup();
+
+            batches.push(PlannedGooseBatch {
+                file_path: file_path.clone(),
+                chunk_index: chunk_idx + 1,
+                chunk_count,
+                max_turns: (22 + chunk.len()).min(40) as u32,
+                rule_ids,
+                lines,
+                families: families.into_iter().collect(),
+                prompt,
+            });
+        }
+    }
+
+    batches
+}
+
+fn chunk_merged_requests<'a>(
+    file_requests: &'a [MergedLlmFixRequest],
+    max_fixes_per_batch: usize,
+) -> Vec<Vec<&'a MergedLlmFixRequest>> {
+    let mut result: Vec<Vec<&MergedLlmFixRequest>> = Vec::new();
+    let mut current_chunk: Vec<&MergedLlmFixRequest> = Vec::new();
+    let mut current_families: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for req in file_requests.iter() {
+        if let Some(ref fam) = req.family {
+            if current_families.contains(fam) {
+                current_chunk.push(req);
+            } else if current_chunk.len() >= max_fixes_per_batch && !current_chunk.is_empty() {
+                result.push(std::mem::take(&mut current_chunk));
+                current_families.clear();
+                current_families.insert(fam.clone());
+                current_chunk.push(req);
+            } else {
+                current_families.insert(fam.clone());
+                current_chunk.push(req);
+            }
+        } else {
+            if current_chunk.len() >= max_fixes_per_batch {
+                result.push(std::mem::take(&mut current_chunk));
+                current_families.clear();
+            }
+            current_chunk.push(req);
+        }
+    }
+
+    if !current_chunk.is_empty() {
+        result.push(current_chunk);
+    }
+
+    result
+}
+
 pub fn run_all_goose_fixes(
     requests: &[LlmFixRequest],
     ctx: &dyn FixContext,
@@ -464,44 +599,7 @@ fn process_single_file(
         // must stay in the same chunk so the LLM sees the full migration
         // (composition + prop→child + conformance) as one coherent change.
         // A family group is treated as one logical unit regardless of size.
-        let chunks: Vec<Vec<&MergedLlmFixRequest>> = {
-            let mut result: Vec<Vec<&MergedLlmFixRequest>> = Vec::new();
-            let mut current_chunk: Vec<&MergedLlmFixRequest> = Vec::new();
-            let mut current_families: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            for req in file_requests.iter() {
-                if let Some(ref fam) = req.family {
-                    if current_families.contains(fam) {
-                        // Same family — always add to current chunk
-                        current_chunk.push(req);
-                    } else if current_chunk.len() >= max_fixes_per_batch
-                        && !current_chunk.is_empty()
-                    {
-                        // New family and chunk is full — start new chunk
-                        result.push(std::mem::take(&mut current_chunk));
-                        current_families.clear();
-                        current_families.insert(fam.clone());
-                        current_chunk.push(req);
-                    } else {
-                        // New family, chunk has room
-                        current_families.insert(fam.clone());
-                        current_chunk.push(req);
-                    }
-                } else {
-                    // No family — add to current chunk, respect size limit
-                    if current_chunk.len() >= max_fixes_per_batch {
-                        result.push(std::mem::take(&mut current_chunk));
-                        current_families.clear();
-                    }
-                    current_chunk.push(req);
-                }
-            }
-            if !current_chunk.is_empty() {
-                result.push(current_chunk);
-            }
-            result
-        };
+        let chunks = chunk_merged_requests(file_requests, max_fixes_per_batch);
         let chunk_count = chunks.len();
 
         for (chunk_idx, chunk) in chunks.iter().enumerate() {

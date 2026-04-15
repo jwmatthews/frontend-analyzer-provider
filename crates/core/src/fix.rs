@@ -138,6 +138,239 @@ pub enum FixStrategy {
     Llm,
 }
 
+/// Structured remediation artifact written by the `plan` subcommand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationPlanReport {
+    pub schema_version: String,
+    pub generated_at_utc: String,
+    pub tool_version: String,
+    pub project_root: PathBuf,
+    pub analysis_input: PathBuf,
+    pub output_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ruleset_names: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules_filter: Option<Vec<String>>,
+    pub strategy_sources: StrategySources,
+    pub summary: RemediationSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_errors: Vec<ProviderErrorSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<RemediationFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_rule: Vec<RuleSummary>,
+    pub llm_plan: LlmPlanPreview,
+}
+
+/// Paths or sources used to resolve remediation strategies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StrategySources {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules_strategies: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_strategies: Option<PathBuf>,
+}
+
+/// Top-level counts and metrics for a remediation report.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemediationSummary {
+    pub ruleset_count: usize,
+    pub violation_count: usize,
+    pub incident_count: usize,
+    pub provider_error_count: usize,
+    pub report_file_count: usize,
+    pub files_with_deterministic_edits: usize,
+    pub deterministic_fix_count: usize,
+    pub deterministic_edit_count: usize,
+    pub llm_item_count: usize,
+    pub manual_item_count: usize,
+}
+
+/// Provider-side evaluation/parsing errors surfaced alongside the plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderErrorSummary {
+    pub ruleset_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    pub message: String,
+}
+
+/// All remediation items known for a single file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationFile {
+    pub file_path: PathBuf,
+    pub file_uri: String,
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deterministic_diff: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<RemediationItem>,
+}
+
+/// One actionable or informative remediation entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationItem {
+    pub kind: RemediationKind,
+    pub rule_id: String,
+    pub ruleset_name: String,
+    pub rule_description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_category: Option<crate::report::Category>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_links: Vec<crate::report::Link>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_effort: Option<i32>,
+    pub strategy_resolution: StrategyResolution,
+    pub incident: IncidentSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_fix: Option<PlannedFix>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_request: Option<LlmFixRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_item: Option<ManualFixItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_reason: Option<ManualReason>,
+}
+
+/// The kind of remediation work represented by an item.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemediationKind {
+    Pattern,
+    Llm,
+    Manual,
+}
+
+/// Normalized reason explaining why an item still needs manual handling.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualReason {
+    ExplicitManualStrategy,
+    LabelInferredManual,
+}
+
+/// Snapshot of the original incident evidence that produced a remediation item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentSnapshot {
+    pub file_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_location: Option<crate::incident::Location>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_snip: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variables: BTreeMap<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<crate::incident::ExternalLink>,
+    pub is_dependency_incident: bool,
+}
+
+impl From<&konveyor_core::incident::Incident> for IncidentSnapshot {
+    fn from(incident: &konveyor_core::incident::Incident) -> Self {
+        Self {
+            file_uri: incident.file_uri.clone(),
+            line_number: incident.line_number,
+            code_location: incident.code_location.clone(),
+            message: incident.message.clone(),
+            code_snip: incident.code_snip.clone(),
+            variables: incident.variables.clone(),
+            effort: incident.effort,
+            links: incident.links.clone(),
+            is_dependency_incident: incident.is_dependency_incident,
+        }
+    }
+}
+
+/// How the fix strategy for an item was chosen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyResolution {
+    pub chosen_strategy: String,
+    pub source: StrategyResolutionSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_detail: Option<String>,
+}
+
+/// Provenance of the selected strategy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyResolutionSource {
+    ExplicitRulesStrategies,
+    ExplicitExternalStrategies,
+    LabelInference,
+    FallbackLlm,
+}
+
+/// Aggregated summary of how a rule appears in the plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSummary {
+    pub ruleset_name: String,
+    pub rule_id: String,
+    pub rule_description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_category: Option<crate::report::Category>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_labels: Vec<String>,
+    pub incident_count: usize,
+    pub pattern_item_count: usize,
+    pub llm_item_count: usize,
+    pub manual_item_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<PathBuf>,
+}
+
+/// Non-mutating previews of the LLM requests/prompts the system can construct.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmPlanPreview {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub openai_requests: Vec<PlannedOpenAiRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goose_batches: Vec<PlannedGooseBatch>,
+}
+
+/// OpenAI-compatible chat request preview for one LLM fix request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedOpenAiRequest {
+    pub rule_id: String,
+    pub file_path: PathBuf,
+    pub line: u32,
+    pub model: String,
+    pub temperature: f32,
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub request_json: serde_json::Value,
+}
+
+/// Goose batch prompt preview for one file/chunk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedGooseBatch {
+    pub file_path: PathBuf,
+    pub chunk_index: usize,
+    pub chunk_count: usize,
+    pub max_turns: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub families: Vec<String>,
+    pub prompt: String,
+}
+
 /// Convert a `FixStrategyEntry` (from the shared `konveyor-core` crate) to
 /// a runtime `FixStrategy`.
 ///
