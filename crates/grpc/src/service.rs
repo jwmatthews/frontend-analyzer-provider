@@ -2,6 +2,7 @@
 
 use crate::proto::provider_service_server::ProviderService;
 use crate::proto::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -276,8 +277,147 @@ impl ProviderService for FrontendProvider {
             });
         }
 
-        let total: usize = file_deps.iter().filter_map(|fd| fd.list.as_ref()).map(|l| l.deps.len()).sum();
-        tracing::info!("Returning {} declared dependencies from {} package.json file(s)", total, file_deps.len());
+        let direct_count: usize = file_deps
+            .iter()
+            .filter_map(|fd| fd.list.as_ref())
+            .map(|l| l.deps.len())
+            .sum();
+        tracing::info!(
+            "Parsed {} declared dependencies from {} package.json file(s)",
+            direct_count,
+            file_deps.len()
+        );
+
+        // ── Lockfile entries (indirect / transitive dependencies) ────
+        //
+        // Parse the project's lockfile(s) to surface ALL resolved packages,
+        // including transitive dependencies not visible in package.json.
+        // This lets kantra fire rules on transitive copies of packages
+        // (e.g., a nested @patternfly/react-core@5.x brought in by
+        // @patternfly/react-topology when the direct dep is already v6).
+        //
+        // Uses monorepo-aware discovery: checks root first (standard
+        // workspace case), falls back to per-package.json lockfiles for
+        // multi-project repos.
+        let (lockfile_entries, lockfile_paths) =
+            frontend_js_scanner::lockfile::parse_all_lockfiles(&root, &pkg_paths).unwrap_or_else(
+                |e| {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to parse lockfile(s), skipping indirect dependencies"
+                    );
+                    (Vec::new(), Vec::new())
+                },
+            );
+
+        if !lockfile_entries.is_empty() {
+            // Build dedup set from direct deps to avoid exact duplicates.
+            // Direct deps use strip_npm_prefix (e.g., "5.4.1") while lockfile
+            // entries have resolved versions (e.g., "5.4.14"), so most entries
+            // won't collide. We keep entries with the same name but different
+            // version — that's the key case (transitive v5 copy when direct is v6).
+            let direct_set: HashSet<(String, String)> = file_deps
+                .iter()
+                .filter_map(|fd| fd.list.as_ref())
+                .flat_map(|l| l.deps.iter())
+                .map(|d| (d.name.clone(), d.version.clone()))
+                .collect();
+
+            // Build reverse index: for each package name, which lockfile
+            // entries list it as a dependency. This lets us annotate each
+            // indirect dep with its parent(s) via the `extras` field.
+            //
+            // Example: react-topology@5.2.1 has dependencies including
+            // react-core@^5.1.1. The reverse index maps "react-core" →
+            // ["@patternfly/react-topology@5.2.1"]. When we emit the
+            // indirect dep for react-core@5.4.14, we attach
+            // extras.resolvedFor = "@patternfly/react-topology@5.2.1"
+            // so the fix engine knows which package to actually update.
+            let mut reverse_deps: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for entry in &lockfile_entries {
+                for dep_name in entry.dependencies.keys() {
+                    reverse_deps
+                        .entry(dep_name.clone())
+                        .or_default()
+                        .push(format!("{}@{}", entry.name, entry.version));
+                }
+            }
+
+            let mut lockfile_deps = Vec::new();
+            for entry in &lockfile_entries {
+                if direct_set.contains(&(entry.name.clone(), entry.version.clone())) {
+                    continue;
+                }
+
+                // Build extras with resolvedFor provenance
+                let extras = {
+                    let mut fields = std::collections::BTreeMap::new();
+
+                    // Which package(s) depend on this entry
+                    if let Some(parents) = reverse_deps.get(&entry.name) {
+                        let parent_list = parents.join(", ");
+                        fields.insert(
+                            "resolvedFor".into(),
+                            prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(parent_list)),
+                            },
+                        );
+                    }
+
+                    if fields.is_empty() {
+                        None
+                    } else {
+                        Some(prost_types::Struct { fields })
+                    }
+                };
+
+                lockfile_deps.push(Dependency {
+                    name: entry.name.clone(),
+                    version: entry.version.clone(),
+                    classifier: String::new(),
+                    r#type: "lockfile".into(),
+                    resolved_identifier: String::new(),
+                    file_uri_prefix: String::new(),
+                    indirect: true,
+                    extras,
+                    labels: vec![],
+                });
+            }
+
+            if !lockfile_deps.is_empty() {
+                let lockfile_uri = lockfile_paths
+                    .first()
+                    .map(|p| format!("file://{}", p.display()))
+                    .unwrap_or_else(|| format!("file://{}/lockfile", root.display()));
+
+                tracing::info!(
+                    count = lockfile_deps.len(),
+                    lockfiles = lockfile_paths.len(),
+                    "Adding indirect dependencies from lockfile(s)"
+                );
+
+                file_deps.push(FileDep {
+                    file_uri: lockfile_uri,
+                    list: Some(DependencyList {
+                        deps: lockfile_deps,
+                    }),
+                });
+            }
+        }
+
+        let total: usize = file_deps
+            .iter()
+            .filter_map(|fd| fd.list.as_ref())
+            .map(|l| l.deps.len())
+            .sum();
+        tracing::info!(
+            "Returning {} total dependencies ({} direct, {} indirect) from {} source(s)",
+            total,
+            direct_count,
+            total - direct_count,
+            file_deps.len()
+        );
 
         Ok(Response::new(DependencyResponse {
             successful: true,

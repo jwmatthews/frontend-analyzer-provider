@@ -57,8 +57,10 @@ impl LanguageFixProvider for JsFixProvider {
         package: &str,
         new_version: &str,
         file_path: &Path,
-    ) -> Option<PlannedFix> {
+    ) -> Vec<PlannedFix> {
         plan_ensure_npm_dependency(rule_id, incident, package, new_version, file_path)
+            .into_iter()
+            .collect()
     }
 
     fn get_matched_text(&self, incident: &Incident) -> String {

@@ -1,13 +1,13 @@
-//! Lockfile parsing for npm and yarn (berry).
+//! Lockfile parsing for npm, yarn (berry), and pnpm.
 //!
-//! Parses `package-lock.json` (npm v2/v3) and `yarn.lock` (berry/v2+) to
-//! extract resolved dependency entries. Used by the dependency scanner to
-//! find packages whose transitive dependencies conflict with the project's
-//! declared versions.
+//! Parses `package-lock.json` (npm v2/v3), `yarn.lock` (berry/v2+), and
+//! `pnpm-lock.yaml` (v6/v9) to extract resolved dependency entries. Used
+//! by the dependency scanner and `GetDependencies` RPC to surface both
+//! direct and transitive dependencies for rule matching.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use tracing;
 
 /// A resolved dependency entry from a lockfile.
@@ -21,13 +21,22 @@ pub struct LockfileEntry {
     pub dependencies: HashMap<String, String>,
 }
 
+/// Lockfile names in priority order.
+const LOCKFILE_NAMES: &[&str] = &["yarn.lock", "package-lock.json", "pnpm-lock.yaml"];
+
 /// Parse the project's lockfile and return all resolved entries.
 ///
 /// Automatically detects the lockfile format by checking for `yarn.lock`
-/// (berry) and `package-lock.json` (npm) in order.
+/// (berry), `package-lock.json` (npm), and `pnpm-lock.yaml` (pnpm) in order.
 pub fn parse_lockfile(root: &Path) -> Result<Vec<LockfileEntry>> {
-    let yarn_lock = root.join("yarn.lock");
-    let npm_lock = root.join("package-lock.json");
+    parse_lockfile_at(root)
+}
+
+/// Parse a single lockfile from the given directory, if one exists.
+fn parse_lockfile_at(dir: &Path) -> Result<Vec<LockfileEntry>> {
+    let yarn_lock = dir.join("yarn.lock");
+    let npm_lock = dir.join("package-lock.json");
+    let pnpm_lock = dir.join("pnpm-lock.yaml");
 
     if yarn_lock.exists() {
         let content = std::fs::read_to_string(&yarn_lock)
@@ -37,10 +46,101 @@ pub fn parse_lockfile(root: &Path) -> Result<Vec<LockfileEntry>> {
         let content = std::fs::read_to_string(&npm_lock)
             .with_context(|| format!("Failed to read {}", npm_lock.display()))?;
         parse_package_lock_json(&content)
+    } else if pnpm_lock.exists() {
+        let content = std::fs::read_to_string(&pnpm_lock)
+            .with_context(|| format!("Failed to read {}", pnpm_lock.display()))?;
+        parse_pnpm_lock_yaml(&content)
     } else {
-        tracing::debug!("No lockfile found in {}", root.display());
+        tracing::debug!("No lockfile found in {}", dir.display());
         Ok(Vec::new())
     }
+}
+
+/// Discover and parse ALL lockfiles in the project.
+///
+/// Checks the project root first — this covers standard monorepos where
+/// npm, yarn, and pnpm all produce a single lockfile at the workspace root.
+/// If no lockfile is found at the root, falls back to checking each
+/// `package.json` location, which handles multi-project repos where
+/// independent sub-projects each have their own lockfile.
+///
+/// Returns the path to each discovered lockfile alongside its parsed entries.
+pub fn parse_all_lockfiles(
+    root: &Path,
+    pkg_paths: &[PathBuf],
+) -> Result<(Vec<LockfileEntry>, Vec<PathBuf>)> {
+    // Try root first (standard workspace monorepo case)
+    let root_entries = parse_lockfile_at(root)?;
+    if !root_entries.is_empty() {
+        let lockfile_path = discover_lockfile_path(root);
+        let paths = lockfile_path.into_iter().collect();
+        tracing::info!(
+            entries = root_entries.len(),
+            "Parsed lockfile at project root"
+        );
+        return Ok((root_entries, paths));
+    }
+
+    // Fallback: check each package.json's parent directory for a lockfile.
+    // This handles multi-project repos and pnpm's per-workspace lockfiles.
+    let mut all_entries = Vec::new();
+    let mut all_paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    for pkg_path in pkg_paths {
+        let dir = match pkg_path.parent() {
+            Some(d) => d,
+            None => continue,
+        };
+
+        // Skip if we already checked this directory
+        if !seen.insert(dir.to_path_buf()) {
+            continue;
+        }
+
+        // Skip if this is the root (already checked)
+        if dir == root {
+            continue;
+        }
+
+        let entries = parse_lockfile_at(dir)?;
+        if !entries.is_empty() {
+            tracing::info!(
+                dir = %dir.display(),
+                entries = entries.len(),
+                "Parsed lockfile in sub-project"
+            );
+            if let Some(p) = discover_lockfile_path(dir) {
+                all_paths.push(p);
+            }
+            all_entries.extend(entries);
+        }
+    }
+
+    // Dedup entries by (name, version) across multiple lockfiles
+    if all_paths.len() > 1 {
+        let mut dedup_set = HashSet::new();
+        all_entries.retain(|e| dedup_set.insert((e.name.clone(), e.version.clone())));
+    }
+
+    tracing::info!(
+        entries = all_entries.len(),
+        lockfiles = all_paths.len(),
+        "Parsed lockfiles from sub-projects"
+    );
+
+    Ok((all_entries, all_paths))
+}
+
+/// Find which lockfile exists in a directory, if any.
+fn discover_lockfile_path(dir: &Path) -> Option<PathBuf> {
+    for name in LOCKFILE_NAMES {
+        let p = dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Find all lockfile entries that depend on `target_package` at a version
@@ -352,6 +452,256 @@ fn parse_yarn_dep_line(line: &str) -> Option<(String, String)> {
     Some((name, version))
 }
 
+// ── pnpm-lock.yaml (v6 / v9) ────────────────────────────────────────────
+
+/// Parse pnpm's `pnpm-lock.yaml` (lockfileVersion 6.0 or 9.0).
+///
+/// Supports two formats:
+/// - **v6** (pnpm 8): packages section contains both metadata and
+///   dependencies, keys have leading `/`.
+/// - **v9** (pnpm 9+): packages section has metadata only, dependencies
+///   live in a separate `snapshots` section, no leading `/`.
+fn parse_pnpm_lock_yaml(content: &str) -> Result<Vec<LockfileEntry>> {
+    let lock: serde_yaml::Value =
+        serde_yaml::from_str(content).context("Failed to parse pnpm-lock.yaml")?;
+
+    let version_str = lock
+        .get("lockfileVersion")
+        .map(|v| match v {
+            serde_yaml::Value::String(s) => s.clone(),
+            serde_yaml::Value::Number(n) => n.to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+
+    if version_str.starts_with('9') {
+        parse_pnpm_v9(&lock)
+    } else {
+        // v6 and any other version we treat as v6 format
+        parse_pnpm_v6(&lock)
+    }
+}
+
+/// Parse pnpm lockfile v6 (pnpm 8).
+///
+/// Keys in `packages` look like:
+/// `/@patternfly/react-core@5.1.1(react-dom@18.2.0)(react@18.2.0)`
+///
+/// Each entry has `dependencies` and/or `peerDependencies` inline.
+fn parse_pnpm_v6(lock: &serde_yaml::Value) -> Result<Vec<LockfileEntry>> {
+    let mut entries = Vec::new();
+
+    let packages = match lock.get("packages").and_then(|v| v.as_mapping()) {
+        Some(m) => m,
+        None => {
+            tracing::debug!("No 'packages' section in pnpm-lock.yaml v6");
+            return Ok(entries);
+        }
+    };
+
+    for (key_val, value) in packages {
+        let key = match key_val.as_str() {
+            Some(k) => k,
+            None => continue,
+        };
+
+        // Strip leading '/' (v6 format)
+        let key = key.strip_prefix('/').unwrap_or(key);
+
+        let (name, version) = match extract_name_version_from_pnpm_key(key) {
+            Some(nv) => nv,
+            None => continue,
+        };
+
+        let dependencies = collect_pnpm_dependencies(value);
+
+        if !version.is_empty() {
+            entries.push(LockfileEntry {
+                name,
+                version,
+                dependencies,
+            });
+        }
+    }
+
+    tracing::debug!(entries = entries.len(), "Parsed pnpm-lock.yaml v6");
+    Ok(entries)
+}
+
+/// Parse pnpm lockfile v9 (pnpm 9+).
+///
+/// `packages` has simple keys like `@patternfly/react-core@5.1.1` with
+/// metadata only (resolution, peerDependencies declarations).
+///
+/// `snapshots` has keys with peer suffixes like
+/// `@patternfly/react-core@5.1.1(react-dom@18.2.0)(react@18.2.0)` and
+/// contains the actual resolved dependency tree.
+fn parse_pnpm_v9(lock: &serde_yaml::Value) -> Result<Vec<LockfileEntry>> {
+    let mut entries = Vec::new();
+
+    // First pass: collect all name+version pairs from `packages`
+    let packages = lock.get("packages").and_then(|v| v.as_mapping());
+    let snapshots = lock.get("snapshots").and_then(|v| v.as_mapping());
+
+    // Build a map of name+version → LockfileEntry from packages keys
+    let mut entry_map: HashMap<(String, String), LockfileEntry> = HashMap::new();
+
+    if let Some(pkgs) = packages {
+        for (key_val, _value) in pkgs {
+            let key = match key_val.as_str() {
+                Some(k) => k,
+                None => continue,
+            };
+
+            let (name, version) = match extract_name_version_from_pnpm_key(key) {
+                Some(nv) => nv,
+                None => continue,
+            };
+
+            if !version.is_empty() {
+                entry_map
+                    .entry((name.clone(), version.clone()))
+                    .or_insert_with(|| LockfileEntry {
+                        name,
+                        version,
+                        dependencies: HashMap::new(),
+                    });
+            }
+        }
+    }
+
+    // Second pass: enrich with dependencies from `snapshots`
+    if let Some(snaps) = snapshots {
+        for (key_val, value) in snaps {
+            let key = match key_val.as_str() {
+                Some(k) => k,
+                None => continue,
+            };
+
+            let (name, version) = match extract_name_version_from_pnpm_key(key) {
+                Some(nv) => nv,
+                None => continue,
+            };
+
+            let deps = collect_pnpm_dependencies(value);
+
+            // Merge deps into the entry (snapshots may have multiple peer
+            // variants for the same package; we take the union of deps)
+            if let Some(entry) = entry_map.get_mut(&(name.clone(), version.clone())) {
+                for (dep_name, dep_ver) in deps {
+                    entry.dependencies.entry(dep_name).or_insert(dep_ver);
+                }
+            } else {
+                // Snapshot for a package not in `packages` — can happen for
+                // packages that are only transitive. Create an entry.
+                if !version.is_empty() {
+                    entry_map.insert(
+                        (name.clone(), version.clone()),
+                        LockfileEntry {
+                            name,
+                            version,
+                            dependencies: deps,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    entries.extend(entry_map.into_values());
+    tracing::debug!(entries = entries.len(), "Parsed pnpm-lock.yaml v9");
+    Ok(entries)
+}
+
+/// Extract package name and version from a pnpm lockfile key.
+///
+/// Handles both v6 (leading `/` already stripped) and v9 formats.
+///
+/// Examples:
+/// - `@patternfly/react-core@5.1.1` → `("@patternfly/react-core", "5.1.1")`
+/// - `@patternfly/react-core@5.1.1(react@18.2.0)` → `("@patternfly/react-core", "5.1.1")`
+/// - `lodash@4.17.21` → `("lodash", "4.17.21")`
+fn extract_name_version_from_pnpm_key(key: &str) -> Option<(String, String)> {
+    if key.is_empty() {
+        return None;
+    }
+
+    // For scoped packages (@scope/name@version), find the version-separating @.
+    // It's the @ after the first `/` in a scoped name, or the first @ for unscoped.
+    let version_at = if key.starts_with('@') {
+        // Scoped: find the `/` that ends the scope, then find the next `@`
+        let slash_pos = key.find('/')?;
+        let rest = &key[slash_pos + 1..];
+        rest.find('@').map(|p| slash_pos + 1 + p)
+    } else {
+        // Unscoped: first `@` is the version separator
+        key.find('@')
+    };
+
+    let at_pos = version_at?;
+    let name = &key[..at_pos];
+    let version_and_peers = &key[at_pos + 1..];
+
+    // Strip peer suffix: everything from the first `(` onward
+    let version = match version_and_peers.find('(') {
+        Some(paren_pos) => &version_and_peers[..paren_pos],
+        None => version_and_peers,
+    };
+
+    let name = name.trim();
+    let version = version.trim();
+
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+
+    Some((name.to_string(), version.to_string()))
+}
+
+/// Collect dependencies from a pnpm package/snapshot entry's YAML value.
+///
+/// Reads both `dependencies` and `peerDependencies` maps. Strips peer
+/// suffixes from version values (e.g., `5.1.1(react@18.2.0)` → `5.1.1`).
+fn collect_pnpm_dependencies(value: &serde_yaml::Value) -> HashMap<String, String> {
+    let mut deps = HashMap::new();
+
+    for section in &["dependencies", "peerDependencies", "optionalDependencies"] {
+        if let Some(dep_map) = value.get(*section).and_then(|v| v.as_mapping()) {
+            for (dep_key, dep_val) in dep_map {
+                let dep_name = match dep_key.as_str() {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+
+                let raw_ver = match dep_val {
+                    serde_yaml::Value::String(s) => s.clone(),
+                    serde_yaml::Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+
+                // Strip peer suffix from version value
+                let version = strip_pnpm_peer_suffix(&raw_ver).to_string();
+
+                deps.entry(dep_name).or_insert(version);
+            }
+        }
+    }
+
+    deps
+}
+
+/// Strip peer resolution suffixes from a pnpm version string.
+///
+/// `5.1.1(react-dom@18.2.0)(react@18.2.0)` → `5.1.1`
+/// `18.2.0(react@18.2.0)` → `18.2.0`
+/// `4.17.21` → `4.17.21` (no change)
+fn strip_pnpm_peer_suffix(version: &str) -> &str {
+    match version.find('(') {
+        Some(pos) => version[..pos].trim(),
+        None => version.trim(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +981,387 @@ __metadata:
         assert!(!constraint_within_upperbound("^6.0.0", "5.99.99"));
         assert!(!constraint_within_upperbound("^6.4.1", "5.99.99"));
         assert!(!constraint_within_upperbound("npm:^6.0.0", "5.99.99"));
+    }
+
+    // ── pnpm-lock.yaml tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_extract_name_version_from_pnpm_key() {
+        // Scoped package, no peers
+        assert_eq!(
+            extract_name_version_from_pnpm_key("@patternfly/react-core@5.1.1"),
+            Some(("@patternfly/react-core".into(), "5.1.1".into()))
+        );
+
+        // Scoped package with peer suffix
+        assert_eq!(
+            extract_name_version_from_pnpm_key(
+                "@patternfly/react-core@5.1.1(react-dom@18.2.0)(react@18.2.0)"
+            ),
+            Some(("@patternfly/react-core".into(), "5.1.1".into()))
+        );
+
+        // Scoped package with nested peer suffix (v9)
+        assert_eq!(
+            extract_name_version_from_pnpm_key(
+                "@patternfly/react-core@5.1.1(react-dom@18.2.0(react@18.2.0))(react@18.2.0)"
+            ),
+            Some(("@patternfly/react-core".into(), "5.1.1".into()))
+        );
+
+        // Unscoped package
+        assert_eq!(
+            extract_name_version_from_pnpm_key("lodash@4.17.21"),
+            Some(("lodash".into(), "4.17.21".into()))
+        );
+
+        // Unscoped package with peers
+        assert_eq!(
+            extract_name_version_from_pnpm_key("react-dom@18.2.0(react@18.2.0)"),
+            Some(("react-dom".into(), "18.2.0".into()))
+        );
+
+        // Empty
+        assert_eq!(extract_name_version_from_pnpm_key(""), None);
+    }
+
+    #[test]
+    fn test_strip_pnpm_peer_suffix() {
+        assert_eq!(
+            strip_pnpm_peer_suffix("5.1.1(react-dom@18.2.0)(react@18.2.0)"),
+            "5.1.1"
+        );
+        assert_eq!(strip_pnpm_peer_suffix("18.2.0(react@18.2.0)"), "18.2.0");
+        assert_eq!(strip_pnpm_peer_suffix("4.17.21"), "4.17.21");
+        assert_eq!(
+            strip_pnpm_peer_suffix("5.1.1(react-dom@18.2.0(react@18.2.0))(react@18.2.0)"),
+            "5.1.1"
+        );
+    }
+
+    #[test]
+    fn test_parse_pnpm_v6_basic() {
+        let content = r#"
+lockfileVersion: '6.0'
+
+packages:
+  /@patternfly/react-core@5.1.1(react-dom@18.2.0)(react@18.2.0):
+    resolution: {integrity: sha512-abc123}
+    dependencies:
+      '@patternfly/react-icons': 5.1.1(react-dom@18.2.0)(react@18.2.0)
+      '@patternfly/react-styles': 5.1.1
+    dev: false
+
+  /@patternfly/react-topology@5.2.1(react-dom@18.2.0)(react@18.2.0):
+    resolution: {integrity: sha512-def456}
+    dependencies:
+      '@patternfly/react-core': 5.1.1(react-dom@18.2.0)(react@18.2.0)
+      '@patternfly/react-icons': 5.1.1(react-dom@18.2.0)(react@18.2.0)
+      d3: 7.8.5
+    dev: false
+
+  /lodash@4.17.21:
+    resolution: {integrity: sha512-ghi789}
+    dev: false
+"#;
+
+        let entries = parse_pnpm_lock_yaml(content).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let topology = entries
+            .iter()
+            .find(|e| e.name == "@patternfly/react-topology")
+            .unwrap();
+        assert_eq!(topology.version, "5.2.1");
+        // Peer suffix stripped from dep version
+        assert_eq!(
+            topology.dependencies.get("@patternfly/react-core").unwrap(),
+            "5.1.1"
+        );
+        assert_eq!(topology.dependencies.get("d3").unwrap(), "7.8.5");
+
+        let core = entries
+            .iter()
+            .find(|e| e.name == "@patternfly/react-core")
+            .unwrap();
+        assert_eq!(core.version, "5.1.1");
+        assert_eq!(
+            core.dependencies.get("@patternfly/react-icons").unwrap(),
+            "5.1.1"
+        );
+
+        let lodash = entries.iter().find(|e| e.name == "lodash").unwrap();
+        assert_eq!(lodash.version, "4.17.21");
+    }
+
+    #[test]
+    fn test_parse_pnpm_v9_basic() {
+        let content = r#"
+lockfileVersion: '9.0'
+
+packages:
+  '@patternfly/react-core@5.1.1':
+    resolution: {integrity: sha512-abc123}
+    peerDependencies:
+      react: ^17 || ^18
+      react-dom: ^17 || ^18
+
+  '@patternfly/react-topology@5.2.1':
+    resolution: {integrity: sha512-def456}
+    peerDependencies:
+      react: ^17 || ^18
+      react-dom: ^17 || ^18
+
+  lodash@4.17.21:
+    resolution: {integrity: sha512-ghi789}
+
+snapshots:
+  '@patternfly/react-core@5.1.1(react-dom@18.2.0(react@18.2.0))(react@18.2.0)':
+    dependencies:
+      '@patternfly/react-icons': 5.1.1(react-dom@18.2.0(react@18.2.0))(react@18.2.0)
+      '@patternfly/react-styles': 5.1.1
+      react: 18.2.0
+      react-dom: 18.2.0(react@18.2.0)
+
+  '@patternfly/react-topology@5.2.1(react-dom@18.2.0(react@18.2.0))(react@18.2.0)':
+    dependencies:
+      '@patternfly/react-core': 5.1.1(react-dom@18.2.0(react@18.2.0))(react@18.2.0)
+      '@patternfly/react-icons': 5.1.1(react-dom@18.2.0(react@18.2.0))(react@18.2.0)
+      d3: 7.8.5
+
+  lodash@4.17.21: {}
+"#;
+
+        let entries = parse_pnpm_lock_yaml(content).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let topology = entries
+            .iter()
+            .find(|e| e.name == "@patternfly/react-topology")
+            .unwrap();
+        assert_eq!(topology.version, "5.2.1");
+        // Dependencies came from snapshots, peer suffixes stripped
+        assert_eq!(
+            topology.dependencies.get("@patternfly/react-core").unwrap(),
+            "5.1.1"
+        );
+        assert_eq!(topology.dependencies.get("d3").unwrap(), "7.8.5");
+
+        let core = entries
+            .iter()
+            .find(|e| e.name == "@patternfly/react-core")
+            .unwrap();
+        assert_eq!(core.version, "5.1.1");
+        assert_eq!(
+            core.dependencies.get("@patternfly/react-icons").unwrap(),
+            "5.1.1"
+        );
+        // Peer deps from snapshots also captured
+        assert_eq!(core.dependencies.get("react").unwrap(), "18.2.0");
+    }
+
+    #[test]
+    fn test_parse_pnpm_v9_snapshot_only_package() {
+        // A package that appears only in snapshots (not in packages)
+        let content = r#"
+lockfileVersion: '9.0'
+
+packages: {}
+
+snapshots:
+  tslib@2.6.0:
+    dependencies:
+      some-dep: 1.0.0
+"#;
+
+        let entries = parse_pnpm_lock_yaml(content).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "tslib");
+        assert_eq!(entries[0].version, "2.6.0");
+        assert_eq!(entries[0].dependencies.get("some-dep").unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pnpm_v6_peer_deps() {
+        let content = r#"
+lockfileVersion: '6.0'
+
+packages:
+  /some-plugin@2.0.0(react@18.2.0):
+    resolution: {integrity: sha512-xyz}
+    peerDependencies:
+      react: ^18.0.0
+    dependencies:
+      '@patternfly/react-core': 5.0.0(react@18.2.0)
+      lodash: 4.17.21
+    dev: false
+"#;
+
+        let entries = parse_pnpm_lock_yaml(content).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "some-plugin");
+        assert_eq!(entries[0].version, "2.0.0");
+        // peerDependencies collected (range preserved for peers in the entry)
+        assert!(entries[0].dependencies.contains_key("react"));
+        // Regular dep version has peer suffix stripped
+        assert_eq!(
+            entries[0]
+                .dependencies
+                .get("@patternfly/react-core")
+                .unwrap(),
+            "5.0.0"
+        );
+    }
+
+    #[test]
+    fn test_parse_pnpm_empty_packages() {
+        let content = r#"
+lockfileVersion: '9.0'
+"#;
+
+        let entries = parse_pnpm_lock_yaml(content).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pnpm_numeric_lockfile_version() {
+        // Some pnpm versions write lockfileVersion as a number, not string
+        let content = r#"
+lockfileVersion: 6.0
+
+packages:
+  /lodash@4.17.21:
+    resolution: {integrity: sha512-abc}
+    dev: false
+"#;
+
+        let entries = parse_pnpm_lock_yaml(content).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "lodash");
+    }
+
+    // ── monorepo lockfile discovery tests ─────────────────────────────
+
+    #[test]
+    fn test_parse_all_lockfiles_root_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create a package-lock.json at root
+        let lock_content = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root", "version": "1.0.0" },
+                "node_modules/lodash": { "version": "4.17.21" }
+            }
+        }"#;
+        std::fs::write(root.join("package-lock.json"), lock_content).unwrap();
+
+        // Create a sub-project with its own package.json (but no lockfile)
+        let sub = root.join("packages/app");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("package.json"), r#"{"name": "app"}"#).unwrap();
+
+        let pkg_paths = vec![sub.join("package.json"), root.join("package.json")];
+
+        let (entries, paths) = parse_all_lockfiles(root, &pkg_paths).unwrap();
+
+        // Should find the root lockfile
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "lodash");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], root.join("package-lock.json"));
+    }
+
+    #[test]
+    fn test_parse_all_lockfiles_subproject_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // No lockfile at root
+        std::fs::write(root.join("package.json"), r#"{"name": "root"}"#).unwrap();
+
+        // Sub-project A with its own lockfile
+        let sub_a = root.join("project-a");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::write(sub_a.join("package.json"), r#"{"name": "a"}"#).unwrap();
+        let lock_a = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "a", "version": "1.0.0" },
+                "node_modules/@patternfly/react-core": { "version": "5.4.14" }
+            }
+        }"#;
+        std::fs::write(sub_a.join("package-lock.json"), lock_a).unwrap();
+
+        // Sub-project B with its own lockfile
+        let sub_b = root.join("project-b");
+        std::fs::create_dir_all(&sub_b).unwrap();
+        std::fs::write(sub_b.join("package.json"), r#"{"name": "b"}"#).unwrap();
+        let lock_b = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "b", "version": "1.0.0" },
+                "node_modules/lodash": { "version": "4.17.21" }
+            }
+        }"#;
+        std::fs::write(sub_b.join("package-lock.json"), lock_b).unwrap();
+
+        let pkg_paths = vec![
+            sub_a.join("package.json"),
+            sub_b.join("package.json"),
+            root.join("package.json"),
+        ];
+
+        let (entries, paths) = parse_all_lockfiles(root, &pkg_paths).unwrap();
+
+        // Should find both sub-project lockfiles
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.name == "@patternfly/react-core"));
+        assert!(entries.iter().any(|e| e.name == "lodash"));
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_all_lockfiles_no_lockfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("package.json"), r#"{"name": "root"}"#).unwrap();
+
+        let pkg_paths = vec![root.join("package.json")];
+        let (entries, paths) = parse_all_lockfiles(root, &pkg_paths).unwrap();
+
+        assert!(entries.is_empty());
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_parse_all_lockfiles_pnpm() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let pnpm_content = r#"
+lockfileVersion: '9.0'
+
+packages:
+  '@patternfly/react-core@5.1.1':
+    resolution: {integrity: sha512-abc}
+
+snapshots:
+  '@patternfly/react-core@5.1.1(react@18.2.0)':
+    dependencies:
+      react: 18.2.0
+"#;
+        std::fs::write(root.join("pnpm-lock.yaml"), pnpm_content).unwrap();
+
+        let pkg_paths = vec![root.join("package.json")];
+        let (entries, paths) = parse_all_lockfiles(root, &pkg_paths).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "@patternfly/react-core");
+        assert_eq!(entries[0].version, "5.1.1");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], root.join("pnpm-lock.yaml"));
     }
 }
