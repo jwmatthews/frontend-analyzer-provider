@@ -17,8 +17,14 @@ pub struct LockfileEntry {
     pub name: String,
     /// The resolved version (e.g., `5.2.1`).
     pub version: String,
-    /// Direct dependencies declared by this package: name → version constraint.
+    /// All dependencies (regular + peer) declared by this package: name → version constraint.
+    /// Peer dependencies are merged here for backward compatibility with `find_dependents`.
     pub dependencies: HashMap<String, String>,
+    /// Peer dependencies only: name → version constraint.
+    /// A subset of `dependencies` — entries here also appear in `dependencies`.
+    /// Used by `GetDependencies` to surface peer dependency constraints as
+    /// separate dependency entries so kantra can detect version incompatibilities.
+    pub peer_dependencies: HashMap<String, String>,
 }
 
 /// Lockfile names in priority order.
@@ -259,13 +265,18 @@ fn parse_package_lock_json(content: &str) -> Result<Vec<LockfileEntry>> {
                 .to_string();
 
             let mut dependencies = HashMap::new();
+            let mut peer_dependencies = HashMap::new();
 
             // Collect from both "dependencies" and "peerDependencies"
             for dep_section in &["dependencies", "peerDependencies"] {
                 if let Some(deps) = value.get(*dep_section).and_then(|v| v.as_object()) {
+                    let is_peer = *dep_section == "peerDependencies";
                     for (dep_name, dep_ver) in deps {
                         let ver = dep_ver.as_str().unwrap_or_default().to_string();
-                        dependencies.entry(dep_name.clone()).or_insert(ver);
+                        dependencies.entry(dep_name.clone()).or_insert(ver.clone());
+                        if is_peer {
+                            peer_dependencies.entry(dep_name.clone()).or_insert(ver);
+                        }
                     }
                 }
             }
@@ -275,6 +286,7 @@ fn parse_package_lock_json(content: &str) -> Result<Vec<LockfileEntry>> {
                     name,
                     version,
                     dependencies,
+                    peer_dependencies,
                 });
             }
         }
@@ -322,11 +334,12 @@ fn parse_yarn_lock_berry(content: &str) -> Result<Vec<LockfileEntry>> {
     let mut current_name: Option<String> = None;
     let mut current_version: Option<String> = None;
     let mut current_deps: HashMap<String, String> = HashMap::new();
+    let mut current_peer_deps: HashMap<String, String> = HashMap::new();
     let mut in_dependencies = false;
     let mut in_peer_dependencies = false;
 
     for line in content.lines() {
-        // Top-level entry: starts with `"` and ends with `:`
+        // Top-level entry: starts with `"` and ends with `:` and !line.starts_with("  ")
         // e.g., `"@patternfly/react-topology@npm:5.2.1":`
         if line.starts_with('"') && line.ends_with(':') && !line.starts_with("  ") {
             // Save previous entry if we have one
@@ -335,6 +348,7 @@ fn parse_yarn_lock_berry(content: &str) -> Result<Vec<LockfileEntry>> {
                     name,
                     version,
                     dependencies: std::mem::take(&mut current_deps),
+                    peer_dependencies: std::mem::take(&mut current_peer_deps),
                 });
             }
 
@@ -378,7 +392,14 @@ fn parse_yarn_lock_berry(content: &str) -> Result<Vec<LockfileEntry>> {
         // Parse dependency entry: `    "@patternfly/react-core": "npm:^5.1.1"`
         if (in_dependencies || in_peer_dependencies) && line.starts_with("    ") {
             if let Some((dep_name, dep_ver)) = parse_yarn_dep_line(trimmed) {
-                current_deps.entry(dep_name).or_insert(dep_ver);
+                // Always add to merged dependencies map
+                current_deps
+                    .entry(dep_name.clone())
+                    .or_insert(dep_ver.clone());
+                // Also track peer deps separately
+                if in_peer_dependencies {
+                    current_peer_deps.entry(dep_name).or_insert(dep_ver);
+                }
             }
         }
     }
@@ -389,6 +410,7 @@ fn parse_yarn_lock_berry(content: &str) -> Result<Vec<LockfileEntry>> {
             name,
             version,
             dependencies: current_deps,
+            peer_dependencies: current_peer_deps,
         });
     }
 
@@ -513,13 +535,14 @@ fn parse_pnpm_v6(lock: &serde_yaml::Value) -> Result<Vec<LockfileEntry>> {
             None => continue,
         };
 
-        let dependencies = collect_pnpm_dependencies(value);
+        let (dependencies, peer_dependencies) = collect_pnpm_dependencies(value);
 
         if !version.is_empty() {
             entries.push(LockfileEntry {
                 name,
                 version,
                 dependencies,
+                peer_dependencies,
             });
         }
     }
@@ -565,6 +588,7 @@ fn parse_pnpm_v9(lock: &serde_yaml::Value) -> Result<Vec<LockfileEntry>> {
                         name,
                         version,
                         dependencies: HashMap::new(),
+                        peer_dependencies: HashMap::new(),
                     });
             }
         }
@@ -583,13 +607,16 @@ fn parse_pnpm_v9(lock: &serde_yaml::Value) -> Result<Vec<LockfileEntry>> {
                 None => continue,
             };
 
-            let deps = collect_pnpm_dependencies(value);
+            let (deps, peer_deps) = collect_pnpm_dependencies(value);
 
             // Merge deps into the entry (snapshots may have multiple peer
             // variants for the same package; we take the union of deps)
             if let Some(entry) = entry_map.get_mut(&(name.clone(), version.clone())) {
                 for (dep_name, dep_ver) in deps {
                     entry.dependencies.entry(dep_name).or_insert(dep_ver);
+                }
+                for (dep_name, dep_ver) in peer_deps {
+                    entry.peer_dependencies.entry(dep_name).or_insert(dep_ver);
                 }
             } else {
                 // Snapshot for a package not in `packages` — can happen for
@@ -601,6 +628,7 @@ fn parse_pnpm_v9(lock: &serde_yaml::Value) -> Result<Vec<LockfileEntry>> {
                             name,
                             version,
                             dependencies: deps,
+                            peer_dependencies: peer_deps,
                         },
                     );
                 }
@@ -662,11 +690,18 @@ fn extract_name_version_from_pnpm_key(key: &str) -> Option<(String, String)> {
 ///
 /// Reads both `dependencies` and `peerDependencies` maps. Strips peer
 /// suffixes from version values (e.g., `5.1.1(react@18.2.0)` → `5.1.1`).
-fn collect_pnpm_dependencies(value: &serde_yaml::Value) -> HashMap<String, String> {
+///
+/// Returns `(all_deps, peer_deps_only)` where `all_deps` is the merged map
+/// and `peer_deps_only` contains only entries from `peerDependencies`.
+fn collect_pnpm_dependencies(
+    value: &serde_yaml::Value,
+) -> (HashMap<String, String>, HashMap<String, String>) {
     let mut deps = HashMap::new();
+    let mut peer_deps = HashMap::new();
 
     for section in &["dependencies", "peerDependencies", "optionalDependencies"] {
         if let Some(dep_map) = value.get(*section).and_then(|v| v.as_mapping()) {
+            let is_peer = *section == "peerDependencies";
             for (dep_key, dep_val) in dep_map {
                 let dep_name = match dep_key.as_str() {
                     Some(n) => n.to_string(),
@@ -682,12 +717,15 @@ fn collect_pnpm_dependencies(value: &serde_yaml::Value) -> HashMap<String, Strin
                 // Strip peer suffix from version value
                 let version = strip_pnpm_peer_suffix(&raw_ver).to_string();
 
-                deps.entry(dep_name).or_insert(version);
+                deps.entry(dep_name.clone()).or_insert(version.clone());
+                if is_peer {
+                    peer_deps.entry(dep_name).or_insert(version);
+                }
             }
         }
     }
 
-    deps
+    (deps, peer_deps)
 }
 
 /// Strip peer resolution suffixes from a pnpm version string.
@@ -763,9 +801,18 @@ mod tests {
 
         let entries = parse_package_lock_json(content).unwrap();
         assert_eq!(entries.len(), 1);
+        // Merged into dependencies
         assert_eq!(
             entries[0]
                 .dependencies
+                .get("@patternfly/react-core")
+                .unwrap(),
+            "^5.0.0"
+        );
+        // Also tracked separately in peer_dependencies
+        assert_eq!(
+            entries[0]
+                .peer_dependencies
                 .get("@patternfly/react-core")
                 .unwrap(),
             "^5.0.0"
@@ -877,7 +924,7 @@ __metadata:
 
         let entries = parse_yarn_lock_berry(content).unwrap();
         assert_eq!(entries.len(), 1);
-        // Both dependencies and peerDependencies are collected
+        // Both dependencies and peerDependencies are collected in merged map
         assert_eq!(
             entries[0]
                 .dependencies
@@ -886,6 +933,16 @@ __metadata:
             "npm:^5.0.0"
         );
         assert_eq!(entries[0].dependencies.get("lodash").unwrap(), "npm:^4.0.0");
+        // Peer deps also tracked separately
+        assert_eq!(
+            entries[0]
+                .peer_dependencies
+                .get("@patternfly/react-core")
+                .unwrap(),
+            "npm:^5.0.0"
+        );
+        // Regular deps not in peer_dependencies
+        assert!(entries[0].peer_dependencies.get("lodash").is_none());
     }
 
     #[test]
@@ -915,16 +972,19 @@ __metadata:
                 name: "@patternfly/react-core".into(),
                 version: "6.4.1".into(),
                 dependencies: HashMap::new(),
+                peer_dependencies: HashMap::new(),
             },
             LockfileEntry {
                 name: "@patternfly/react-topology".into(),
                 version: "5.2.1".into(),
                 dependencies: HashMap::from([("@patternfly/react-core".into(), "^5.1.1".into())]),
+                peer_dependencies: HashMap::new(),
             },
             LockfileEntry {
                 name: "@patternfly/react-table".into(),
                 version: "6.4.1".into(),
                 dependencies: HashMap::from([("@patternfly/react-core".into(), "^6.0.0".into())]),
+                peer_dependencies: HashMap::new(),
             },
         ];
 
@@ -947,6 +1007,7 @@ __metadata:
                 "@patternfly/react-core".into(), // self-reference (shouldn't happen but guard)
                 "^5.0.0".into(),
             )]),
+            peer_dependencies: HashMap::new(),
         }];
 
         let deps = find_dependents(&entries, "@patternfly/react-core", Some("5.99.99"));
@@ -962,11 +1023,50 @@ __metadata:
                 "@patternfly/react-core".into(),
                 "npm:^5.1.1".into(), // yarn format with npm: prefix
             )]),
+            peer_dependencies: HashMap::new(),
         }];
 
         let deps = find_dependents(&entries, "@patternfly/react-core", Some("5.99.99"));
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "@patternfly/react-topology");
+    }
+
+    #[test]
+    fn test_find_dependents_via_peer_deps() {
+        // Simulates @openshift/dynamic-plugin-sdk-utils depending on
+        // @patternfly/react-core via peerDependencies
+        let entries = vec![
+            LockfileEntry {
+                name: "@patternfly/react-core".into(),
+                version: "5.4.14".into(),
+                dependencies: HashMap::new(),
+                peer_dependencies: HashMap::new(),
+            },
+            LockfileEntry {
+                name: "@openshift/dynamic-plugin-sdk-utils".into(),
+                version: "4.1.0".into(),
+                // Peer deps are merged into dependencies for find_dependents
+                dependencies: HashMap::from([
+                    ("@patternfly/react-core".into(), "^5.1.0".into()),
+                    ("lodash".into(), "^4.17.21".into()),
+                ]),
+                peer_dependencies: HashMap::from([(
+                    "@patternfly/react-core".into(),
+                    "^5.1.0".into(),
+                )]),
+            },
+        ];
+
+        // find_dependents should find sdk-utils as a dependent of react-core
+        let deps = find_dependents(&entries, "@patternfly/react-core", Some("5.99.99"));
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "@openshift/dynamic-plugin-sdk-utils");
+
+        // Verify peer_dependencies field is populated
+        assert!(entries[1]
+            .peer_dependencies
+            .contains_key("@patternfly/react-core"));
+        assert!(!entries[1].peer_dependencies.contains_key("lodash"));
     }
 
     #[test]
@@ -1201,7 +1301,7 @@ packages:
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "some-plugin");
         assert_eq!(entries[0].version, "2.0.0");
-        // peerDependencies collected (range preserved for peers in the entry)
+        // peerDependencies collected in merged map (range preserved for peers in the entry)
         assert!(entries[0].dependencies.contains_key("react"));
         // Regular dep version has peer suffix stripped
         assert_eq!(
@@ -1211,6 +1311,13 @@ packages:
                 .unwrap(),
             "5.0.0"
         );
+        // Peer deps tracked separately
+        assert!(entries[0].peer_dependencies.contains_key("react"));
+        // Regular dep not in peer_dependencies
+        assert!(!entries[0].peer_dependencies.contains_key("lodash"));
+        assert!(!entries[0]
+            .peer_dependencies
+            .contains_key("@patternfly/react-core"));
     }
 
     #[test]

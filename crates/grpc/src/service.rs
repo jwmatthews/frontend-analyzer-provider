@@ -404,6 +404,111 @@ impl ProviderService for FrontendProvider {
                     }),
                 });
             }
+
+            // ── Peer dependency constraints ──────────────────────────────
+            //
+            // For each direct dependency in the consumer's package.json, check
+            // its lockfile entry for peerDependencies. Emit each peer dep
+            // constraint as a separate dependency entry so kantra can detect
+            // version incompatibilities.
+            //
+            // Example: @openshift/dynamic-plugin-sdk-utils@4.1.0 declares
+            // peerDependencies: { "@patternfly/react-core": "^5.1.0" }.
+            // We emit an entry for @patternfly/react-core at version 5.1.0
+            // (the base of the constraint) with type "peerDependency" and
+            // resolvedFor pointing to the parent package. This lets the
+            // dep-update rule for @patternfly/react-core match it, creating
+            // an incident that the fix engine can use to update the parent.
+            let direct_dep_names: HashSet<String> = file_deps
+                .iter()
+                .filter_map(|fd| fd.list.as_ref())
+                .flat_map(|l| l.deps.iter())
+                .filter(|d| !d.indirect)
+                .map(|d| d.name.clone())
+                .collect();
+
+            let mut peer_dep_entries = Vec::new();
+
+            for entry in &lockfile_entries {
+                // Only process lockfile entries for packages that are direct
+                // dependencies of the consumer — we can only update what's
+                // in their package.json.
+                if !direct_dep_names.contains(&entry.name) {
+                    continue;
+                }
+
+                // Skip entries with no peer dependencies
+                if entry.peer_dependencies.is_empty() {
+                    continue;
+                }
+
+                let parent_label = format!("{}@{}", entry.name, entry.version);
+
+                for (peer_name, peer_constraint) in &entry.peer_dependencies {
+                    // Skip self-references
+                    if peer_name == &entry.name {
+                        continue;
+                    }
+
+                    // Strip the constraint prefix (^, ~, >=, npm:, etc.) to get
+                    // the base version for kantra comparison.
+                    let base_version =
+                        frontend_js_scanner::dependency::strip_npm_prefix(peer_constraint)
+                            .to_string();
+
+                    let extras = {
+                        let mut fields = std::collections::BTreeMap::new();
+                        fields.insert(
+                            "resolvedFor".into(),
+                            prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(
+                                    parent_label.clone(),
+                                )),
+                            },
+                        );
+                        fields.insert(
+                            "constraintSource".into(),
+                            prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(
+                                    "peerDependency".into(),
+                                )),
+                            },
+                        );
+                        Some(prost_types::Struct { fields })
+                    };
+
+                    peer_dep_entries.push(Dependency {
+                        name: peer_name.clone(),
+                        version: base_version,
+                        classifier: String::new(),
+                        r#type: "peerDependency".into(),
+                        resolved_identifier: String::new(),
+                        file_uri_prefix: String::new(),
+                        indirect: true,
+                        extras,
+                        labels: vec![],
+                    });
+                }
+            }
+
+            if !peer_dep_entries.is_empty() {
+                let lockfile_uri = lockfile_paths
+                    .first()
+                    .map(|p| format!("file://{}", p.display()))
+                    .unwrap_or_else(|| format!("file://{}/lockfile", root.display()));
+
+                tracing::info!(
+                    count = peer_dep_entries.len(),
+                    "Adding peer dependency constraint entries from lockfile"
+                );
+
+                file_deps.push(FileDep {
+                    file_uri: lockfile_uri,
+                    list: Some(DependencyList {
+                        deps: peer_dep_entries,
+                    }),
+                });
+            }
         }
 
         let total: usize = file_deps
