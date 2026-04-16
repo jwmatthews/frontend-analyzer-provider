@@ -1537,17 +1537,27 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
                             let prop_value = match value {
                                 JSXAttributeValue::StringLiteral(s) => Some(s.value.to_string()),
                                 JSXAttributeValue::ExpressionContainer(expr) => {
-                                    // For expressions, capture the source text
-                                    let expr_span = expr.span();
-                                    // Strip the { } wrapper, with bounds checking
-                                    let start =
-                                        (expr_span.start as usize + 1).min(ctx.source.len());
-                                    let end = (expr_span.end as usize)
-                                        .saturating_sub(1)
-                                        .max(start)
-                                        .min(ctx.source.len());
-                                    let text = &ctx.source[start..end];
-                                    Some(text.trim().to_string())
+                                    // Static member expression: Foo.bar → extract "bar".
+                                    // This handles enum-style prop values like
+                                    // variant={PageSectionVariants.light} so that the
+                                    // value filter `value: ^light$` matches correctly.
+                                    if let JSXExpression::StaticMemberExpression(member) =
+                                        &expr.expression
+                                    {
+                                        Some(member.property.name.to_string())
+                                    } else {
+                                        // Fallback: capture the raw source text
+                                        let expr_span = expr.span();
+                                        // Strip the { } wrapper, with bounds checking
+                                        let start =
+                                            (expr_span.start as usize + 1).min(ctx.source.len());
+                                        let end = (expr_span.end as usize)
+                                            .saturating_sub(1)
+                                            .max(start)
+                                            .min(ctx.source.len());
+                                        let text = &ctx.source[start..end];
+                                        Some(text.trim().to_string())
+                                    }
                                 }
                                 _ => None,
                             };
@@ -1743,6 +1753,42 @@ const el = <Button isActive>Click</Button>;
         assert_eq!(
             incidents[0].variables.get("propValue"),
             Some(&serde_json::Value::String("primary".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_enum_member_expression_value() {
+        // Enum-style prop values like variant={PageSectionVariants.light}
+        // should extract the member name ("light") as propValue, so that
+        // value-based rules (value: ^light$) match correctly.
+        let source =
+            r#"const el = <PageSection variant={PageSectionVariants.light}>content</PageSection>;"#;
+        let incidents = scan_source_jsx(source, r"^variant$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("propValue"),
+            Some(&serde_json::Value::String("light".to_string())),
+            "Should extract member name 'light' from PageSectionVariants.light"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_enum_member_nested_expression() {
+        // Non-member expressions should still capture raw source text
+        let source =
+            r#"const el = <Button variant={isActive ? "primary" : "secondary"}>Click</Button>;"#;
+        let incidents = scan_source_jsx(source, r"^variant$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        // Should be the raw source text, not a member name
+        let pv = incidents[0]
+            .variables
+            .get("propValue")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(
+            pv.contains("isActive"),
+            "Non-member expressions should preserve raw source text, got: {}",
+            pv
         );
     }
 
