@@ -253,7 +253,7 @@ mod tests {
         let incidents = scan_source("const el = getByRole(someVariable);", r"^getByRole$");
         assert_eq!(incidents.len(), 1);
         assert!(
-            incidents[0].variables.get("callArgValue").is_none(),
+            !incidents[0].variables.contains_key("callArgValue"),
             "Non-string argument should not produce callArgValue"
         );
     }
@@ -263,6 +263,6 @@ mod tests {
         // getByText with regex arg — should not extract
         let incidents = scan_source("const el = getByText(/hello/i);", r"^getByText$");
         assert_eq!(incidents.len(), 1);
-        assert!(incidents[0].variables.get("callArgValue").is_none());
+        assert!(!incidents[0].variables.contains_key("callArgValue"));
     }
 }

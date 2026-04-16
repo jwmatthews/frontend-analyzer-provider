@@ -113,6 +113,70 @@ fn check_selector_components<'i>(
     }
 }
 
+/// Emit an incident for a matched class name, locating its actual position
+/// in the source text rather than using the rule's start location.
+///
+/// LightningCSS only provides the rule-level `loc` (the start of the style
+/// rule), not per-component positions. For multi-line selectors like:
+///
+/// ```css
+/// .container
+///   .pf-v5-c-button
+///   .pf-v5-c-icon { ... }
+/// ```
+///
+/// the rule `loc` points to `.container` (line 1), but the matched classes
+/// are on lines 2 and 3. We search forward from the rule start to find the
+/// actual `.className` occurrence.
+fn emit_class_incident(
+    source: &str,
+    file_uri: &str,
+    loc: &CssLocation,
+    class_name: &str,
+    incidents: &mut Vec<Incident>,
+) {
+    // Build the search needle: ".className" (with the dot prefix)
+    let needle = format!(".{}", class_name);
+
+    // Compute byte offset of the rule's start line in the source
+    let rule_start_offset = source
+        .lines()
+        .take(loc.line as usize)
+        .map(|l| l.len() + 1) // +1 for newline
+        .sum::<usize>();
+
+    // Search for the class from the rule start. Use the first occurrence
+    // that hasn't already been claimed by a prior incident on the same
+    // rule (tracked by searching from an advancing offset).
+    if let Some(rel) = source[rule_start_offset..].find(&needle) {
+        let class_offset = rule_start_offset + rel + 1; // +1 to skip the dot
+        let actual_line = source[..class_offset].matches('\n').count() as u32 + 1;
+        let line_start = source[..class_offset].rfind('\n').map_or(0, |p| p + 1);
+        let actual_col = (class_offset - line_start) as u32;
+
+        let mut incident = Incident::new(
+            file_uri.to_string(),
+            actual_line,
+            Location {
+                start: Position {
+                    line: actual_line - 1,
+                    character: actual_col,
+                },
+                end: Position {
+                    line: actual_line - 1,
+                    character: actual_col + class_name.len() as u32,
+                },
+            },
+        );
+        incident.variables.insert(
+            "className".into(),
+            serde_json::Value::String(class_name.to_string()),
+        );
+        incident.code_snip = Some(extract_code_snip(source, actual_line, 3));
+        incidents.push(incident);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,69 +273,5 @@ mod tests {
         let css = "@media (min-width: 768px) {\n  .pf-v5-c-page {\n    padding: 0;\n  }\n}\n";
         let incidents = scan(css, "pf-v5-");
         assert_eq!(incidents.len(), 1);
-    }
-}
-
-/// Emit an incident for a matched class name, locating its actual position
-/// in the source text rather than using the rule's start location.
-///
-/// LightningCSS only provides the rule-level `loc` (the start of the style
-/// rule), not per-component positions. For multi-line selectors like:
-///
-/// ```css
-/// .container
-///   .pf-v5-c-button
-///   .pf-v5-c-icon { ... }
-/// ```
-///
-/// the rule `loc` points to `.container` (line 1), but the matched classes
-/// are on lines 2 and 3. We search forward from the rule start to find the
-/// actual `.className` occurrence.
-fn emit_class_incident(
-    source: &str,
-    file_uri: &str,
-    loc: &CssLocation,
-    class_name: &str,
-    incidents: &mut Vec<Incident>,
-) {
-    // Build the search needle: ".className" (with the dot prefix)
-    let needle = format!(".{}", class_name);
-
-    // Compute byte offset of the rule's start line in the source
-    let rule_start_offset = source
-        .lines()
-        .take(loc.line as usize)
-        .map(|l| l.len() + 1) // +1 for newline
-        .sum::<usize>();
-
-    // Search for the class from the rule start. Use the first occurrence
-    // that hasn't already been claimed by a prior incident on the same
-    // rule (tracked by searching from an advancing offset).
-    if let Some(rel) = source[rule_start_offset..].find(&needle) {
-        let class_offset = rule_start_offset + rel + 1; // +1 to skip the dot
-        let actual_line = source[..class_offset].matches('\n').count() as u32 + 1;
-        let line_start = source[..class_offset].rfind('\n').map_or(0, |p| p + 1);
-        let actual_col = (class_offset - line_start) as u32;
-
-        let mut incident = Incident::new(
-            file_uri.to_string(),
-            actual_line,
-            Location {
-                start: Position {
-                    line: actual_line - 1,
-                    character: actual_col,
-                },
-                end: Position {
-                    line: actual_line - 1,
-                    character: actual_col + class_name.len() as u32,
-                },
-            },
-        );
-        incident.variables.insert(
-            "className".into(),
-            serde_json::Value::String(class_name.to_string()),
-        );
-        incident.code_snip = Some(extract_code_snip(source, actual_line, 3));
-        incidents.push(incident);
     }
 }

@@ -198,7 +198,7 @@ mod tests {
             map.get("PFButton"),
             Some(&"@patternfly/react-core".to_string())
         );
-        assert!(map.get("Button").is_none()); // imported name, not local
+        assert!(!map.contains_key("Button")); // imported name, not local
     }
 
     #[test]

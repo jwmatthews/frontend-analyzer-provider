@@ -1994,7 +1994,7 @@ const el = <ToolbarItem align="alignRight" />;
         let incidents = scan_source_jsx(source, r"^align$", Some(&ReferenceLocation::JsxProp));
         assert_eq!(incidents.len(), 1);
         assert!(
-            incidents[0].variables.get("propObjectValues").is_none(),
+            !incidents[0].variables.contains_key("propObjectValues"),
             "Direct string props should not have propObjectValues"
         );
     }
@@ -2857,7 +2857,7 @@ const App = () => (
         );
         assert_eq!(incidents.len(), 1);
         assert!(
-            incidents[0].variables.get("parentName").is_none(),
+            !incidents[0].variables.contains_key("parentName"),
             "Regular component without annotation should have no parentName. Got: {:?}",
             incidents[0].variables
         );
@@ -3374,7 +3374,10 @@ const el = (
             r"^MenuToggle$",
             Some(&ReferenceLocation::JsxComponent),
         );
-        assert!(incidents.len() >= 1, "Should find MenuToggle at least once");
+        assert!(
+            !incidents.is_empty(),
+            "Should find MenuToggle at least once"
+        );
         let resolved = incidents.iter().find(|i| {
             i.variables.get("parentName") == Some(&serde_json::Value::String("Select".to_string()))
         });
@@ -3431,7 +3434,7 @@ const el = (
             Some(&ReferenceLocation::JsxComponent),
         );
         assert!(
-            incidents.len() >= 1,
+            !incidents.is_empty(),
             "Should find DropdownItem at least once"
         );
         let resolved = incidents.iter().find(|i| {

@@ -320,14 +320,16 @@ pub fn scan_file_referenced(
     // Works for both import incidents (module from import statement) and
     // JSX incidents (module resolved from the file's import map).
     //
-    // Uses exact string matching, not regex. The `from` field is a package
-    // name (e.g., "@patternfly/react-core"), not a pattern. Exact matching
-    // prevents "@patternfly/react-core" from matching imports from
-    // "@patternfly/react-core/deprecated".
+    // Uses package-aware matching: exact match OR deep-path match for
+    // internal distribution paths (dist/, esm/, etc.). This allows
+    // `from: "@patternfly/react-tokens"` to match deep-path imports like
+    // `@patternfly/react-tokens/dist/js/chart_color_black_200` while still
+    // preventing false matches against logical subpackage exports like
+    // `@patternfly/react-core/deprecated`.
     if let Some(from_value) = &condition.from {
         incidents.retain(|inc| {
             if let Some(serde_json::Value::String(module)) = inc.variables.get("module") {
-                module == from_value
+                matches_package(module, from_value)
             } else {
                 // No module = component not found in imports (e.g., locally
                 // defined or HTML element). Keep it to avoid false negatives.
@@ -338,11 +340,11 @@ pub fn scan_file_referenced(
 
     // Filter by parent import source path if specified.
     // Matches the parent JSX component's import source, resolved from the
-    // file's import map. Exact string match, same as `from` above.
+    // file's import map. Uses the same package-aware matching as `from`.
     if let Some(parent_from_value) = &condition.parent_from {
         incidents.retain(|inc| {
             if let Some(serde_json::Value::String(module)) = inc.variables.get("parentFrom") {
-                module == parent_from_value
+                matches_package(module, parent_from_value)
             } else {
                 // No parentFrom = parent not found in imports, filter out
                 false
@@ -602,6 +604,41 @@ pub fn make_incident(source: &str, file_uri: &str, start_offset: u32, end_offset
             },
         },
     )
+}
+
+/// Check if an import module path matches a package name, accounting for
+/// deep-path imports into the package's internal distribution files.
+///
+/// Deep-path imports like `@patternfly/react-tokens/dist/js/chart_color_black_200`
+/// resolve to files within the same package and should match the bare package
+/// name `@patternfly/react-tokens`.
+///
+/// Logical subpackage exports like `@patternfly/react-core/deprecated` are
+/// different API surfaces and must NOT match the bare package name.
+///
+/// Examples:
+/// ```text
+/// matches_package("@patternfly/react-tokens/dist/js/foo", "@patternfly/react-tokens") → true
+/// matches_package("@patternfly/react-core/deprecated",    "@patternfly/react-core")   → false
+/// matches_package("@patternfly/react-core",               "@patternfly/react-core")   → true
+/// ```
+fn matches_package(module: &str, package: &str) -> bool {
+    if module == package {
+        return true;
+    }
+    // Deep-path imports resolve to files within the package's build output.
+    // These are the same package, just a direct entry point into an internal
+    // file. Subpackage exports like /deprecated and /next are logical
+    // sub-packages and must NOT match the bare package name.
+    if let Some(rest) = module
+        .strip_prefix(package)
+        .and_then(|s| s.strip_prefix('/'))
+    {
+        let internal_prefixes = ["dist/", "es/", "esm/", "cjs/", "lib/", "src/", "build/"];
+        internal_prefixes.iter().any(|p| rest.starts_with(p))
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -2083,5 +2120,81 @@ const App = () => (
                 .map(|i| i.variables.get("parentName"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ── matches_package tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_matches_package_exact_match() {
+        assert!(matches_package(
+            "@patternfly/react-tokens",
+            "@patternfly/react-tokens"
+        ));
+    }
+
+    #[test]
+    fn test_matches_package_deep_path_dist_js() {
+        assert!(matches_package(
+            "@patternfly/react-tokens/dist/js/global_palette_black_500",
+            "@patternfly/react-tokens"
+        ));
+    }
+
+    #[test]
+    fn test_matches_package_deep_path_dist_esm() {
+        assert!(matches_package(
+            "@patternfly/react-tokens/dist/esm/global_palette_black_500",
+            "@patternfly/react-tokens"
+        ));
+    }
+
+    #[test]
+    fn test_matches_package_deep_path_lib() {
+        assert!(matches_package(
+            "@patternfly/react-icons/lib/esm/icons/TrashIcon",
+            "@patternfly/react-icons"
+        ));
+    }
+
+    #[test]
+    fn test_matches_package_does_not_match_subpackage_deprecated() {
+        assert!(!matches_package(
+            "@patternfly/react-core/deprecated",
+            "@patternfly/react-core"
+        ));
+    }
+
+    #[test]
+    fn test_matches_package_does_not_match_subpackage_next() {
+        assert!(!matches_package(
+            "@patternfly/react-core/next",
+            "@patternfly/react-core"
+        ));
+    }
+
+    #[test]
+    fn test_matches_package_does_not_match_different_package() {
+        assert!(!matches_package(
+            "@patternfly/react-tokens-extra/dist/js/foo",
+            "@patternfly/react-tokens"
+        ));
+    }
+
+    #[test]
+    fn test_matches_package_does_not_match_prefix_without_slash() {
+        assert!(!matches_package(
+            "@patternfly/react-core-internal",
+            "@patternfly/react-core"
+        ));
+    }
+
+    #[test]
+    fn test_matches_package_deprecated_exact_match() {
+        // When the rule explicitly targets the deprecated subpackage,
+        // it should match exactly.
+        assert!(matches_package(
+            "@patternfly/react-core/deprecated",
+            "@patternfly/react-core/deprecated"
+        ));
     }
 }
