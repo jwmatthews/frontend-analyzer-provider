@@ -81,6 +81,55 @@ fn walk_stmt(
                 walk_stmt(s, source, pattern, file_uri, incidents);
             }
         }
+        Statement::IfStatement(if_stmt) => {
+            walk_stmt(&if_stmt.consequent, source, pattern, file_uri, incidents);
+            if let Some(alt) = &if_stmt.alternate {
+                walk_stmt(alt, source, pattern, file_uri, incidents);
+            }
+        }
+        Statement::ForStatement(f) => {
+            walk_stmt(&f.body, source, pattern, file_uri, incidents);
+        }
+        Statement::ForInStatement(f) => {
+            walk_stmt(&f.body, source, pattern, file_uri, incidents);
+        }
+        Statement::ForOfStatement(f) => {
+            walk_stmt(&f.body, source, pattern, file_uri, incidents);
+        }
+        Statement::WhileStatement(w) => {
+            walk_stmt(&w.body, source, pattern, file_uri, incidents);
+        }
+        Statement::DoWhileStatement(d) => {
+            walk_stmt(&d.body, source, pattern, file_uri, incidents);
+        }
+        Statement::SwitchStatement(s) => {
+            for case in &s.cases {
+                for stmt in &case.consequent {
+                    walk_stmt(stmt, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        Statement::TryStatement(t) => {
+            for s in &t.block.body {
+                walk_stmt(s, source, pattern, file_uri, incidents);
+            }
+            if let Some(handler) = &t.handler {
+                for s in &handler.body.body {
+                    walk_stmt(s, source, pattern, file_uri, incidents);
+                }
+            }
+            if let Some(finalizer) = &t.finalizer {
+                for s in &finalizer.body {
+                    walk_stmt(s, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        Statement::LabeledStatement(l) => {
+            walk_stmt(&l.body, source, pattern, file_uri, incidents);
+        }
+        Statement::ThrowStatement(t) => {
+            walk_expr(&t.argument, source, pattern, file_uri, incidents);
+        }
         _ => {}
     }
 }
@@ -170,6 +219,9 @@ fn walk_expr(
                     // Also walk property values
                     walk_expr(&p.value, source, pattern, file_uri, incidents);
                 }
+                if let ObjectPropertyKind::SpreadProperty(spread) = prop {
+                    walk_expr(&spread.argument, source, pattern, file_uri, incidents);
+                }
             }
         }
         Expression::ArrayExpression(arr) => {
@@ -190,6 +242,67 @@ fn walk_expr(
         }
         Expression::TSTypeAssertion(ts) => {
             walk_expr(&ts.expression, source, pattern, file_uri, incidents);
+        }
+        // Optional chaining: items?.map((item) => style with CSS var)
+        Expression::ChainExpression(chain) => {
+            if let ChainElement::CallExpression(call) = &chain.expression {
+                for arg in &call.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        walk_expr(e, source, pattern, file_uri, incidents);
+                    }
+                }
+            }
+        }
+        // Await/yield: const el = await getStyles(); may contain CSS vars
+        Expression::AwaitExpression(a) => {
+            walk_expr(&a.argument, source, pattern, file_uri, incidents);
+        }
+        Expression::YieldExpression(y) => {
+            if let Some(arg) = &y.argument {
+                walk_expr(arg, source, pattern, file_uri, incidents);
+            }
+        }
+        // Sequence: (expr1, expr2)
+        Expression::SequenceExpression(seq) => {
+            for e in &seq.expressions {
+                walk_expr(e, source, pattern, file_uri, incidents);
+            }
+        }
+        // Assignment: variable = { "--pf-v5-...": value }
+        Expression::AssignmentExpression(assign) => {
+            walk_expr(&assign.right, source, pattern, file_uri, incidents);
+        }
+        // new Constructor(style with CSS var)
+        Expression::NewExpression(new_expr) => {
+            for arg in &new_expr.arguments {
+                if let Some(e) = arg.as_expression() {
+                    walk_expr(e, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        // Tagged templates: css`var(--pf-v5-...)`
+        Expression::TaggedTemplateExpression(tagged) => {
+            for quasi in &tagged.quasi.quasis {
+                let raw = quasi.value.raw.as_str();
+                if pattern.is_match(raw) {
+                    let span = quasi.span();
+                    let mut incident = make_incident(source, file_uri, span.start, span.end);
+                    incident.variables.insert(
+                        "matchingText".into(),
+                        serde_json::Value::String(raw.to_string()),
+                    );
+                    incidents.push(incident);
+                }
+            }
+        }
+        // Static member expressions: styles.property (walk object in case it's complex)
+        Expression::StaticMemberExpression(member) => {
+            walk_expr(&member.object, source, pattern, file_uri, incidents);
+        }
+        // Computed member: obj[expr] — walk both
+        Expression::ComputedMemberExpression(member) => {
+            walk_expr(&member.object, source, pattern, file_uri, incidents);
+            walk_expr(&member.expression, source, pattern, file_uri, incidents);
         }
         _ => {}
     }
@@ -403,5 +516,247 @@ mod tests {
         "#;
         let incidents = scan_source(source, r"--pf-v5-");
         assert_eq!(incidents.len(), 1);
+    }
+
+    // --- Tests for previously missing statement types ---
+
+    #[test]
+    fn test_css_var_inside_if_block() {
+        // Reproduces the PipelineRunsStatusCard.tsx Gap 1:
+        // CSS var inside an if-body assignment expression
+        let source = r#"
+            function render() {
+                let xAxisStyle = { tickLabels: { fill: 'var(--pf-v5-global--Color--100)' } };
+                if (tickValues.length > 7) {
+                    xAxisStyle = {
+                        tickLabels: {
+                            fill: 'var(--pf-v5-global--Color--100)',
+                            angle: 320,
+                        },
+                    };
+                }
+                return xAxisStyle;
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            2,
+            "Should find CSS var in both variable declaration AND if-body assignment"
+        );
+    }
+
+    #[test]
+    fn test_css_var_inside_if_else_chain() {
+        // Reproduces the pipeline-topology/utils.ts Gap 2:
+        // CSS vars inside if/else-if/else assignment branches
+        let source = r#"
+            function getDiamondState() {
+                let diamondColor: string;
+                if (isPipelineRun) {
+                    diamondColor = 'var(--pf-v5-global--active-color--100)';
+                } else if (!isFinallyTask) {
+                    diamondColor = 'var(--pf-v5-global--BackgroundColor--200)';
+                } else {
+                    diamondColor = 'var(--pf-v5-global--BackgroundColor--light-100)';
+                }
+                return diamondColor;
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            3,
+            "Should find CSS var in all three if/else-if/else branches"
+        );
+    }
+
+    #[test]
+    fn test_css_var_inside_for_loop() {
+        let source = r#"
+            function buildStyles() {
+                const styles = [];
+                for (let i = 0; i < items.length; i++) {
+                    styles.push({ color: 'var(--pf-v5-global--Color--100)' });
+                }
+                return styles;
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(incidents.len(), 1, "Should find CSS var inside for loop");
+    }
+
+    #[test]
+    fn test_css_var_inside_for_of_loop() {
+        let source = r#"
+            function buildStyles() {
+                for (const item of items) {
+                    item.style = 'var(--pf-v5-global--spacer--md)';
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(incidents.len(), 1, "Should find CSS var inside for-of loop");
+    }
+
+    #[test]
+    fn test_css_var_inside_switch() {
+        let source = r#"
+            function getColor(type: string) {
+                switch (type) {
+                    case "success":
+                        return 'var(--pf-v5-global--success-color--100)';
+                    case "danger":
+                        return 'var(--pf-v5-global--danger-color--100)';
+                    default:
+                        return 'var(--pf-v5-global--Color--100)';
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            3,
+            "Should find CSS var in all switch cases"
+        );
+    }
+
+    #[test]
+    fn test_css_var_inside_try_catch() {
+        let source = r#"
+            function getStyle() {
+                try {
+                    return { color: 'var(--pf-v5-global--Color--100)' };
+                } catch (e) {
+                    return { color: 'var(--pf-v5-global--danger-color--100)' };
+                } finally {
+                    cleanup('var(--pf-v5-global--spacer--md)');
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            3,
+            "Should find CSS var in try, catch, and finally"
+        );
+    }
+
+    #[test]
+    fn test_css_var_inside_while_loop() {
+        let source = r#"
+            function process() {
+                while (hasMore) {
+                    applyStyle('var(--pf-v5-global--spacer--lg)');
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(incidents.len(), 1, "Should find CSS var inside while loop");
+    }
+
+    // --- Tests for previously missing expression types ---
+
+    #[test]
+    fn test_css_var_in_assignment_expression() {
+        // Direct test for AssignmentExpression handling
+        let source = r#"
+            function update() {
+                style = { fill: 'var(--pf-v5-global--Color--100)' };
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find CSS var in assignment expression"
+        );
+    }
+
+    #[test]
+    fn test_css_var_inside_optional_chain() {
+        let source = r#"
+            const el = <ul>{items?.map((item) => (
+                <li style={{ color: 'var(--pf-v5-global--Color--100)' }}>text</li>
+            ))}</ul>;
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find CSS var inside optional chain .map() callback"
+        );
+    }
+
+    #[test]
+    fn test_css_var_in_tagged_template() {
+        let source = r#"
+            const styles = css`
+                color: var(--pf-v5-global--Color--100);
+                background: var(--pf-v5-global--BackgroundColor--200);
+            `;
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find CSS var in tagged template literal"
+        );
+    }
+
+    #[test]
+    fn test_css_var_in_spread_property() {
+        let source = r#"
+            const baseStyles = { "--pf-v5-c-label--Color": "red" };
+            const styles = { ...baseStyles };
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        // Only the original object key should match, not the spread reference
+        assert_eq!(incidents.len(), 1);
+    }
+
+    #[test]
+    fn test_css_var_in_computed_member() {
+        let source = r#"
+            const val = styles["--pf-v5-global--Color--100"];
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find CSS var in computed member expression"
+        );
+    }
+
+    #[test]
+    fn test_css_var_in_await_expression() {
+        let source = r#"
+            async function getStyle() {
+                const color = await Promise.resolve('var(--pf-v5-global--Color--100)');
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find CSS var in await expression"
+        );
+    }
+
+    #[test]
+    fn test_css_var_in_labeled_statement() {
+        let source = r#"
+            function process() {
+                outer: for (const item of items) {
+                    item.color = 'var(--pf-v5-global--Color--100)';
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"--pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find CSS var inside labeled statement"
+        );
     }
 }
