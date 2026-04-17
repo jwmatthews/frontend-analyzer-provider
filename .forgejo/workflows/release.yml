@@ -33,18 +33,6 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Checkout konveyor-core (dependency)
-        uses: https://github.com/actions/checkout@v6
-        with:
-          repository: shawn_hurley/konveyor-core
-          path: ../konveyor-core
-
-      - name: Checkout fix-engine (dependency)
-        uses: https://github.com/actions/checkout@v6
-        with:
-          repository: shawn_hurley/fix-engine
-          path: ../fix-engine
-
       - name: Install Rust stable
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
@@ -92,18 +80,6 @@ jobs:
         uses: https://github.com/actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
-
-      - name: Checkout konveyor-core (dependency)
-        uses: https://github.com/actions/checkout@v6
-        with:
-          repository: shawn_hurley/konveyor-core
-          path: ../konveyor-core
-
-      - name: Checkout fix-engine (dependency)
-        uses: https://github.com/actions/checkout@v6
-        with:
-          repository: shawn_hurley/fix-engine
-          path: ../fix-engine
 
       - name: Install Rust stable
         uses: https://github.com/dtolnay/rust-toolchain@stable
