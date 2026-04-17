@@ -2197,4 +2197,208 @@ const App = () => (
             "@patternfly/react-core/deprecated"
         ));
     }
+
+    // ── Cross-file spread resolution tests ───────────────────────────────
+
+    #[test]
+    fn test_cross_file_spread_identifier_object() {
+        // Import an object from another file and spread it onto a JSX element.
+        // The scanner should follow the import and extract property names.
+        let utils = r#"
+export const modalProps = { actions: [], title: "Hello" };
+"#;
+        let consumer = r#"
+import { Modal } from '@patternfly/react-core';
+import { modalProps } from './utils';
+const el = <Modal {...modalProps}>content</Modal>;
+"#;
+
+        let tsconfig = r#"{ "compilerOptions": { "baseUrl": "." } }"#;
+        let files = &[("src/utils.ts", utils), ("src/App.tsx", consumer)];
+
+        let condition = ReferencedCondition {
+            pattern: "^actions$".to_string(),
+            location: Some(ReferenceLocation::JsxProp),
+            component: Some("^Modal$".to_string()),
+            parent: None,
+            not_parent: None,
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-core".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+            requires_child: None,
+        };
+
+        let incidents = scan_with_tsconfig_project(files, "src/App.tsx", tsconfig, &condition);
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect 'actions' from cross-file identifier spread"
+        );
+        assert_eq!(
+            incidents[0].variables.get("spreadSource"),
+            Some(&serde_json::Value::String("true".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_cross_file_spread_fn_call() {
+        // Import a function from another file that returns an object,
+        // and spread its return value onto a JSX element.
+        let utils = r#"
+export const getModalProps = () => ({ actions: [], title: "Hello" });
+"#;
+        let consumer = r#"
+import { Modal } from '@patternfly/react-core';
+import { getModalProps } from './utils';
+const el = <Modal {...getModalProps()}>content</Modal>;
+"#;
+
+        let tsconfig = r#"{ "compilerOptions": { "baseUrl": "." } }"#;
+        let files = &[("src/utils.ts", utils), ("src/App.tsx", consumer)];
+
+        let condition = ReferencedCondition {
+            pattern: "^actions$".to_string(),
+            location: Some(ReferenceLocation::JsxProp),
+            component: Some("^Modal$".to_string()),
+            parent: None,
+            not_parent: None,
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-core".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+            requires_child: None,
+        };
+
+        let incidents = scan_with_tsconfig_project(files, "src/App.tsx", tsconfig, &condition);
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect 'actions' from cross-file function call spread"
+        );
+    }
+
+    #[test]
+    fn test_cross_file_spread_through_barrel() {
+        // Object re-exported through a barrel file (index.ts)
+        let utils = r#"
+export const modalProps = { actions: [], title: "Hello" };
+"#;
+        let barrel = r#"
+export { modalProps } from './utils';
+"#;
+        let consumer = r#"
+import { Modal } from '@patternfly/react-core';
+import { modalProps } from './shared';
+const el = <Modal {...modalProps}>content</Modal>;
+"#;
+
+        let tsconfig = r#"{ "compilerOptions": { "baseUrl": "." } }"#;
+        let files = &[
+            ("src/shared/utils.ts", utils),
+            ("src/shared/index.ts", barrel),
+            ("src/App.tsx", consumer),
+        ];
+
+        let condition = ReferencedCondition {
+            pattern: "^actions$".to_string(),
+            location: Some(ReferenceLocation::JsxProp),
+            component: Some("^Modal$".to_string()),
+            parent: None,
+            not_parent: None,
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-core".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+            requires_child: None,
+        };
+
+        let incidents = scan_with_tsconfig_project(files, "src/App.tsx", tsconfig, &condition);
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect 'actions' from spread through barrel re-export"
+        );
+    }
+
+    #[test]
+    fn test_cross_file_spread_fn_declaration() {
+        // Cross-file function declaration (not arrow) that returns an object
+        let utils = r#"
+export function getModalProps() {
+    return { actions: [], description: "text" };
+}
+"#;
+        let consumer = r#"
+import { Modal } from '@patternfly/react-core';
+import { getModalProps } from './utils';
+const el = <Modal {...getModalProps()}>content</Modal>;
+"#;
+
+        let tsconfig = r#"{ "compilerOptions": { "baseUrl": "." } }"#;
+        let files = &[("src/utils.ts", utils), ("src/App.tsx", consumer)];
+
+        let condition = ReferencedCondition {
+            pattern: "^actions$".to_string(),
+            location: Some(ReferenceLocation::JsxProp),
+            component: Some("^Modal$".to_string()),
+            parent: None,
+            not_parent: None,
+            parent_from: None,
+            value: None,
+            from: Some("@patternfly/react-core".to_string()),
+            file_pattern: None,
+            child: None,
+            not_child: None,
+            requires_child: None,
+        };
+
+        let incidents = scan_with_tsconfig_project(files, "src/App.tsx", tsconfig, &condition);
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect 'actions' from cross-file function declaration return"
+        );
+    }
+
+    #[test]
+    fn test_cross_file_spread_node_modules_skipped() {
+        // Identifiers imported from node_modules should NOT be followed
+        // (we don't parse library source code)
+        let consumer = r#"
+import { Modal } from '@patternfly/react-core';
+import { someProps } from 'some-library';
+const el = <Modal {...someProps}>content</Modal>;
+"#;
+
+        let tsconfig = r#"{ "compilerOptions": { "baseUrl": "." } }"#;
+        let files = &[("src/App.tsx", consumer)];
+
+        let condition = ReferencedCondition {
+            pattern: "^actions$".to_string(),
+            location: Some(ReferenceLocation::JsxProp),
+            component: None,
+            parent: None,
+            not_parent: None,
+            parent_from: None,
+            value: None,
+            from: None,
+            file_pattern: None,
+            child: None,
+            not_child: None,
+            requires_child: None,
+        };
+
+        let incidents = scan_with_tsconfig_project(files, "src/App.tsx", tsconfig, &condition);
+        assert!(
+            incidents.is_empty(),
+            "Should not produce incidents for node_modules spread identifiers"
+        );
+    }
 }

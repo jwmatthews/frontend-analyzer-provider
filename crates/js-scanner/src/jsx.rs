@@ -26,13 +26,19 @@ const MAX_REEXPORT_DEPTH: usize = 20;
 /// can be resolved to their import source (e.g., Button → @patternfly/react-core).
 type ImportMap = HashMap<String, String>;
 
-/// Map of local function/variable names → the expression body they hold.
+/// Map of local variable names → their initializer expressions.
 ///
-/// Built from variable declarations like `const renderItems = () => { ... }`
-/// or `const renderItems = function() { ... }`. Used to resolve call
-/// expressions in JSX children (e.g., `{renderItems()}`) to the function body,
-/// so the parent context propagates through the call.
-type LocalFnMap<'a> = HashMap<String, &'a Expression<'a>>;
+/// Captures ALL expression types from variable declarations:
+/// - Functions: `const renderItems = () => { ... }` — resolved for JSX parent
+///   context propagation via call expressions in children
+/// - Objects: `const modalProps = { actions, title }` — resolved for spread
+///   attribute prop name extraction
+///
+/// Callers match on the expression variant they need. This unified map
+/// replaces the previous separate `LocalFnMap` and `LocalObjMap` to avoid
+/// duplicated AST traversal and to enable the shared `resolve_cross_file_export`
+/// infrastructure to work with both use cases.
+type LocalExprMap<'a> = HashMap<String, &'a Expression<'a>>;
 
 /// Shared scanning context passed through the JSX walk tree.
 ///
@@ -45,7 +51,11 @@ struct ScanContext<'a, 'b> {
     location: Option<&'b ReferenceLocation>,
     incidents: &'b mut Vec<Incident>,
     import_map: &'b ImportMap,
-    local_fns: &'b LocalFnMap<'a>,
+    /// Map of local variable names → initializer expressions (functions,
+    /// objects, etc.). Used for:
+    /// - Resolving call expressions in JSX children (e.g., `{renderItems()}`)
+    /// - Resolving identifier spread attributes (e.g., `{...modalProps}`)
+    local_exprs: &'b LocalExprMap<'a>,
     /// When set, only matches the parent component (via `pattern`) if it has
     /// at least one direct JSX child whose name matches this regex. The
     /// incident is emitted on the parent. Used for migration rules to detect
@@ -147,24 +157,28 @@ fn binding_name<'a>(binding: &'a BindingPattern<'a>, source: &'a str) -> Option<
     }
 }
 
+/// Build a map of all local variable declarations to their initializer
+/// expressions. Captures functions, objects, and any other expression type.
+///
 /// ```ts
 /// const MyComponent = () => {
-///   const renderItems = () => <Item />;  // ← captured
+///   const renderItems = () => <Item />;  // ← captured (function)
+///   const modalProps = { actions, title }; // ← captured (object)
 ///   return <Parent>{renderItems()}</Parent>;
 /// };
 /// ```
-fn build_local_fn_map<'a>(stmts: &'a [Statement<'a>], source: &str) -> LocalFnMap<'a> {
-    let mut map = LocalFnMap::new();
+fn build_local_expr_map<'a>(stmts: &'a [Statement<'a>], source: &str) -> LocalExprMap<'a> {
+    let mut map = LocalExprMap::new();
     for stmt in stmts {
-        collect_fn_declarations_from_stmt(stmt, source, &mut map);
+        collect_expr_declarations_from_stmt(stmt, source, &mut map);
     }
     map
 }
 
-fn collect_fn_declarations_from_stmt<'a>(
+fn collect_expr_declarations_from_stmt<'a>(
     stmt: &'a Statement<'a>,
     source: &str,
-    map: &mut LocalFnMap<'a>,
+    map: &mut LocalExprMap<'a>,
 ) {
     let var_decl = match stmt {
         Statement::VariableDeclaration(v) => Some(v.as_ref()),
@@ -181,44 +195,39 @@ fn collect_fn_declarations_from_stmt<'a>(
     if let Some(var_decl) = var_decl {
         for declarator in &var_decl.declarations {
             if let Some(init) = &declarator.init {
-                let is_fn = matches!(
-                    init,
-                    Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
-                );
-                if is_fn {
-                    // Register this function
-                    let id_span = declarator.id.span();
-                    let start = id_span.start as usize;
-                    let end = id_span.end as usize;
-                    if let Some(name_str) = source.get(start..end) {
-                        let name = name_str.split(':').next().unwrap_or("").trim();
-                        if !name.is_empty() {
-                            map.insert(name.to_string(), init);
-                        }
+                // Register the expression (function, object, or any other type)
+                let id_span = declarator.id.span();
+                let start = id_span.start as usize;
+                let end = id_span.end as usize;
+                if let Some(name_str) = source.get(start..end) {
+                    // Strip optional type annotation (e.g., "props: ModalProps" → "props")
+                    let name = name_str.split(':').next().unwrap_or("").trim();
+                    if !name.is_empty() {
+                        map.insert(name.to_string(), init);
                     }
-                    // Recurse into the function body to find nested declarations
-                    collect_fn_declarations_from_expr(init, source, map);
                 }
+                // Recurse into function/arrow bodies to find nested declarations
+                collect_expr_declarations_from_body(init, source, map);
             }
         }
     }
 }
 
-fn collect_fn_declarations_from_expr<'a>(
+fn collect_expr_declarations_from_body<'a>(
     expr: &'a Expression<'a>,
     source: &str,
-    map: &mut LocalFnMap<'a>,
+    map: &mut LocalExprMap<'a>,
 ) {
     match expr {
         Expression::ArrowFunctionExpression(arrow) => {
             for stmt in &arrow.body.statements {
-                collect_fn_declarations_from_stmt(stmt, source, map);
+                collect_expr_declarations_from_stmt(stmt, source, map);
             }
         }
         Expression::FunctionExpression(func) => {
             if let Some(body) = &func.body {
                 for stmt in &body.statements {
-                    collect_fn_declarations_from_stmt(stmt, source, map);
+                    collect_expr_declarations_from_stmt(stmt, source, map);
                 }
             }
         }
@@ -285,7 +294,7 @@ pub fn scan_jsx_file_with_resolver<'a>(
     resolver: Option<&Resolver>,
     file_path: Option<&Path>,
 ) -> Vec<Incident> {
-    let local_fns = build_local_fn_map(stmts, source);
+    let local_exprs = build_local_expr_map(stmts, source);
     let mut incidents = Vec::new();
     let mut ctx = ScanContext {
         source,
@@ -294,7 +303,7 @@ pub fn scan_jsx_file_with_resolver<'a>(
         location,
         incidents: &mut incidents,
         import_map,
-        local_fns: &local_fns,
+        local_exprs: &local_exprs,
         child,
         not_child,
         requires_child,
@@ -318,7 +327,7 @@ pub fn scan_jsx(
     location: Option<&ReferenceLocation>,
     import_map: &ImportMap,
 ) -> Vec<Incident> {
-    let empty_fns = LocalFnMap::new();
+    let empty_exprs = LocalExprMap::new();
     let empty_transparent = HashMap::new();
     let mut incidents = Vec::new();
     let mut ctx = ScanContext {
@@ -328,7 +337,7 @@ pub fn scan_jsx(
         location,
         incidents: &mut incidents,
         import_map,
-        local_fns: &empty_fns,
+        local_exprs: &empty_exprs,
         child: None,
         not_child: None,
         requires_child: None,
@@ -585,7 +594,7 @@ fn walk_jsx_expression(
             // the parent element (e.g., <Dropdown>).
             if let Expression::Identifier(ident) = &call.callee {
                 let callee_name = ident.name.as_str();
-                if let Some(fn_expr) = ctx.local_fns.get(callee_name) {
+                if let Some(fn_expr) = ctx.local_exprs.get(callee_name) {
                     // Guard against cycles (same logic as resolve_local_fn_reference)
                     if ctx.resolving_fns.contains(callee_name) {
                         tracing::debug!(
@@ -657,7 +666,7 @@ fn is_children_passthrough_expression(expr: &JSXExpression<'_>) -> bool {
 /// When an identifier like `toggle` is encountered in a JSX expression context
 /// (either as a prop value `toggle={toggle}` or as a child `{toggle}`):
 ///
-/// 1. Check the `LocalFnMap` for a same-file function definition.
+/// 1. Check the `LocalExprMap` for a same-file function definition.
 /// 2. If not found and the name is an import, resolve the import cross-file
 ///    using the `oxc_resolver`, parse the target file, find the exported
 ///    function, and walk its JSX body with the current parent context.
@@ -676,8 +685,8 @@ fn resolve_local_fn_reference(
     parent_name: Option<&str>,
     depth: usize,
 ) {
-    // 1. Same-file: check LocalFnMap
-    if let Some(fn_expr) = ctx.local_fns.get(name) {
+    // 1. Same-file: check LocalExprMap
+    if let Some(fn_expr) = ctx.local_exprs.get(name) {
         // Guard against cycles: if we're already resolving this function,
         // we've hit a recursive reference (e.g., renderA → renderB → renderA).
         if ctx.resolving_fns.contains(name) {
@@ -743,17 +752,35 @@ fn resolve_local_fn_reference(
     );
 }
 
-/// Parse a resolved file and walk the exported function's JSX body with
-/// the given parent context. This is the cross-file resolution workhorse.
-fn resolve_cross_file_fn(
+/// What was found when resolving a named export across files.
+enum ResolvedExport<'a> {
+    /// A variable initializer expression: `export const x = <expr>`
+    /// Covers arrow functions, function expressions, object literals, etc.
+    Expression(&'a Expression<'a>),
+    /// A function declaration body: `export function x() { <body> }`
+    FunctionBody(&'a FunctionBody<'a>),
+}
+
+/// Resolve a named export from a file's source text, following re-export chains.
+///
+/// This is the shared cross-file resolution infrastructure used by both the
+/// JSX walker (for parent context propagation through function references)
+/// and the spread prop scanner (for identifier/function-call spread resolution).
+///
+/// Parses the file, finds the named export (variable initializer, function
+/// declaration, or default export), and calls `on_found` with a `ResolvedExport`.
+/// If the name is re-exported from another file, follows the chain recursively
+/// up to `MAX_REEXPORT_DEPTH`.
+fn resolve_cross_file_export<F>(
     name: &str,
     source_text: &str,
-    ctx: &mut ScanContext,
-    parent_name: Option<&str>,
     resolver: &Resolver,
     resolved_path: &Path,
     depth: usize,
-) {
+    on_found: &mut F,
+) where
+    F: FnMut(ResolvedExport<'_>),
+{
     if depth > MAX_REEXPORT_DEPTH {
         tracing::warn!(
             "re-export chain depth exceeded {} for '{}' at {}",
@@ -771,59 +798,53 @@ fn resolve_cross_file_fn(
         return;
     }
 
-    // Build the local fn map for the resolved file so we can find the export
-    let remote_fns = build_local_fn_map(&ret.program.body, source_text);
+    // Build expression map for the resolved file
+    let remote_exprs = build_local_expr_map(&ret.program.body, source_text);
 
-    // Check if the function is in the local fn map (covers `export const toggle = ...`)
-    if let Some(fn_expr) = remote_fns.get(name) {
-        // Walk the function body using OUR context (pattern, incidents, etc.)
-        // but with parent_name from the call site.
-        match fn_expr {
-            Expression::ArrowFunctionExpression(arrow) => {
-                walk_function_body(&arrow.body, ctx, parent_name);
-            }
-            Expression::FunctionExpression(func) => {
-                if let Some(body) = &func.body {
-                    walk_function_body(body, ctx, parent_name);
-                }
-            }
-            _ => {}
-        }
+    // Check variable declarations: `export const x = <expr>`
+    if let Some(expr) = remote_exprs.get(name) {
+        on_found(ResolvedExport::Expression(expr));
         return;
     }
 
-    // Check for `export function toggle(...)` declarations
+    // Check function declarations: `export function x() { ... }`
     for stmt in &ret.program.body {
         if let Statement::ExportNamedDeclaration(export) = stmt {
             if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
                 let fn_name = func.id.as_ref().map(|id| id.name.as_str()).unwrap_or("");
                 if fn_name == name {
                     if let Some(body) = &func.body {
-                        walk_function_body(body, ctx, parent_name);
+                        on_found(ResolvedExport::FunctionBody(body));
                     }
                     return;
                 }
             }
         }
-        // Also check `export default function` when the import is "default"
+        // `export default function` when the import is "default"
         if let Statement::ExportDefaultDeclaration(export) = stmt {
             if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
                 if let Some(body) = &func.body {
-                    walk_function_body(body, ctx, parent_name);
+                    on_found(ResolvedExport::FunctionBody(body));
                 }
+                return;
+            }
+            // `export default <expr>` (arrow, object, etc.)
+            // ExportDefaultDeclarationKind inherits Expression variants via
+            // the inherit_variants! macro, so use as_expression() to extract.
+            if let Some(expr) = export.declaration.as_expression() {
+                on_found(ResolvedExport::Expression(expr));
                 return;
             }
         }
     }
 
-    // Follow re-exports: `export { toggle } from './otherFile'`
+    // Follow named re-exports: `export { toggle } from './otherFile'`
     for stmt in &ret.program.body {
         if let Statement::ExportNamedDeclaration(export) = stmt {
             if let Some(ref source) = export.source {
                 for spec in &export.specifiers {
                     let exported_name = spec.exported.name();
                     if exported_name == name {
-                        // Resolve the re-export target
                         let local_name = spec.local.name().to_string();
                         if let Some(re_resolved) = crate::resolve::resolve_import_with_resolver(
                             resolver,
@@ -832,14 +853,13 @@ fn resolve_cross_file_fn(
                         ) {
                             if !crate::resolve::is_node_modules_path(&re_resolved) {
                                 if let Ok(re_source) = std::fs::read_to_string(&re_resolved) {
-                                    resolve_cross_file_fn(
+                                    resolve_cross_file_export(
                                         &local_name,
                                         &re_source,
-                                        ctx,
-                                        parent_name,
                                         resolver,
                                         &re_resolved,
                                         depth + 1,
+                                        on_found,
                                     );
                                 }
                             }
@@ -858,20 +878,56 @@ fn resolve_cross_file_fn(
             ) {
                 if !crate::resolve::is_node_modules_path(&re_resolved) {
                     if let Ok(re_source) = std::fs::read_to_string(&re_resolved) {
-                        resolve_cross_file_fn(
+                        resolve_cross_file_export(
                             name,
                             &re_source,
-                            ctx,
-                            parent_name,
                             resolver,
                             &re_resolved,
                             depth + 1,
+                            on_found,
                         );
                     }
                 }
             }
         }
     }
+}
+
+/// Parse a resolved file and walk the exported function's JSX body with
+/// the given parent context. Thin wrapper around `resolve_cross_file_export`
+/// that provides the JSX-walking callback.
+fn resolve_cross_file_fn(
+    name: &str,
+    source_text: &str,
+    ctx: &mut ScanContext,
+    parent_name: Option<&str>,
+    resolver: &Resolver,
+    resolved_path: &Path,
+    depth: usize,
+) {
+    resolve_cross_file_export(
+        name,
+        source_text,
+        resolver,
+        resolved_path,
+        depth,
+        &mut |export| match export {
+            ResolvedExport::Expression(expr) => match expr {
+                Expression::ArrowFunctionExpression(arrow) => {
+                    walk_function_body(&arrow.body, ctx, parent_name);
+                }
+                Expression::FunctionExpression(func) => {
+                    if let Some(body) = &func.body {
+                        walk_function_body(body, ctx, parent_name);
+                    }
+                }
+                _ => {}
+            },
+            ResolvedExport::FunctionBody(body) => {
+                walk_function_body(body, ctx, parent_name);
+            }
+        },
+    );
 }
 
 /// Extract all string literal values from an `ObjectExpression` (non-JSX context).
@@ -1195,7 +1251,7 @@ fn check_typed_object_literal(
 /// conditionals, arrow functions, etc.
 fn collect_child_components(
     children: &[JSXChild<'_>],
-    local_fns: &LocalFnMap,
+    local_exprs: &LocalExprMap,
 ) -> Vec<(String, oxc_span::Span)> {
     let mut results = Vec::new();
     for child in children {
@@ -1206,10 +1262,10 @@ fn collect_child_components(
                 results.push((name, span));
             }
             JSXChild::Fragment(frag) => {
-                results.extend(collect_child_components(&frag.children, local_fns));
+                results.extend(collect_child_components(&frag.children, local_exprs));
             }
             JSXChild::ExpressionContainer(container) => {
-                collect_names_from_jsx_expression(&container.expression, local_fns, &mut results);
+                collect_names_from_jsx_expression(&container.expression, local_exprs, &mut results);
             }
             _ => {}
         }
@@ -1221,7 +1277,7 @@ fn collect_child_components(
 /// but collects names instead of emitting incidents.
 fn collect_names_from_jsx_expression(
     jsx_expr: &JSXExpression<'_>,
-    local_fns: &LocalFnMap,
+    local_exprs: &LocalExprMap,
     results: &mut Vec<(String, oxc_span::Span)>,
 ) {
     match jsx_expr {
@@ -1232,32 +1288,32 @@ fn collect_names_from_jsx_expression(
             results.push((name, span));
         }
         JSXExpression::JSXFragment(frag) => {
-            results.extend(collect_child_components(&frag.children, local_fns));
+            results.extend(collect_child_components(&frag.children, local_exprs));
         }
         JSXExpression::ParenthesizedExpression(paren) => {
-            collect_names_from_expression(&paren.expression, local_fns, results);
+            collect_names_from_expression(&paren.expression, local_exprs, results);
         }
         JSXExpression::ArrowFunctionExpression(arrow) => {
-            collect_names_from_fn_body(&arrow.body, local_fns, results);
+            collect_names_from_fn_body(&arrow.body, local_exprs, results);
         }
         JSXExpression::ConditionalExpression(cond) => {
-            collect_names_from_expression(&cond.consequent, local_fns, results);
-            collect_names_from_expression(&cond.alternate, local_fns, results);
+            collect_names_from_expression(&cond.consequent, local_exprs, results);
+            collect_names_from_expression(&cond.alternate, local_exprs, results);
         }
         JSXExpression::LogicalExpression(logic) => {
-            collect_names_from_expression(&logic.right, local_fns, results);
+            collect_names_from_expression(&logic.right, local_exprs, results);
         }
         JSXExpression::CallExpression(call) => {
             // Resolve local function calls
             if let Expression::Identifier(ident) = &call.callee {
-                if let Some(fn_expr) = local_fns.get(ident.name.as_str()) {
+                if let Some(fn_expr) = local_exprs.get(ident.name.as_str()) {
                     match fn_expr {
                         Expression::ArrowFunctionExpression(arrow) => {
-                            collect_names_from_fn_body(&arrow.body, local_fns, results);
+                            collect_names_from_fn_body(&arrow.body, local_exprs, results);
                         }
                         Expression::FunctionExpression(func) => {
                             if let Some(body) = &func.body {
-                                collect_names_from_fn_body(body, local_fns, results);
+                                collect_names_from_fn_body(body, local_exprs, results);
                             }
                         }
                         _ => {}
@@ -1267,9 +1323,9 @@ fn collect_names_from_jsx_expression(
             // Walk call arguments
             for arg in &call.arguments {
                 if let Argument::SpreadElement(spread) = arg {
-                    collect_names_from_expression(&spread.argument, local_fns, results);
+                    collect_names_from_expression(&spread.argument, local_exprs, results);
                 } else if let Some(expr) = arg.as_expression() {
-                    collect_names_from_expression(expr, local_fns, results);
+                    collect_names_from_expression(expr, local_exprs, results);
                 }
             }
         }
@@ -1277,9 +1333,9 @@ fn collect_names_from_jsx_expression(
             if let ChainElement::CallExpression(call) = &chain.expression {
                 for arg in &call.arguments {
                     if let Argument::SpreadElement(spread) = arg {
-                        collect_names_from_expression(&spread.argument, local_fns, results);
+                        collect_names_from_expression(&spread.argument, local_exprs, results);
                     } else if let Some(expr) = arg.as_expression() {
-                        collect_names_from_expression(expr, local_fns, results);
+                        collect_names_from_expression(expr, local_exprs, results);
                     }
                 }
             }
@@ -1289,11 +1345,11 @@ fn collect_names_from_jsx_expression(
             for elem in &arr.elements {
                 match elem {
                     ArrayExpressionElement::SpreadElement(spread) => {
-                        collect_names_from_expression(&spread.argument, local_fns, results);
+                        collect_names_from_expression(&spread.argument, local_exprs, results);
                     }
                     _ => {
                         if let Some(expr) = elem.as_expression() {
-                            collect_names_from_expression(expr, local_fns, results);
+                            collect_names_from_expression(expr, local_exprs, results);
                         }
                     }
                 }
@@ -1306,7 +1362,7 @@ fn collect_names_from_jsx_expression(
 /// Walk an Expression to collect component names. Mirrors `walk_expression_for_jsx`.
 fn collect_names_from_expression(
     expr: &Expression<'_>,
-    local_fns: &LocalFnMap,
+    local_exprs: &LocalExprMap,
     results: &mut Vec<(String, oxc_span::Span)>,
 ) {
     match expr {
@@ -1316,27 +1372,27 @@ fn collect_names_from_expression(
             results.push((name, span));
         }
         Expression::JSXFragment(frag) => {
-            results.extend(collect_child_components(&frag.children, local_fns));
+            results.extend(collect_child_components(&frag.children, local_exprs));
         }
         Expression::ParenthesizedExpression(paren) => {
-            collect_names_from_expression(&paren.expression, local_fns, results);
+            collect_names_from_expression(&paren.expression, local_exprs, results);
         }
         Expression::ConditionalExpression(cond) => {
-            collect_names_from_expression(&cond.consequent, local_fns, results);
-            collect_names_from_expression(&cond.alternate, local_fns, results);
+            collect_names_from_expression(&cond.consequent, local_exprs, results);
+            collect_names_from_expression(&cond.alternate, local_exprs, results);
         }
         Expression::LogicalExpression(logic) => {
-            collect_names_from_expression(&logic.right, local_fns, results);
+            collect_names_from_expression(&logic.right, local_exprs, results);
         }
         Expression::ArrowFunctionExpression(arrow) => {
-            collect_names_from_fn_body(&arrow.body, local_fns, results);
+            collect_names_from_fn_body(&arrow.body, local_exprs, results);
         }
         Expression::CallExpression(call) => {
             for arg in &call.arguments {
                 if let Argument::SpreadElement(spread) = arg {
-                    collect_names_from_expression(&spread.argument, local_fns, results);
+                    collect_names_from_expression(&spread.argument, local_exprs, results);
                 } else if let Some(expr) = arg.as_expression() {
-                    collect_names_from_expression(expr, local_fns, results);
+                    collect_names_from_expression(expr, local_exprs, results);
                 }
             }
         }
@@ -1344,9 +1400,9 @@ fn collect_names_from_expression(
             if let ChainElement::CallExpression(call) = &chain.expression {
                 for arg in &call.arguments {
                     if let Argument::SpreadElement(spread) = arg {
-                        collect_names_from_expression(&spread.argument, local_fns, results);
+                        collect_names_from_expression(&spread.argument, local_exprs, results);
                     } else if let Some(expr) = arg.as_expression() {
-                        collect_names_from_expression(expr, local_fns, results);
+                        collect_names_from_expression(expr, local_exprs, results);
                     }
                 }
             }
@@ -1356,11 +1412,11 @@ fn collect_names_from_expression(
             for elem in &arr.elements {
                 match elem {
                     ArrayExpressionElement::SpreadElement(spread) => {
-                        collect_names_from_expression(&spread.argument, local_fns, results);
+                        collect_names_from_expression(&spread.argument, local_exprs, results);
                     }
                     _ => {
                         if let Some(expr) = elem.as_expression() {
-                            collect_names_from_expression(expr, local_fns, results);
+                            collect_names_from_expression(expr, local_exprs, results);
                         }
                     }
                 }
@@ -1373,21 +1429,298 @@ fn collect_names_from_expression(
 /// Walk a FunctionBody to collect component names from return statements.
 fn collect_names_from_fn_body(
     body: &FunctionBody<'_>,
-    local_fns: &LocalFnMap,
+    local_exprs: &LocalExprMap,
     results: &mut Vec<(String, oxc_span::Span)>,
 ) {
     for stmt in &body.statements {
         match stmt {
             Statement::ReturnStatement(ret) => {
                 if let Some(arg) = &ret.argument {
-                    collect_names_from_expression(arg, local_fns, results);
+                    collect_names_from_expression(arg, local_exprs, results);
                 }
             }
             Statement::ExpressionStatement(expr) => {
-                collect_names_from_expression(&expr.expression, local_fns, results);
+                collect_names_from_expression(&expr.expression, local_exprs, results);
             }
             _ => {}
         }
+    }
+}
+
+/// Context needed for spread prop resolution, separated from `ScanContext`
+/// to avoid borrow conflicts when the cross-file resolver callback needs
+/// mutable access to the results vector.
+struct SpreadResolveCtx<'a, 'b> {
+    local_exprs: &'b LocalExprMap<'a>,
+    import_map: &'b ImportMap,
+    resolver: Option<&'b Resolver>,
+    file_path: Option<&'b Path>,
+}
+
+/// Extract property names from a spread expression.
+///
+/// Analyzes the expression inside a JSX spread attribute (`{...expr}`) and
+/// returns a list of `(property_name, span)` pairs for any property names
+/// that can be statically determined.
+///
+/// Handles these patterns:
+/// - Object literal: `{...{ actions, title }}` → `["actions", "title"]`
+/// - Parenthesized: `{...(expr)}` → unwrap and recurse
+/// - Logical AND: `{...(x && { actions })}` → check right-hand object
+/// - Ternary: `{...(cond ? { actions } : {})}` → check both branches
+/// - Identifier: `{...modalProps}` → resolve via `LocalExprMap` or cross-file
+/// - Function call: `{...getProps()}` → resolve function, extract return object props
+///
+/// Does NOT handle rest spreads (`const { x, ...rest } = props`).
+fn extract_spread_prop_names(
+    expr: &Expression<'_>,
+    spread_ctx: &SpreadResolveCtx,
+) -> Vec<(String, oxc_span::Span)> {
+    let mut results = Vec::new();
+    collect_spread_props(expr, spread_ctx, &mut results);
+    results
+}
+
+/// Recursively collect property names from a spread expression into `results`.
+fn collect_spread_props(
+    expr: &Expression<'_>,
+    spread_ctx: &SpreadResolveCtx,
+    results: &mut Vec<(String, oxc_span::Span)>,
+) {
+    match expr {
+        // Direct object literal: {...{ actions, title, onClose }}
+        Expression::ObjectExpression(obj) => {
+            collect_props_from_object(obj, results);
+        }
+        // Parenthesized: {...(expr)} — unwrap and recurse
+        Expression::ParenthesizedExpression(paren) => {
+            collect_spread_props(&paren.expression, spread_ctx, results);
+        }
+        // Logical AND: {...(actions && { actions })}
+        // The right side is the object that gets spread when the condition is truthy.
+        Expression::LogicalExpression(logic) => {
+            if logic.operator == LogicalOperator::And {
+                collect_spread_props(&logic.right, spread_ctx, results);
+            }
+            // For OR (||) and nullish coalescing (??), both sides could provide props.
+            // These patterns are rare in JSX spreads, so skip for now.
+        }
+        // Ternary: {...(cond ? { actions } : {})}
+        // Both branches may supply props.
+        Expression::ConditionalExpression(cond) => {
+            collect_spread_props(&cond.consequent, spread_ctx, results);
+            collect_spread_props(&cond.alternate, spread_ctx, results);
+        }
+        // Identifier: {...modalProps} — resolve to a local variable or cross-file import
+        Expression::Identifier(ident) => {
+            let name = ident.name.as_str();
+            // Try local first
+            if let Some(local_expr) = spread_ctx.local_exprs.get(name) {
+                match local_expr {
+                    Expression::ObjectExpression(obj) => {
+                        collect_props_from_object(obj, results);
+                    }
+                    // Local variable is a function: extract return object props
+                    // e.g., const getProps = () => ({ actions, title });
+                    Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {
+                        extract_return_object_props(local_expr, results);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            // Cross-file: check import_map, resolve, parse, extract
+            let module_source = match spread_ctx.import_map.get(name) {
+                Some(m) => m.clone(),
+                None => return,
+            };
+            let (resolver, file_path) = match (spread_ctx.resolver, spread_ctx.file_path) {
+                (Some(r), Some(p)) => (r, p),
+                _ => return,
+            };
+            let resolved_path = match crate::resolve::resolve_import_with_resolver(
+                resolver,
+                file_path,
+                &module_source,
+            ) {
+                Some(p) => p,
+                None => return,
+            };
+            if crate::resolve::is_node_modules_path(&resolved_path) {
+                return;
+            }
+            let source_text = match std::fs::read_to_string(&resolved_path) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            resolve_cross_file_export(
+                name,
+                &source_text,
+                resolver,
+                &resolved_path,
+                0,
+                &mut |export| match export {
+                    ResolvedExport::Expression(Expression::ObjectExpression(obj)) => {
+                        collect_props_from_object(&obj, results);
+                    }
+                    ResolvedExport::Expression(
+                        fn_expr @ Expression::ArrowFunctionExpression(_),
+                    )
+                    | ResolvedExport::Expression(fn_expr @ Expression::FunctionExpression(_)) => {
+                        extract_return_object_props(fn_expr, results);
+                    }
+                    ResolvedExport::FunctionBody(body) => {
+                        extract_return_object_props_from_body(body, results);
+                    }
+                    _ => {}
+                },
+            );
+        }
+        // Function call: {...getProps()} — resolve function, extract return object
+        Expression::CallExpression(call) => {
+            if let Expression::Identifier(ident) = &call.callee {
+                let name = ident.name.as_str();
+                // Try local function
+                if let Some(fn_expr) = spread_ctx.local_exprs.get(name) {
+                    extract_return_object_props(fn_expr, results);
+                    return;
+                }
+                // Cross-file function
+                let module_source = match spread_ctx.import_map.get(name) {
+                    Some(m) => m.clone(),
+                    None => return,
+                };
+                let (resolver, file_path) = match (spread_ctx.resolver, spread_ctx.file_path) {
+                    (Some(r), Some(p)) => (r, p),
+                    _ => return,
+                };
+                let resolved_path = match crate::resolve::resolve_import_with_resolver(
+                    resolver,
+                    file_path,
+                    &module_source,
+                ) {
+                    Some(p) => p,
+                    None => return,
+                };
+                if crate::resolve::is_node_modules_path(&resolved_path) {
+                    return;
+                }
+                let source_text = match std::fs::read_to_string(&resolved_path) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                resolve_cross_file_export(
+                    name,
+                    &source_text,
+                    resolver,
+                    &resolved_path,
+                    0,
+                    &mut |export| match export {
+                        ResolvedExport::Expression(fn_expr) => {
+                            extract_return_object_props(fn_expr, results);
+                        }
+                        ResolvedExport::FunctionBody(body) => {
+                            extract_return_object_props_from_body(body, results);
+                        }
+                    },
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract object property names from a function's return value.
+///
+/// Handles:
+/// - Concise arrow body: `() => ({ actions, title })` — expression is the return
+/// - Block body with return: `() => { return { actions }; }` — find ReturnStatement
+fn extract_return_object_props(
+    fn_expr: &Expression<'_>,
+    results: &mut Vec<(String, oxc_span::Span)>,
+) {
+    match fn_expr {
+        Expression::ArrowFunctionExpression(arrow) => {
+            // Check for concise body (expression return)
+            if arrow.expression {
+                // The last statement should be an ExpressionStatement wrapping the return
+                if let Some(Statement::ExpressionStatement(expr_stmt)) =
+                    arrow.body.statements.last()
+                {
+                    extract_obj_props_from_return_expr(&expr_stmt.expression, results);
+                }
+            } else {
+                extract_return_object_props_from_body(&arrow.body, results);
+            }
+        }
+        Expression::FunctionExpression(func) => {
+            if let Some(body) = &func.body {
+                extract_return_object_props_from_body(body, results);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract object property names from return statements in a function body.
+fn extract_return_object_props_from_body(
+    body: &FunctionBody<'_>,
+    results: &mut Vec<(String, oxc_span::Span)>,
+) {
+    for stmt in &body.statements {
+        if let Statement::ReturnStatement(ret) = stmt {
+            if let Some(arg) = &ret.argument {
+                extract_obj_props_from_return_expr(arg, results);
+            }
+        }
+    }
+}
+
+/// Extract object properties from a return expression, unwrapping parentheses
+/// and type assertions.
+fn extract_obj_props_from_return_expr(
+    expr: &Expression<'_>,
+    results: &mut Vec<(String, oxc_span::Span)>,
+) {
+    match expr {
+        Expression::ObjectExpression(obj) => {
+            collect_props_from_object(obj, results);
+        }
+        Expression::ParenthesizedExpression(paren) => {
+            extract_obj_props_from_return_expr(&paren.expression, results);
+        }
+        Expression::TSAsExpression(as_expr) => {
+            extract_obj_props_from_return_expr(&as_expr.expression, results);
+        }
+        Expression::TSSatisfiesExpression(sat) => {
+            extract_obj_props_from_return_expr(&sat.expression, results);
+        }
+        _ => {}
+    }
+}
+
+/// Extract property names and their spans from an object expression.
+///
+/// Handles shorthand properties (`{ actions }`) and regular properties
+/// (`{ actions: [...] }`). Skips computed properties and spread elements.
+fn collect_props_from_object(
+    obj: &ObjectExpression<'_>,
+    results: &mut Vec<(String, oxc_span::Span)>,
+) {
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            let key_name = match &p.key {
+                PropertyKey::StaticIdentifier(ident) => Some((ident.name.to_string(), ident.span)),
+                PropertyKey::StringLiteral(s) => Some((s.value.to_string(), s.span)),
+                _ => None, // computed keys like [expr] — skip
+            };
+            if let Some((name, span)) = key_name {
+                results.push((name, span));
+            }
+        }
+        // ObjectPropertyKind::SpreadProperty — nested spreads inside the object.
+        // e.g., {...{ ...baseProps, actions }}. We could recurse into these but
+        // it adds complexity for a rare pattern. Skip for now.
     }
 }
 
@@ -1428,7 +1761,7 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
         // This is used by all three child-matching scanners below.
         let all_children =
             if ctx.child.is_some() || ctx.not_child.is_some() || ctx.requires_child.is_some() {
-                collect_child_components(&el.children, ctx.local_fns)
+                collect_child_components(&el.children, ctx.local_exprs)
             } else {
                 Vec::new()
             };
@@ -1619,14 +1952,68 @@ fn check_jsx_element(el: &JSXElement<'_>, ctx: &mut ScanContext, parent_name: Op
                 }
             }
         }
+
+        // Check spread attributes for prop names that match the pattern.
+        // This catches patterns like:
+        //   <Modal {...(actions && { actions })}>   — conditional spread
+        //   <Modal {...{ actions, title }}>         — object literal spread
+        //   <Modal {...modalProps}>                 — identifier spread (local or cross-file)
+        //   <Modal {...(cond ? { actions } : {})}>  — ternary spread
+        //   <Modal {...getProps()}>                 — function call spread (local or cross-file)
+        //
+        // Incidents from spread scanning include a `spreadSource` variable
+        // set to "true" so consumers can distinguish them from direct props.
+        let spread_ctx = SpreadResolveCtx {
+            local_exprs: ctx.local_exprs,
+            import_map: ctx.import_map,
+            resolver: ctx.resolver,
+            file_path: ctx.file_path,
+        };
+        for attr in &opening.attributes {
+            if let JSXAttributeItem::SpreadAttribute(spread) = attr {
+                let spread_props = extract_spread_prop_names(&spread.argument, &spread_ctx);
+                for (prop_name, span) in spread_props {
+                    if ctx.pattern.is_match(&prop_name) {
+                        let mut incident =
+                            make_incident(ctx.source, ctx.file_uri, span.start, span.end);
+                        incident
+                            .variables
+                            .insert("propName".into(), serde_json::Value::String(prop_name));
+                        incident.variables.insert(
+                            "componentName".into(),
+                            serde_json::Value::String(component_name.clone()),
+                        );
+                        incident.variables.insert(
+                            "spreadSource".into(),
+                            serde_json::Value::String("true".to_string()),
+                        );
+                        // Resolve the owning component's import source so
+                        // that the `from` filter can check it.
+                        if let Some(module) = ctx.import_map.get(&component_name) {
+                            incident
+                                .variables
+                                .insert("module".into(), serde_json::Value::String(module.clone()));
+                        }
+                        ctx.incidents.push(incident);
+                    }
+                }
+            }
+        }
     }
 
     // Walk into prop value expressions to find nested JSX elements.
     // e.g., toggle={ref => (<MenuToggle ...>)} or icon={<Icon />}
     for attr in &opening.attributes {
-        if let JSXAttributeItem::Attribute(a) = attr {
-            if let Some(JSXAttributeValue::ExpressionContainer(expr)) = &a.value {
-                walk_jsx_expression(&expr.expression, ctx, Some(&component_name));
+        match attr {
+            JSXAttributeItem::Attribute(a) => {
+                if let Some(JSXAttributeValue::ExpressionContainer(expr)) = &a.value {
+                    walk_jsx_expression(&expr.expression, ctx, Some(&component_name));
+                }
+            }
+            // Also walk spread attribute expressions for nested JSX.
+            // e.g., {...(condition && <Nested />)} or spread objects containing JSX values.
+            JSXAttributeItem::SpreadAttribute(spread) => {
+                walk_expression_for_jsx(&spread.argument, ctx, Some(&component_name));
             }
         }
     }
@@ -3540,6 +3927,375 @@ const el = (
         assert!(
             resolved.is_some(),
             "Should have ToolbarItem with parentName=ToolbarContent"
+        );
+    }
+
+    // ── Spread attribute tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_jsx_prop_spread_object_literal() {
+        // Direct object literal spread: {...{ actions, title }}
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const el = <Modal {...{ actions: [], title: "Hi" }}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("actions".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("componentName"),
+            Some(&serde_json::Value::String("Modal".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("spreadSource"),
+            Some(&serde_json::Value::String("true".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_conditional_and() {
+        // Conditional spread with logical AND: {...(actions && { actions })}
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const actions = [<button>Close</button>];
+const el = <Modal {...(actions && { actions })}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect 'actions' in conditional spread"
+        );
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("actions".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("spreadSource"),
+            Some(&serde_json::Value::String("true".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_ternary() {
+        // Ternary spread: {...(isOpen ? { actions } : {})}
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const isOpen = true;
+const el = <Modal {...(isOpen ? { actions: [] } : {})}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect 'actions' in ternary spread"
+        );
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("actions".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_identifier_resolved() {
+        // Identifier spread resolved via LocalExprMap: {...modalProps}
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const modalProps = { actions: [], title: "Hello", onClose: () => {} };
+const el = <Modal {...modalProps}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should resolve 'actions' from modalProps variable"
+        );
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("actions".to_string()))
+        );
+        assert_eq!(
+            incidents[0].variables.get("spreadSource"),
+            Some(&serde_json::Value::String("true".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_identifier_multiple_props() {
+        // Multiple matching props from an identifier spread
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const modalProps = { actions: [], title: "Hello", header: <div /> };
+const el = <Modal {...modalProps}>content</Modal>;
+"#;
+        // Match both actions and title
+        let incidents = scan_source_jsx(
+            source,
+            r"^(actions|title)$",
+            Some(&ReferenceLocation::JsxProp),
+        );
+        assert_eq!(incidents.len(), 2, "Should find both 'actions' and 'title'");
+        let prop_names: Vec<&str> = incidents
+            .iter()
+            .filter_map(|i| i.variables.get("propName").and_then(|v| v.as_str()))
+            .collect();
+        assert!(prop_names.contains(&"actions"));
+        assert!(prop_names.contains(&"title"));
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_unresolvable_identifier() {
+        // Unresolvable identifier spread — should NOT produce incidents
+        // (avoids false positives when we can't determine what's being spread)
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const el = <Modal {...props}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert!(
+            incidents.is_empty(),
+            "Should not produce incidents for unresolvable spread identifiers"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_no_match() {
+        // Spread with props that don't match the pattern
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const el = <Modal {...{ title: "Hi", onClose: () => {} }}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert!(
+            incidents.is_empty(),
+            "Should not match when spread doesn't contain the target prop"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_with_module() {
+        // Verify spread incidents include the module from import_map
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const el = <Modal {...{ actions: [] }}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].variables.get("module"),
+            Some(&serde_json::Value::String(
+                "@patternfly/react-core".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_coexists_with_direct_prop() {
+        // Both a direct prop and a spread prop matching the same pattern
+        // should produce two incidents
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const el = <Modal title="direct" {...{ actions: [] }}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(
+            source,
+            r"^(title|actions)$",
+            Some(&ReferenceLocation::JsxProp),
+        );
+        assert_eq!(
+            incidents.len(),
+            2,
+            "Should find both direct prop and spread prop"
+        );
+        let direct = incidents
+            .iter()
+            .find(|i| i.variables.get("spreadSource").is_none());
+        let spread = incidents
+            .iter()
+            .find(|i| i.variables.get("spreadSource").is_some());
+        assert!(direct.is_some(), "Should have a direct prop incident");
+        assert!(spread.is_some(), "Should have a spread prop incident");
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_nested_in_component() {
+        // Spread inside a component function body
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const MyComponent = () => {
+    const opts = { actions: [], title: "Hi" };
+    return <Modal {...opts}>content</Modal>;
+};
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should resolve spread from variable inside component body"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_location_none_also_scans() {
+        // When location is None (scan all), spread props should still be found
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const el = <Modal {...{ actions: [] }}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", None);
+        let spread_incident = incidents.iter().find(|i| {
+            i.variables.get("spreadSource") == Some(&serde_json::Value::String("true".to_string()))
+        });
+        assert!(
+            spread_incident.is_some(),
+            "Should find spread props when location is None"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_shorthand_property() {
+        // Shorthand property in spread: {...{ actions }} (key === value)
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const actions = [<button>OK</button>];
+const el = <Modal {...{ actions }}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should detect shorthand property in spread"
+        );
+        assert_eq!(
+            incidents[0].variables.get("propName"),
+            Some(&serde_json::Value::String("actions".to_string()))
+        );
+    }
+
+    // ── Function call spread tests ──────────────────────────────────────
+
+    #[test]
+    fn test_jsx_prop_spread_local_fn_call_concise_arrow() {
+        // Concise arrow returning object: const getProps = () => ({ actions })
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const getProps = () => ({ actions: [], title: "Hi" });
+const el = <Modal {...getProps()}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should extract 'actions' from concise arrow return"
+        );
+        assert_eq!(
+            incidents[0].variables.get("spreadSource"),
+            Some(&serde_json::Value::String("true".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_local_fn_call_block_body() {
+        // Block body with return statement
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const getProps = () => {
+    return { actions: [], title: "Hi" };
+};
+const el = <Modal {...getProps()}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should extract 'actions' from block body return"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_local_fn_call_function_expression() {
+        // function expression (not arrow)
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const getProps = function() { return { actions: [] }; };
+const el = <Modal {...getProps()}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should extract 'actions' from function expression return"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_local_fn_call_no_match() {
+        // Function returns object but doesn't contain the target prop
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const getProps = () => ({ title: "Hi" });
+const el = <Modal {...getProps()}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert!(
+            incidents.is_empty(),
+            "Should not match when function return doesn't contain target prop"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_local_fn_call_unresolvable() {
+        // Function not in local scope — should not produce incidents
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const el = <Modal {...unknownFn()}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert!(
+            incidents.is_empty(),
+            "Should not produce incidents for unresolvable function calls"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_local_identifier_fn_return() {
+        // Identifier spread where the local variable is a function —
+        // should extract return object props
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const getProps = () => ({ actions: [], title: "Hi" });
+const el = <Modal {...getProps}>content</Modal>;
+"#;
+        // Note: {...getProps} spreads the function itself, not its return value.
+        // This should NOT match — the function is spread, not called.
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        // Function spread extracts return object props (since that's what
+        // the consumer likely means when spreading a function reference)
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should extract return object props from function identifier spread"
+        );
+    }
+
+    #[test]
+    fn test_jsx_prop_spread_parenthesized_return() {
+        // Parenthesized return: return ({ actions })
+        let source = r#"
+import { Modal } from '@patternfly/react-core';
+const getProps = () => {
+    return ({ actions: [], title: "Hi" });
+};
+const el = <Modal {...getProps()}>content</Modal>;
+"#;
+        let incidents = scan_source_jsx(source, r"^actions$", Some(&ReferenceLocation::JsxProp));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should handle parenthesized return expression"
         );
     }
 }

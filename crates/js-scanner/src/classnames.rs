@@ -29,29 +29,26 @@ fn walk_statement(
     incidents: &mut Vec<Incident>,
 ) {
     match stmt {
-        Statement::ExportDefaultDeclaration(decl) => {
-            if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &decl.declaration {
+        Statement::ExportDefaultDeclaration(decl) => match &decl.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
                 if let Some(body) = &func.body {
                     for s in &body.statements {
                         walk_statement(s, source, pattern, file_uri, incidents);
                     }
                 }
             }
-        }
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                walk_class_body(&class.body, source, pattern, file_uri, incidents);
+            }
+            _ => {
+                if let Some(expr) = decl.declaration.as_expression() {
+                    walk_expr(expr, source, pattern, file_uri, incidents);
+                }
+            }
+        },
         Statement::ExportNamedDeclaration(decl) => {
-            if let Some(Declaration::FunctionDeclaration(func)) = &decl.declaration {
-                if let Some(body) = &func.body {
-                    for s in &body.statements {
-                        walk_statement(s, source, pattern, file_uri, incidents);
-                    }
-                }
-            }
-            if let Some(Declaration::VariableDeclaration(v)) = &decl.declaration {
-                for d in &v.declarations {
-                    if let Some(init) = &d.init {
-                        walk_expr(init, source, pattern, file_uri, incidents);
-                    }
-                }
+            if let Some(ref declaration) = decl.declaration {
+                walk_declaration(declaration, source, pattern, file_uri, incidents);
             }
         }
         Statement::FunctionDeclaration(func) => {
@@ -67,6 +64,9 @@ fn walk_statement(
                     walk_expr(init, source, pattern, file_uri, incidents);
                 }
             }
+        }
+        Statement::ClassDeclaration(class) => {
+            walk_class_body(&class.body, source, pattern, file_uri, incidents);
         }
         Statement::ReturnStatement(ret) => {
             if let Some(arg) = &ret.argument {
@@ -131,6 +131,63 @@ fn walk_statement(
             walk_expr(&t.argument, source, pattern, file_uri, incidents);
         }
         _ => {}
+    }
+}
+
+fn walk_declaration(
+    decl: &Declaration<'_>,
+    source: &str,
+    pattern: &Regex,
+    file_uri: &str,
+    incidents: &mut Vec<Incident>,
+) {
+    match decl {
+        Declaration::FunctionDeclaration(func) => {
+            if let Some(body) = &func.body {
+                for s in &body.statements {
+                    walk_statement(s, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        Declaration::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                if let Some(init) = &d.init {
+                    walk_expr(init, source, pattern, file_uri, incidents);
+                }
+            }
+        }
+        Declaration::ClassDeclaration(class) => {
+            walk_class_body(&class.body, source, pattern, file_uri, incidents);
+        }
+        _ => {}
+    }
+}
+
+fn walk_class_body(
+    body: &ClassBody<'_>,
+    source: &str,
+    pattern: &Regex,
+    file_uri: &str,
+    incidents: &mut Vec<Incident>,
+) {
+    for element in &body.body {
+        match element {
+            // Standard methods: render() { ... }
+            ClassElement::MethodDefinition(method) => {
+                if let Some(body) = &method.value.body {
+                    for s in &body.statements {
+                        walk_statement(s, source, pattern, file_uri, incidents);
+                    }
+                }
+            }
+            // Arrow property methods: render = () => { ... }
+            ClassElement::PropertyDefinition(prop) => {
+                if let Some(init) = &prop.value {
+                    walk_expr(init, source, pattern, file_uri, incidents);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -277,6 +334,15 @@ fn walk_expr(
                 }
             }
         }
+        // Binary expressions: (<Spinner className="pf-v5-..." />) + text
+        Expression::BinaryExpression(bin) => {
+            walk_expr(&bin.left, source, pattern, file_uri, incidents);
+            walk_expr(&bin.right, source, pattern, file_uri, incidents);
+        }
+        // Unary expressions: !expr, typeof expr, void expr
+        Expression::UnaryExpression(unary) => {
+            walk_expr(&unary.argument, source, pattern, file_uri, incidents);
+        }
         // Static member expressions: styles.className (walk object in case it's complex)
         Expression::StaticMemberExpression(member) => {
             walk_expr(&member.object, source, pattern, file_uri, incidents);
@@ -285,6 +351,10 @@ fn walk_expr(
         Expression::ComputedMemberExpression(member) => {
             walk_expr(&member.object, source, pattern, file_uri, incidents);
             walk_expr(&member.expression, source, pattern, file_uri, incidents);
+        }
+        // Class expression: const Foo = class extends React.Component { render() { ... } }
+        Expression::ClassExpression(class) => {
+            walk_class_body(&class.body, source, pattern, file_uri, incidents);
         }
         _ => {}
     }
@@ -320,14 +390,39 @@ fn check_jsx_classnames(
         }
     }
 
-    // Walk into attribute values that contain expressions (e.g., JSX inside prop values).
-    // This catches patterns like `labelIcon={<Popover><button className="pf-v5-...">}`.
+    // Walk into attribute values that contain expressions or string literals.
+    // This catches patterns like:
+    //   - `labelIcon={<Popover><button className="pf-v5-...">}` (expression containers)
+    //   - `additionalClassNames="pf-v5-u-my-md"` (string on non-className props)
     for attr in &el.opening_element.attributes {
         if let JSXAttributeItem::Attribute(a) = attr {
-            if let Some(JSXAttributeValue::ExpressionContainer(expr_container)) = &a.value {
-                if let Some(expr) = expr_container.expression.as_expression() {
-                    walk_expr(expr, source, pattern, file_uri, incidents);
+            // Skip className/class — already handled above
+            let is_classname = if let JSXAttributeName::Identifier(ident) = &a.name {
+                let n = ident.name.as_str();
+                n == "className" || n == "class"
+            } else {
+                false
+            };
+            match &a.value {
+                Some(JSXAttributeValue::ExpressionContainer(expr_container)) => {
+                    if let Some(expr) = expr_container.expression.as_expression() {
+                        walk_expr(expr, source, pattern, file_uri, incidents);
+                    }
                 }
+                Some(JSXAttributeValue::StringLiteral(s)) if !is_classname => {
+                    // Check string literal values on any prop (not just className)
+                    let text = s.value.as_str();
+                    if pattern.is_match(text) {
+                        let span = s.span();
+                        let mut incident = make_incident(source, file_uri, span.start, span.end);
+                        incident.variables.insert(
+                            "matchingText".into(),
+                            serde_json::Value::String(text.to_string()),
+                        );
+                        incidents.push(incident);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -601,5 +696,152 @@ mod tests {
         "#;
         let incidents = scan_source(source, r"pf-v5-");
         assert_eq!(incidents.len(), 1);
+    }
+
+    // ── Tests for class component patterns (create-secret.tsx, file-input.tsx) ──
+
+    #[test]
+    fn test_classname_in_class_component_render() {
+        // Mirrors create-secret.tsx: class component with render() returning JSX
+        // containing native <input> elements with className
+        let source = r#"
+            class BasicAuthSubform extends React.Component<Props, State> {
+                render() {
+                    return (
+                        <>
+                            <div className="form-group">
+                                <input
+                                    className="pf-v5-c-form-control"
+                                    type="text"
+                                    name="username"
+                                />
+                            </div>
+                            <div className="form-group">
+                                <input
+                                    className="pf-v5-c-form-control"
+                                    type="password"
+                                    name="password"
+                                />
+                            </div>
+                        </>
+                    );
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            2,
+            "Should find pf-v5 in class component render() method"
+        );
+    }
+
+    #[test]
+    fn test_classname_in_jsx_returned_from_function_call() {
+        // Mirrors file-input.tsx: render() returns connectDropTarget(<div>...</div>)
+        // where JSX is passed as argument to a function, not in a return statement
+        let source = r#"
+            class FileInput extends React.Component<Props, State> {
+                render() {
+                    return connectDropTarget(
+                        <div className="co-file-dropzone">
+                            <div className="pf-v5-c-input-group">
+                                <input className="pf-v5-c-form-control" type="text" />
+                                <span className="pf-v5-c-button pf-m-tertiary">Browse</span>
+                            </div>
+                        </div>,
+                    );
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            3,
+            "Should find pf-v5 in JSX passed as function call argument"
+        );
+    }
+
+    #[test]
+    fn test_classname_in_jsx_binary_expression() {
+        // Mirrors ApprovalTaskActionDropdown.tsx line 120-128:
+        // (<Spinner className="pf-v5-u-mr-xs" />) + t('text')
+        // JSX in a binary expression (addition with string)
+        let source = r#"
+            const tooltipContent = () => {
+                return (
+                    (<Spinner className="pf-v5-u-mr-xs" size="sm" />) + t('Checking...')
+                );
+            };
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find pf-v5 in JSX inside binary expression"
+        );
+    }
+
+    #[test]
+    fn test_classname_in_class_component_with_map_callback() {
+        // Mirrors create-secret.tsx render() with _.map() returning JSX
+        let source = r#"
+            class CreateConfigSubform extends React.Component<Props, State> {
+                render() {
+                    const list = items.map((item, index) => {
+                        return (
+                            <div key={item.uid}>
+                                <input className="pf-v5-c-form-control" type="text" />
+                            </div>
+                        );
+                    });
+                    return <>{list}</>;
+                }
+            }
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find pf-v5 in class component map callback"
+        );
+    }
+
+    #[test]
+    fn test_classname_on_custom_prop_name() {
+        // Mirrors resource-sidebar.tsx: additionalClassNames="pf-v5-u-my-md"
+        // The scanner checks className/class attrs specifically, but should also
+        // catch this via string literal matching
+        let source = r#"
+            const el = <SimpleTabNav additionalClassNames="pf-v5-u-my-md" />;
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find pf-v5 in custom prop string value via string literal matching"
+        );
+    }
+
+    #[test]
+    fn test_classname_in_class_component_exported_with_hoc() {
+        // Mirrors create-secret.tsx: class component wrapped in withTranslation() HOC
+        // export const BasicAuthSubform = withTranslation()(BasicAuthSubformWithTranslation);
+        let source = r#"
+            class BasicAuthSubformWithTranslation extends React.Component<Props, State> {
+                render() {
+                    return (
+                        <input className="pf-v5-c-form-control" type="text" />
+                    );
+                }
+            }
+            export const BasicAuthSubform = withTranslation()(BasicAuthSubformWithTranslation);
+        "#;
+        let incidents = scan_source(source, r"pf-v5-");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "Should find pf-v5 in class component exported via HOC"
+        );
     }
 }
