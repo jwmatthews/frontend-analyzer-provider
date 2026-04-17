@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc", "crates/js-fix", "crates/patternfly-fix-context"]
+members = ["crates/core", "crates/js-scanner", "crates/css-scanner", "crates/grpc"]
 resolver = "2"
 
 [package]

@@ -8,7 +8,6 @@ repository = "https://forge.hurley.page/shawn_hurley/frontend-analyzer-provider"
 
 [dependencies]
 konveyor-core = "0.0.4"
-fix-engine-core = { version = "0.0.1", path = "../../../fix-engine/crates/core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 yaml_serde = "0.10"

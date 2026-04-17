@@ -142,32 +142,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Publish frontend-js-fix
-        run: |
-          output=$(cargo publish --package frontend-js-fix 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already exists"; then
-              echo "frontend-js-fix already published, skipping"
-            else
-              echo "$output"
-              exit 1
-            fi
-          }
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Publish patternfly-fix-context
-        run: |
-          output=$(cargo publish --package patternfly-fix-context 2>&1) && echo "$output" || {
-            if echo "$output" | grep -q "already exists"; then
-              echo "patternfly-fix-context already published, skipping"
-            else
-              echo "$output"
-              exit 1
-            fi
-          }
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
       - name: Wait for crates.io index update
         run: sleep 30
 
@@ -224,9 +198,7 @@ jobs:
             crates/core/Cargo.toml \
             crates/js-scanner/Cargo.toml \
             crates/css-scanner/Cargo.toml \
-            crates/grpc/Cargo.toml \
-            crates/js-fix/Cargo.toml \
-            crates/patternfly-fix-context/Cargo.toml; do
+            crates/grpc/Cargo.toml; do
             # Bump package version (start-of-line version = "...")
             sed -i "s/^version *= *\"${CURRENT}\"/version = \"${NEXT}\"/" "$manifest"
             # Bump workspace dependency version constraints (inline version = "...")

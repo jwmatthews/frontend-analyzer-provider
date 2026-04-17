@@ -77,7 +77,7 @@ pub fn create_resolver_map(root: &Path, max_depth: usize) -> ResolverMap {
 
     // Sort by component count descending — most specific (deepest) paths first
     // so the longest-prefix match wins in resolver_for_file().
-    resolvers.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
+    resolvers.sort_by_key(|b| std::cmp::Reverse(b.0.components().count()));
 
     ResolverMap {
         resolvers,

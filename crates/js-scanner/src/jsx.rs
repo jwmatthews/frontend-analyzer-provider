@@ -1498,13 +1498,12 @@ fn collect_spread_props(
         }
         // Logical AND: {...(actions && { actions })}
         // The right side is the object that gets spread when the condition is truthy.
-        Expression::LogicalExpression(logic) => {
-            if logic.operator == LogicalOperator::And {
-                collect_spread_props(&logic.right, spread_ctx, results);
-            }
-            // For OR (||) and nullish coalescing (??), both sides could provide props.
-            // These patterns are rare in JSX spreads, so skip for now.
+        Expression::LogicalExpression(logic) if logic.operator == LogicalOperator::And => {
+            collect_spread_props(&logic.right, spread_ctx, results);
         }
+        // For OR (||) and nullish coalescing (??), both sides could provide props.
+        // These patterns are rare in JSX spreads, so skip for now.
+        Expression::LogicalExpression(_) => {}
         // Ternary: {...(cond ? { actions } : {})}
         // Both branches may supply props.
         Expression::ConditionalExpression(cond) => {
@@ -1561,7 +1560,7 @@ fn collect_spread_props(
                 0,
                 &mut |export| match export {
                     ResolvedExport::Expression(Expression::ObjectExpression(obj)) => {
-                        collect_props_from_object(&obj, results);
+                        collect_props_from_object(obj, results);
                     }
                     ResolvedExport::Expression(
                         fn_expr @ Expression::ArrowFunctionExpression(_),
@@ -4112,10 +4111,10 @@ const el = <Modal title="direct" {...{ actions: [] }}>content</Modal>;
         );
         let direct = incidents
             .iter()
-            .find(|i| i.variables.get("spreadSource").is_none());
+            .find(|i| !i.variables.contains_key("spreadSource"));
         let spread = incidents
             .iter()
-            .find(|i| i.variables.get("spreadSource").is_some());
+            .find(|i| i.variables.contains_key("spreadSource"));
         assert!(direct.is_some(), "Should have a direct prop incident");
         assert!(spread.is_some(), "Should have a spread prop incident");
     }

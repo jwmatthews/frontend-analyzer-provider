@@ -942,7 +942,7 @@ __metadata:
             "npm:^5.0.0"
         );
         // Regular deps not in peer_dependencies
-        assert!(entries[0].peer_dependencies.get("lodash").is_none());
+        assert!(!entries[0].peer_dependencies.contains_key("lodash"));
     }
 
     #[test]
